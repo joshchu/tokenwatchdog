@@ -4,6 +4,7 @@ notifications or audio playback are ever triggered."""
 from __future__ import annotations
 
 import dataclasses
+import types
 
 import pytest
 
@@ -84,3 +85,34 @@ def test_notifier_failure_is_swallowed(cfg, fake_which, monkeypatch):
 
     monkeypatch.setattr(notify_module.subprocess, "run", raise_oserror)
     notify(_alert(), cfg)  # must not raise
+
+
+def _no_say(name):
+    return None if name == "say" else f"/usr/bin/{name}"
+
+
+def test_bark_falls_back_to_a_windows_beep_when_say_is_unavailable(
+    cfg, monkeypatch, calls
+):
+    """Regression: on Windows there's no `say` and no bundled bark audio to
+    ship, so the audible cue for the "bark" setting should still play --
+    via the stdlib winsound module -- instead of silently doing nothing."""
+    monkeypatch.setattr(notify_module.shutil, "which", _no_say)
+    beeps = []
+    fake_winsound = types.SimpleNamespace(
+        MessageBeep=lambda beep_type: beeps.append(beep_type),
+        MB_ICONEXCLAMATION="MB_ICONEXCLAMATION",
+    )
+    monkeypatch.setattr(notify_module, "winsound", fake_winsound)
+    notify(_alert(), _with_sound(cfg, "bark"))
+    assert beeps == ["MB_ICONEXCLAMATION"]
+    assert not any(c[0] == "/usr/bin/say" for c in calls)
+
+
+def test_bark_does_nothing_when_neither_say_nor_winsound_is_available(
+    cfg, monkeypatch, calls
+):
+    monkeypatch.setattr(notify_module.shutil, "which", _no_say)
+    monkeypatch.setattr(notify_module, "winsound", None)
+    notify(_alert(), _with_sound(cfg, "bark"))  # must not raise
+    assert not any(c[0] == "/usr/bin/say" for c in calls)

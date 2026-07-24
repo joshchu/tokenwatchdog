@@ -11,6 +11,11 @@ from __future__ import annotations
 import shutil
 import subprocess
 
+try:
+    import winsound
+except ImportError:  # not on Windows
+    winsound = None  # type: ignore[assignment]
+
 from tokenwatchdog.config import Config
 from tokenwatchdog.models import Alert
 
@@ -72,10 +77,20 @@ def _deliver(title: str, subtitle: str, message: str, cfg: Config) -> None:
 
 
 def _bark() -> None:
+    """Audible cue for the "bark" sound setting. macOS: a spoken woof via
+    `say`. Windows has no `say` equivalent and no bundled bark audio to
+    ship, so it rings the system exclamation sound via the stdlib
+    `winsound` module instead -- not a literal bark, but still an audible,
+    unmistakable "something needs your attention.\""""
     say = shutil.which("say")
-    if say is None:
-        return
-    subprocess.run([say, _BARK_PHRASE], check=False, timeout=_TIMEOUT_SECONDS)
+    if say is not None:
+        subprocess.run([say, _BARK_PHRASE], check=False, timeout=_TIMEOUT_SECONDS)
+    elif winsound is not None:
+        # typeshed's winsound stub only declares these two under win32, so
+        # mypy running on macOS/Linux sees a module with neither -- a
+        # static-analysis gap, not a real portability issue (the try/except
+        # ImportError above already covers this module not existing here).
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)  # type: ignore[attr-defined]
 
 
 def _applescript_str(value: str) -> str:
