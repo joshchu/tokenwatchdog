@@ -349,10 +349,9 @@ def test_overage_cost_usd_prices_input_and_output_separately(cfg):
 
 
 def test_overage_cost_usd_never_prices_claude_with_codexs_rate(cfg):
-    """Regression: Claude's cache accounting is a different shape (see
-    providers/claude.py) -- pricing it through Codex's two-rate formula
-    would silently misprice it, so this is Codex-only until Claude gets
-    its own deliberate rates."""
+    """Regression: each provider is priced from its own config namespace
+    -- a Codex rate configured alone must not leak into Claude's cost
+    just because Claude's own rates are still at their zero default."""
     priced = dataclasses.replace(
         cfg,
         codex=dataclasses.replace(
@@ -363,3 +362,67 @@ def test_overage_cost_usd_never_prices_claude_with_codexs_rate(cfg):
     history = [_sample(1000.0, 100.0)]
     events = [_token_event(1000.0, input_tokens=1_000_000)]
     assert overage_cost_usd(window, history, events, priced) is None
+
+
+def test_overage_cost_usd_never_prices_codex_with_claudes_rate(cfg):
+    """The symmetric case: a Claude rate configured alone must not leak
+    into Codex's cost either."""
+    priced = dataclasses.replace(
+        cfg,
+        claude=dataclasses.replace(
+            cfg.claude,
+            input_price_per_million_usd=2.0,
+            output_price_per_million_usd=8.0,
+        ),
+    )
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [_sample(1000.0, 100.0)]
+    events = [_token_event(1000.0, input_tokens=1_000_000)]
+    assert overage_cost_usd(window, history, events, priced) is None
+
+
+def test_overage_cost_usd_prices_claudes_four_rates_separately(cfg):
+    """Regression: Anthropic bills cache writes and cache reads on their
+    own tiers, distinct from input/output -- unlike Codex, where cache
+    fields are always 0 (already folded into input/output), Claude's
+    token_events carry real, separately-priced cache_creation/cache_read
+    totals that a two-rate formula would silently misprice."""
+    priced = dataclasses.replace(
+        cfg,
+        claude=dataclasses.replace(
+            cfg.claude,
+            input_price_per_million_usd=1.0,
+            output_price_per_million_usd=5.0,
+            cache_write_price_per_million_usd=1.25,
+            cache_read_price_per_million_usd=0.1,
+        ),
+    )
+    window = _window(Provider.CLAUDE, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [_sample(900.0, 100.0), _sample(1000.0, 100.0)]
+    events = [
+        _token_event(
+            900.0,
+            input_tokens=1_000_000,
+            output_tokens=200_000,
+            cache_creation=400_000,
+            cache_read=10_000_000,
+        )
+    ]
+    cost = overage_cost_usd(window, history, events, priced)
+    assert cost == pytest.approx(1.0 + 1.0 + 0.5 + 1.0)
+
+
+def test_tokens_burned_past_quota_works_for_claude_too(cfg):
+    """tokens_burned_past_quota is provider-agnostic by construction --
+    this pins that Claude gets the same treatment as Codex without any
+    Claude-specific branch, since providers/claude.py already ingests its
+    own token_events unconditionally regardless of which source (Desktop
+    or token-compute) is live."""
+    del cfg  # unused; kept for parity with the other tests in this file
+    window = _window(Provider.CLAUDE, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [_sample(900.0, 90.0), _sample(1000.0, 100.0)]
+    events = [
+        _token_event(800.0, input_tokens=999_999),  # before saturation -- excluded
+        _token_event(1000.0, input_tokens=10, output_tokens=5, cache_read=100),
+    ]
+    assert tokens_burned_past_quota(window, history, events) == 115

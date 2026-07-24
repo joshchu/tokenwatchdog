@@ -390,6 +390,31 @@ def tokens_burned_past_quota(
     )
 
 
+def _overage_rates(
+    window: Window, cfg: Config
+) -> tuple[float, float, float, float] | None:
+    """(input, output, cache_write, cache_read) $/million rates for this
+    window's provider, or None for a provider with no pricing config at
+    all. Codex's cache fields are always 0 in token_events (see
+    providers/codex.py), so its cache rates are pinned at 0.0 here rather
+    than exposed as config -- there's nothing for them to ever multiply."""
+    if window.provider is Provider.CODEX:
+        return (
+            cfg.codex.input_price_per_million_usd,
+            cfg.codex.output_price_per_million_usd,
+            0.0,
+            0.0,
+        )
+    if window.provider is Provider.CLAUDE:
+        return (
+            cfg.claude.input_price_per_million_usd,
+            cfg.claude.output_price_per_million_usd,
+            cfg.claude.cache_write_price_per_million_usd,
+            cfg.claude.cache_read_price_per_million_usd,
+        )
+    return None
+
+
 def overage_cost_usd(
     window: Window,
     history: list[SampleRow],
@@ -397,20 +422,19 @@ def overage_cost_usd(
     cfg: Config,
 ) -> float | None:
     """Dollar estimate for tokens burned since `window` pinned at 100%,
-    priced from `cfg.codex.{input,output}_price_per_million_usd`. None
-    (never 0.0) unless a price is actually configured AND there's overage
-    token data to price -- $0.00 would read as "you owe nothing," a
-    materially different claim from "unpriced."
+    priced from this provider's configured rates (see _overage_rates).
+    None (never 0.0) unless a price is actually configured AND there's
+    overage token data to price -- $0.00 would read as "you owe nothing,"
+    a materially different claim from "unpriced."
 
-    Codex only: Claude's own accounting model splits cache tokens on a
-    different axis (see providers/claude.py), so pricing it through this
-    same two-rate formula would silently misprice it -- that needs its
-    own deliberate rates, not a reuse of Codex's."""
-    input_rate = cfg.codex.input_price_per_million_usd
-    output_rate = cfg.codex.output_price_per_million_usd
-    if window.provider is not Provider.CODEX:
-        return None
-    if input_rate <= 0.0 and output_rate <= 0.0:
+    Claude prices cache writes/reads on their own rates, separate from
+    input/output -- Anthropic bills them on distinct tiers (reads usually
+    well below base input), unlike Codex where cache tokens are already
+    folded into input/output counts (see providers/codex.py). Reusing a
+    single two-rate formula for both would silently misprice whichever
+    one doesn't fit it."""
+    rates = _overage_rates(window, cfg)
+    if rates is None or not any(rate > 0.0 for rate in rates):
         return None
     if window.used_percent < 100.0:
         return None
@@ -420,9 +444,17 @@ def overage_cost_usd(
     relevant = [e for e in token_events if e.ts >= boundary_ts]
     if not relevant:
         return None
+    input_rate, output_rate, cache_write_rate, cache_read_rate = rates
     input_tokens = sum(e.input_tokens for e in relevant)
     output_tokens = sum(e.output_tokens for e in relevant)
-    return (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000.0
+    cache_write_tokens = sum(e.cache_creation for e in relevant)
+    cache_read_tokens = sum(e.cache_read for e in relevant)
+    return (
+        input_tokens * input_rate
+        + output_tokens * output_rate
+        + cache_write_tokens * cache_write_rate
+        + cache_read_tokens * cache_read_rate
+    ) / 1_000_000.0
 
 
 def _saturation_started_at(history: list[SampleRow]) -> float | None:

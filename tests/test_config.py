@@ -52,3 +52,17 @@ def test_negative_codex_token_price_fails_loud(tmp_path):
     path = _write(tmp_path, "[codex]\ninput_price_per_million_usd = -1.0\n")
     with pytest.raises(ConfigError, match="input_price_per_million_usd"):
         load_config(path)
+
+
+def test_claude_token_prices_default_to_unconfigured(tmp_path):
+    cfg = load_config(tmp_path / "config.toml")
+    assert cfg.claude.input_price_per_million_usd == 0.0
+    assert cfg.claude.output_price_per_million_usd == 0.0
+    assert cfg.claude.cache_write_price_per_million_usd == 0.0
+    assert cfg.claude.cache_read_price_per_million_usd == 0.0
+
+
+def test_negative_claude_token_price_fails_loud(tmp_path):
+    path = _write(tmp_path, "[claude]\ncache_read_price_per_million_usd = -0.1\n")
+    with pytest.raises(ConfigError, match="cache_read_price_per_million_usd"):
+        load_config(path)

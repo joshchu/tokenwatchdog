@@ -63,6 +63,17 @@ class ClaudeConfig:
     plan_limits_tokens: dict[str, int] = field(
         default_factory=lambda: {"default_claude_max_5x": 88_000}
     )
+    # 0.0 = not configured -> no $ estimate shown, tokens-past-quota shows
+    # instead. Four rates, not two: Anthropic prices cache writes and
+    # cache reads on their own distinct tiers (usually well below base
+    # input for reads), unlike Codex where those are already folded into
+    # input/output token counts (see providers/codex.py) -- reusing
+    # Codex's two-rate formula here would silently misprice real,
+    # separately-billed usage.
+    input_price_per_million_usd: float = 0.0
+    output_price_per_million_usd: float = 0.0
+    cache_write_price_per_million_usd: float = 0.0
+    cache_read_price_per_million_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -226,6 +237,14 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("codex.input_price_per_million_usd must not be negative")
     if cfg.codex.output_price_per_million_usd < 0.0:
         raise ConfigError("codex.output_price_per_million_usd must not be negative")
+    for field_name in (
+        "input_price_per_million_usd",
+        "output_price_per_million_usd",
+        "cache_write_price_per_million_usd",
+        "cache_read_price_per_million_usd",
+    ):
+        if getattr(cfg.claude, field_name) < 0.0:
+            raise ConfigError(f"claude.{field_name} must not be negative")
     if cfg.predictor.model not in _VALID_PREDICTOR_MODELS:
         raise ConfigError(
             f"predictor.model must be one of {sorted(_VALID_PREDICTOR_MODELS)}, "
@@ -310,6 +329,10 @@ output_price_per_million_usd = 0.0   # to show $ burned past quota instead of ju
 source = "auto"                      # "auto" (desktop->tokens) | "desktop" | "tokens"
 config_dir = ""                      # "" -> $CLAUDE_CONFIG_DIR or ~/.claude
 limit_mode = "p90"                   # "p90" | "plan"
+input_price_per_million_usd = 0.0        # set to your plan's real overage/credit
+output_price_per_million_usd = 0.0       # rate to show $ burned past quota instead
+cache_write_price_per_million_usd = 0.0  # of just tokens -- Anthropic prices cache
+cache_read_price_per_million_usd = 0.0   # writes/reads separately from input/output
 
 [claude.plan_limits_tokens]          # used when limit_mode = "plan"
 default_claude_max_5x = 88000

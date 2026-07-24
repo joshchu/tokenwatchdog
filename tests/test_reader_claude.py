@@ -14,7 +14,9 @@ import pytest
 
 from tokenwatchdog.config import load_config
 from tokenwatchdog.models import Provider, WindowKind
+from tokenwatchdog.predictor import tokens_burned_past_quota
 from tokenwatchdog.providers import claude as claude_provider
+from tokenwatchdog.store import SampleRow
 
 
 @pytest.fixture
@@ -304,6 +306,48 @@ def test_weekly_omitted_under_p90_without_enough_history(sandbox_home, tmp_path,
     kinds = {w.kind for w in windows}
     assert WindowKind.W5H in kinds  # 5h always has a fallback estimate
     assert WindowKind.WEEKLY not in kinds  # no fabricated weekly denominator
+
+
+def test_tokens_burned_past_quota_sees_claudes_own_ingested_events(
+    sandbox_home, tmp_path, store
+):
+    """End-to-end: providers/claude.py's own real token-log ingestion
+    (not a synthetic TokenEventRow) combined with predictor.
+    tokens_burned_past_quota -- proves the two pieces actually fit
+    together, not just that each is independently correct. Ingestion
+    runs unconditionally regardless of cfg.claude.source (see read()),
+    so this holds even though "tokens" is the live source here."""
+    proj_dir = sandbox_home / ".claude" / "projects" / "proj1"
+    proj_dir.mkdir(parents=True)
+    line = _assistant_line(
+        ts=_recent_iso(120),
+        request_id="req_1",
+        message_id="msg_1",
+        input_tokens=1,
+        output_tokens=999,  # input(1) + output(999) = 1000 == the configured limit
+    )
+    (proj_dir / "session1.jsonl").write_text(json.dumps(line) + "\n")
+    cfg = _write_config(
+        tmp_path,
+        '[claude]\nsource = "tokens"\nlimit_mode = "plan"\n\n'
+        "[claude.plan_limits_tokens]\ndefault_claude_max_5x = 1000\n",
+    )
+
+    windows = claude_provider.ClaudeProvider().read(cfg, store)
+    w5h = next(w for w in windows if w.kind is WindowKind.W5H)
+    assert w5h.used_percent == pytest.approx(100.0)
+
+    history = [
+        SampleRow(
+            captured_at=w5h.source_ts,
+            source_ts=w5h.source_ts,
+            used_percent=w5h.used_percent,
+            resets_at=w5h.resets_at,
+            is_estimated=w5h.is_estimated,
+        )
+    ]
+    events = store.recent_token_events(Provider.CLAUDE, since_ts=0.0)
+    assert tokens_burned_past_quota(w5h, history, events) == 1000
 
 
 def test_p90_limit_estimate_excludes_the_live_window(sandbox_home, tmp_path, store):
