@@ -88,6 +88,7 @@ def test_stale_sample_is_idle(cfg):
     window = _window(Provider.CLAUDE, WindowKind.W5H, 50.0, stale_source_ts)
     forecast = LinearPredictor().forecast(window, [], [], cfg, now)
     assert forecast.status == "IDLE"
+    assert forecast.confidence is None
     assert forecast.eta_calendar is None
 
 

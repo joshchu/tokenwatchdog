@@ -39,6 +39,10 @@ def test_tick_returns_no_data_when_no_provider_reports_a_window(tmp_path):
     state = engine.tick(now=1000.0)
     assert {f.status for f in state.forecasts} == {"NO_DATA"}
     assert state.alerts == ()
+    # Regression: NO_DATA has no ETA either -- a "low" confidence sitting
+    # next to a blank ETA read as confidence in a forecast that was never
+    # made at all.
+    assert all(f.confidence is None for f in state.forecasts)
 
 
 def test_tick_persists_samples_and_forecasts(tmp_path):

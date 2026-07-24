@@ -167,7 +167,7 @@ def _no_data_forecast(provider: Provider, kind: WindowKind, now: float) -> Forec
         eta_p50=None,
         eta_p90=None,
         prob_exhaust_before_reset=None,
-        confidence="low",
+        confidence=None,  # nothing was forecast at all -- nothing to rate
         exhausts_before_reset=False,
         n_samples=0,
     )

@@ -117,12 +117,12 @@ def test_reset_pending_short_circuits_before_simulating(cfg):
     assert forecast.status == "RESET_PENDING"
 
 
-def test_no_history_falls_back_to_ok_low_confidence(cfg):
+def test_no_history_falls_back_to_ok_with_no_confidence(cfg):
     now = 1_000_000.0
     window = _window(WindowKind.WEEKLY, 10.0, now)
     forecast = MonteCarloPredictor().forecast(window, [], [], cfg, now)
     assert forecast.status == "OK"
-    assert forecast.confidence == "low"
+    assert forecast.confidence is None  # nothing forecast -- nothing to rate
     assert forecast.eta_p50 is None
 
 

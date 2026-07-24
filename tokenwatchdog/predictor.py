@@ -575,7 +575,7 @@ def _status_only_forecast(
         eta_p50=None,
         eta_p90=None,
         prob_exhaust_before_reset=None,
-        confidence="low",
+        confidence=None,  # IDLE/RESET_PENDING/too-few-samples: nothing forecast
         exhausts_before_reset=False,
         n_samples=n_samples,
     )
