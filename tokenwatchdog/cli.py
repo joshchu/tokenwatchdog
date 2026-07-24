@@ -87,6 +87,10 @@ def _run_headless(engine: Engine, cfg: Config) -> int:
 
 def _render(state: MonitorState, cfg: Config, alert_log: Sequence[Alert]) -> Group:
     tz = resolve_timezone(cfg)
+    # All wall-clock columns below are already tz-converted (see _row/_fmt_dt)
+    # — label them with the actual abbreviation so a local time is never
+    # mistaken for UTC at a glance, matching the "updated ... EDT" header.
+    tz_label = datetime.fromtimestamp(state.now, tz=tz).strftime("%Z")
     table = Table(expand=True)
     for column in (
         "Provider",
@@ -94,9 +98,9 @@ def _render(state: MonitorState, cfg: Config, alert_log: Sequence[Alert]) -> Gro
         "Used %",
         "Status",
         "Burn %/h",
-        "ETA (calendar)",
-        "ETA (working hrs)",
-        "Resets",
+        f"ETA (calendar, {tz_label})",
+        f"ETA (working hrs, {tz_label})",
+        f"Resets ({tz_label})",
         "Conf.",
     ):
         table.add_column(column)
