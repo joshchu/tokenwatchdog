@@ -109,7 +109,7 @@ class LinearPredictor:
             )
 
         fit_samples = _slope_fit_samples(block.samples, cfg, window.kind, now)
-        burn_per_hour = _theil_sen_slope_per_hour(fit_samples)
+        burn_per_hour = _robust_slope_per_hour(fit_samples)
         return _project_forecast(
             window=window,
             burn_per_hour=burn_per_hour,
@@ -419,18 +419,35 @@ def _slope_fit_samples(
     return block_samples[-2:] if len(block_samples) >= 2 else block_samples
 
 
-def _theil_sen_slope_per_hour(samples: list[SampleRow]) -> float:
-    """Median of all pairwise slopes (%/h) — robust to a single burst
-    outlier in a way a least-squares fit isn't."""
+def _robust_slope_per_hour(samples: list[SampleRow]) -> float:
+    """Median of fixed-lag-k slopes (%/h), k = max(1, n // 4) — NOT the
+    median of all C(n,2) pairwise slopes (Theil-Sen), which this replaced.
+
+    used_percent only ever moves up within a block (a real quota counter
+    never partially un-consumes), so a "burst outlier" here can only be a
+    PERMANENT step from that point forward, never a reverting point
+    anomaly. That matters: a step after position i corrupts i*(n-i) of
+    the C(n,2) all-pairs slopes, which is >50% (past the median's
+    breakdown point) whenever the step lands near the middle of the
+    window — measured concretely as producing an estimate *worse* than a
+    naive endpoint-to-endpoint slope. A step can corrupt at most k of the
+    (n-k) fixed-lag-k slopes regardless of WHERE it falls, bounding
+    contamination well under 50% for any position — while the wider
+    baseline (k samples apart, not 1) keeps each slope less noise-amplified
+    than raw consecutive deltas would be against Claude's is_estimated
+    source, which can legitimately wobble within a block (see _is_reset)."""
+    n = len(samples)
+    if n < 2:
+        return 0.0
+    lag = max(1, n // 4)
     slopes: list[float] = []
-    for i in range(len(samples)):
-        for j in range(i + 1, len(samples)):
-            dt_hours = (samples[j].source_ts - samples[i].source_ts) / 3600.0
-            if dt_hours <= 0:
-                continue
-            slopes.append(
-                (samples[j].used_percent - samples[i].used_percent) / dt_hours
-            )
+    for i in range(n - lag):
+        dt_hours = (samples[i + lag].source_ts - samples[i].source_ts) / 3600.0
+        if dt_hours <= 0:
+            continue
+        slopes.append(
+            (samples[i + lag].used_percent - samples[i].used_percent) / dt_hours
+        )
     if not slopes:
         return 0.0
     slopes.sort()
@@ -632,10 +649,24 @@ def _project_forecast(
         eta_calendar = None
         eta_workhours = None
     else:
-        eta_calendar = now_dt + timedelta(hours=hours_to_exhaust)
-        eta_workhours = project_workhours_exhaustion(
-            now_dt, hours_to_exhaust, cfg.working_hours
-        )
+        try:
+            eta_calendar = now_dt + timedelta(hours=hours_to_exhaust)
+            eta_workhours = project_workhours_exhaustion(
+                now_dt, hours_to_exhaust, cfg.working_hours
+            )
+        except (OverflowError, RuntimeError):
+            # A burn rate close enough to zero (but not exactly zero -- e.g.
+            # floating-point noise off two nearly-identical readings) turns
+            # a tiny remaining-percent into an exhaustion horizon of
+            # literally centuries. Calendar arithmetic that far out either
+            # overflows datetime's range outright, or blows the
+            # working-hours projector's iteration guard (config is already
+            # validated at load time, so that guard can only fire here for
+            # an input too large to converge, never a real misconfiguration).
+            # Either way there's no meaningful ETA to report at that
+            # remove -- None is honest, not a crash.
+            eta_calendar = None
+            eta_workhours = None
 
     return Forecast(
         window=window,
