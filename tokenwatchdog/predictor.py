@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, replace
-from datetime import datetime, time, timedelta, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from typing import Protocol
 
 from tokenwatchdog.config import (
@@ -68,7 +68,7 @@ class LinearPredictor:
         block = _current_block(history)
         resets_at = window.resets_at
         if resets_at is None:
-            resets_at = _derive_resets_at(window, block, now, tz)
+            resets_at = _derive_resets_at(window, block, now)
             if resets_at is not None:
                 # Thread the derived value back onto the window so it rides
                 # along on Forecast.window — alerts.py re-arms on resets_at
@@ -147,7 +147,7 @@ class MonteCarloPredictor:
         block = _current_block(history)
         resets_at = window.resets_at
         if resets_at is None:
-            resets_at = _derive_resets_at(window, block, now, tz)
+            resets_at = _derive_resets_at(window, block, now)
             if resets_at is not None:
                 window = replace(window, resets_at=resets_at)
 
@@ -196,12 +196,16 @@ class MonteCarloPredictor:
 
         now_dt = datetime.fromtimestamp(now, tz=tz)
         time_to_reset_h = (resets_at - now) / 3600.0 if resets_at is not None else None
-        # Simulations run at most 2 weeks out, or 3x the time to reset if
-        # that's longer — no point simulating a year to find a P90 that's
-        # actually "never, at this rate."
-        horizon_h = (
-            max(time_to_reset_h * 3, 24.0 * 14) if time_to_reset_h else 24.0 * 14
-        )
+        # Exhaustion is a WITHIN-THIS-CYCLE question: the window refills at
+        # its own reset, so a simulated future that runs past it isn't "on
+        # pace to exhaust," it's a new cycle starting fresh. Simulations
+        # therefore run only up to the reset when it's known — never
+        # beyond it — so a low-but-nonzero burn with a reset coming soon
+        # correctly reports "not at risk" instead of an ETA far past the
+        # point where the quota will have already refilled. Without a
+        # known reset (cold start), fall back to a 2-week cap so we're not
+        # simulating indefinitely.
+        horizon_h = time_to_reset_h if time_to_reset_h is not None else 24.0 * 14
 
         mc_runs = max(cfg.predictor.mc_runs, 1)
         # Every run contributes exactly one outcome, exhausted or not — a
@@ -219,8 +223,11 @@ class MonteCarloPredictor:
             for _ in range(mc_runs)
         ]
         outcomes.sort()
+        # Because the horizon IS the reset (when known), a non-censored
+        # outcome already means "exhausted before the reset" -- there's
+        # nothing past the horizon to have compared against.
         prob_before_reset = (
-            sum(1 for h in outcomes if h < time_to_reset_h) / mc_runs
+            sum(1 for h in outcomes if h < horizon_h) / mc_runs
             if time_to_reset_h is not None
             else None
         )
@@ -357,25 +364,40 @@ def _current_block(history: list[SampleRow]) -> _BlockView:
     return _BlockView(samples=block, block_started_at=started_at)
 
 
-def _derive_resets_at(
-    window: Window, block: _BlockView, now: float, tz: tzinfo
-) -> float | None:
+_SEVEN_DAYS_SECONDS = 7 * 24 * 3600
+
+
+def _derive_resets_at(window: Window, block: _BlockView, now: float) -> float | None:
     """Only Claude ever needs this: Codex always supplies `resets_at`
-    itself, but neither Claude Desktop nor token-compute do — deriving a
-    reset time from the window's own definition is this layer's job, not
-    the provider's."""
-    if window.kind is WindowKind.W5H:
-        if block.block_started_at is not None:
-            return block.block_started_at + _FIVE_HOURS_SECONDS
-        return None  # this block's start predates our observation window
-    # WEEKLY: fixed calendar anchor, next Monday 00:00 local time — an
-    # unvalidated approximation. Worth cross-checking against Claude Code's
-    # own /usage bars once there's enough real usage to compare against.
-    now_dt = datetime.fromtimestamp(now, tz=tz)
-    days_ahead = (7 - now_dt.weekday()) % 7 or 7
-    anchor_date = now_dt.date() + timedelta(days=days_ahead)
-    anchor = datetime.combine(anchor_date, time(0, 0), tzinfo=tz)
-    return anchor.timestamp()
+    itself, straight from real account state; neither Claude Desktop nor
+    token-compute do.
+
+    Both Claude windows are fixed-duration cycles (5h / 7d) that re-anchor
+    at each actual reset, so the next one is simply the last OBSERVED
+    reset plus that duration — derived from this account's own real
+    behavior, never assumed against a calendar. If no reset has been
+    observed yet (block_started_at is None), the true anchor predates our
+    history and is genuinely unknown — report that honestly rather than
+    guessing a calendar day.
+
+    If that next-cycle projection has already elapsed — a real reset
+    happened since but its used_percent drop was too small to clear
+    `_is_reset`'s threshold (a lightly used window can do this) — advance
+    by however many whole cycles were missed. It's the same fixed-cycle
+    assumption already being made, just carried forward through cycles we
+    didn't directly see a boundary for, rather than reporting a reset
+    that's already in the past.
+    """
+    if block.block_started_at is None:
+        return None
+    duration = (
+        _FIVE_HOURS_SECONDS if window.kind is WindowKind.W5H else _SEVEN_DAYS_SECONDS
+    )
+    resets_at = block.block_started_at + duration
+    if resets_at <= now:
+        missed_cycles = int((now - resets_at) // duration) + 1
+        resets_at += missed_cycles * duration
+    return resets_at
 
 
 def _slope_fit_samples(
@@ -592,13 +614,23 @@ def _project_forecast(
 
     remaining_percent = max(0.0, 100.0 - window.used_percent)
     hours_to_exhaust = remaining_percent / burn_per_hour
-    eta_calendar = now_dt + timedelta(hours=hours_to_exhaust)
-    eta_workhours = project_workhours_exhaustion(
-        now_dt, hours_to_exhaust, cfg.working_hours
-    )
     exhausts_before_reset = (
         False if time_to_reset_h is None else hours_to_exhaust < time_to_reset_h
     )
+
+    # A linear projection that lands AFTER a known reset isn't a real ETA —
+    # the window refills before usage ever gets there, so "exhaustion"
+    # under continued accumulation is hypothetical, not a risk. Report no
+    # ETA rather than a number that reads as "you'll run out then" when
+    # you won't. (The reset time itself is already shown separately.)
+    if time_to_reset_h is not None and not exhausts_before_reset:
+        eta_calendar = None
+        eta_workhours = None
+    else:
+        eta_calendar = now_dt + timedelta(hours=hours_to_exhaust)
+        eta_workhours = project_workhours_exhaustion(
+            now_dt, hours_to_exhaust, cfg.working_hours
+        )
 
     return Forecast(
         window=window,

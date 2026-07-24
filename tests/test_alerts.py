@@ -75,10 +75,11 @@ def test_threshold_rearms_on_hysteresis_drop(cfg, store):
     assert len(fired) == 1
 
 
-def test_burn_alert_fires_when_margin_exceeds_threshold(cfg, store):
+def test_burn_alert_fires_when_exhaustion_is_imminent(cfg, store):
     now = 1000.0
+    # Exhausts in 30 minutes -- clearly within the default 1h alert window.
     forecast = _forecast(
-        30.0, exhausts=True, eta_calendar=_dt(now + 3600), time_to_reset_h=5.0
+        30.0, exhausts=True, eta_calendar=_dt(now + 1800), time_to_reset_h=5.0
     )
     fired = evaluate(forecast, cfg, store, now)
     assert any(a.alert_kind == "burn" for a in fired)
@@ -87,21 +88,23 @@ def test_burn_alert_fires_when_margin_exceeds_threshold(cfg, store):
 def test_burn_alert_does_not_fire_below_min_percent(cfg, store):
     now = 1000.0
     forecast = _forecast(
-        10.0, exhausts=True, eta_calendar=_dt(now + 3600), time_to_reset_h=5.0
+        10.0, exhausts=True, eta_calendar=_dt(now + 1800), time_to_reset_h=5.0
     )
     fired = evaluate(forecast, cfg, store, now)
     assert not any(a.alert_kind == "burn" for a in fired)
 
 
-def test_burn_alert_does_not_fire_within_margin_of_reset(cfg, store):
+def test_burn_alert_does_not_fire_when_exhaustion_is_not_imminent(cfg, store):
+    """Regression: technically "on pace to exhaust before the reset" isn't
+    enough on its own -- if that's still hours away, it isn't urgent, and
+    alerting on it is exactly the "spurious" noise this gate exists to
+    prevent."""
     now = 1000.0
-    # exhausts 1h before a reset that's only 1h05m away: margin (5min) is
-    # under the default 0.25h (15min) threshold.
     forecast = _forecast(
         30.0,
         exhausts=True,
-        eta_calendar=_dt(now + 3600),
-        time_to_reset_h=(3600 + 300) / 3600,
+        eta_calendar=_dt(now + 3 * 3600),  # 3h out -- beyond the 1h default
+        time_to_reset_h=5.0,
     )
     fired = evaluate(forecast, cfg, store, now)
     assert not any(a.alert_kind == "burn" for a in fired)

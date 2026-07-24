@@ -84,6 +84,20 @@ def _desktop_history_path() -> Path:
 
 
 def _read_desktop(cfg: Config) -> list[Window]:
+    """Every retained sample, oldest first — not just the latest.
+
+    Desktop writes this file on its own every ~5 minutes and keeps a few
+    days of history regardless of whether TokenWatchDog is running. If we
+    only ever read the newest point, a period with the poll loop off would
+    be a silent gap even though Desktop's own file already has the data
+    to fill it: the engine inserts every returned Window (idempotently —
+    already-seen ones are a no-op) and only the last one for a given
+    window kind is used for the live forecast, so returning the full
+    history here is both a correct backfill and a no-op on the samples
+    already stored. Measured cost of re-inserting ~5 days of retained
+    history (2880 rows) once already stored: ~17ms — negligible against
+    a ~60s poll interval, so this isn't worth bounding further.
+    """
     path = _desktop_history_path()
     try:
         raw = json.loads(path.read_text())
@@ -92,46 +106,59 @@ def _read_desktop(cfg: Config) -> list[Window]:
     samples = raw.get("samples")
     if not isinstance(samples, list):
         return []
-    dated = [
-        s
-        for s in samples
-        if isinstance(s, dict) and isinstance(s.get("t"), (int, float))
-    ]
+    dated = sorted(
+        (
+            s
+            for s in samples
+            if isinstance(s, dict) and isinstance(s.get("t"), (int, float))
+        ),
+        key=lambda s: s["t"],
+    )
     if not dated:
         return []
-    latest = max(dated, key=lambda s: s["t"])
-    usage = latest.get("u")
-    if not isinstance(usage, dict):
-        return []
-    source_ts = latest["t"] / 1000.0
+    # Desktop can retain samples from more than one Claude org if the
+    # account has switched between them — each org has its own
+    # independent quota, and the store has no org dimension, so mixing
+    # them would look like an arbitrary usage jump or a spurious reset.
+    # Only the org the LATEST sample belongs to is relevant to "current"
+    # usage; older samples from a different org aren't this account's
+    # history.
+    current_org = dated[-1].get("org")
     windows: list[Window] = []
-    fh, sd = usage.get("fh"), usage.get("sd")
-    if isinstance(fh, (int, float)):
-        windows.append(
-            Window(
-                provider=Provider.CLAUDE,
-                kind=WindowKind.W5H,
-                used_percent=float(fh),
-                window_minutes=_W5H_WINDOW_MINUTES,
-                resets_at=None,
-                source_ts=source_ts,
-                is_estimated=False,
-                source_file=str(path),
+    for entry in dated:
+        if entry.get("org") != current_org:
+            continue
+        usage = entry.get("u")
+        if not isinstance(usage, dict):
+            continue
+        source_ts = entry["t"] / 1000.0
+        fh, sd = usage.get("fh"), usage.get("sd")
+        if isinstance(fh, (int, float)):
+            windows.append(
+                Window(
+                    provider=Provider.CLAUDE,
+                    kind=WindowKind.W5H,
+                    used_percent=float(fh),
+                    window_minutes=_W5H_WINDOW_MINUTES,
+                    resets_at=None,
+                    source_ts=source_ts,
+                    is_estimated=False,
+                    source_file=str(path),
+                )
             )
-        )
-    if isinstance(sd, (int, float)):
-        windows.append(
-            Window(
-                provider=Provider.CLAUDE,
-                kind=WindowKind.WEEKLY,
-                used_percent=float(sd),
-                window_minutes=_WEEKLY_WINDOW_MINUTES,
-                resets_at=None,
-                source_ts=source_ts,
-                is_estimated=False,
-                source_file=str(path),
+        if isinstance(sd, (int, float)):
+            windows.append(
+                Window(
+                    provider=Provider.CLAUDE,
+                    kind=WindowKind.WEEKLY,
+                    used_percent=float(sd),
+                    window_minutes=_WEEKLY_WINDOW_MINUTES,
+                    resets_at=None,
+                    source_ts=source_ts,
+                    is_estimated=False,
+                    source_file=str(path),
+                )
             )
-        )
     return windows
 
 

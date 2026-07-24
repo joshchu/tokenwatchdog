@@ -100,6 +100,29 @@ and automatic graduation from the default model to Monte Carlo once enough
 history accumulates (today it's an explicit config choice) are natural next
 steps but aren't built yet.
 
+## Limitations
+
+- **Codex history requires the tool to be running.** Codex's own session
+  logs only ever contain the *current* snapshot, not a time series — there's
+  nothing to backfill from once the tool starts back up. If TokenWatchDog
+  isn't running, that stretch of Codex usage is genuinely unrecoverable; this
+  isn't a bug, it's a property of what Codex exposes locally.
+- **Claude history can be backfilled.** Both Claude sources keep their own
+  history independent of whether TokenWatchDog is running — token-compute
+  re-scans Claude Code's own transcripts (bounded by
+  `predictor.history_retention_weeks`), and Desktop mode reads everything
+  `plan-usage-history.json` still retains (~5 days). Either way, a period
+  with the tool off isn't a gap once it's running again.
+- **Only tested on macOS so far.** Notifications (`terminal-notifier` /
+  `osascript` / the spoken bark via `say`) are macOS-specific. The core
+  polling/prediction logic is plain Python and *should* run elsewhere, but
+  it hasn't been run or verified on Linux or Windows.
+- Claude's weekly and 5-hour reset times are derived from an actually
+  observed reset in your own history (not assumed), but there's no reset to
+  learn from until one has happened at least once since the tool started
+  watching — until then, the reset countdown for that window is honestly
+  unknown rather than guessed.
+
 ## Development
 
 ```bash

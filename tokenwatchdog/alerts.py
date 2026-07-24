@@ -66,24 +66,30 @@ def _evaluate_threshold(
 def _evaluate_burn(
     forecast: Forecast, cfg: Config, store: Store, now: float
 ) -> Alert | None:
+    """Fires only when exhaustion is actually imminent — projected within
+    `burn_alert_within_hours` (default 1h) — not merely "sometime before
+    the window resets," which could be days off and isn't urgent. Gating
+    on distance-from-reset instead of real urgency is what made this fire
+    for burns that were technically on pace but nowhere near soon."""
     window = forecast.window
+    hours_to_exhaust: float | None = None
     if (
-        forecast.status != "OK"
-        or not forecast.exhausts_before_reset
-        or window.used_percent < cfg.thresholds.burn_min_percent
-        or forecast.eta_calendar is None
-        or forecast.time_to_reset_h is None
+        forecast.status == "OK"
+        and forecast.exhausts_before_reset
+        and window.used_percent >= cfg.thresholds.burn_min_percent
+        and forecast.eta_calendar is not None
     ):
-        condition = False
-    else:
         hours_to_exhaust = (forecast.eta_calendar.timestamp() - now) / 3600.0
-        margin_h = forecast.time_to_reset_h - hours_to_exhaust
-        condition = margin_h >= cfg.thresholds.burn_margin_hours
+    condition = (
+        hours_to_exhaust is not None
+        and hours_to_exhaust <= cfg.thresholds.burn_alert_within_hours
+    )
 
+    minutes_to_exhaust = max(hours_to_exhaust or 0.0, 0.0) * 60.0
     message = (
         f"{window.provider.value} {window.kind.value} is burning too fast: "
-        f"{window.used_percent:.0f}% used and on pace to exhaust before its "
-        f"next reset"
+        f"{window.used_percent:.0f}% used, projected to exhaust in "
+        f"~{minutes_to_exhaust:.0f} min (before its next reset)"
     )
     return _evaluate(
         forecast,

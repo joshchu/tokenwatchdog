@@ -49,7 +49,11 @@ def _seeded_random():
 
 def test_produces_ordered_p50_p90_band_with_enough_history(cfg):
     now = 1_000_000.0
-    resets_at = now + 20 * 3600
+    # Reset far enough out that a ~2%/h burn from the last block's used%
+    # (well under 50%) genuinely exhausts before it -- simulations are
+    # capped AT the reset, so a too-close resets_at would correctly (but
+    # unhelpfully for this test) report "no ETA, doesn't exhaust in time."
+    resets_at = now + 60 * 3600
     history = []
     ts = now - 5 * 24 * 3600
     percent = 0.0
@@ -73,6 +77,27 @@ def test_produces_ordered_p50_p90_band_with_enough_history(cfg):
     assert forecast.prob_exhaust_before_reset is not None
     assert 0.0 <= forecast.prob_exhaust_before_reset <= 1.0
     assert forecast.confidence in ("low", "medium", "high")
+
+
+def test_simulation_is_capped_at_an_imminent_reset(cfg):
+    """Regression: simulations must run only up to a KNOWN reset, not
+    beyond it. A slow, steady burn with a reset an hour away should
+    report no ETA (not at risk this cycle) rather than a far-future
+    exhaustion time that ignores the refill happening first."""
+    now = 1_000_000.0
+    resets_at = now + 3600  # resets in 1h
+    # +0.07%/h, oldest first -- at this rate it would take roughly 1200
+    # hours to exhaust from 10%, nowhere close to the 1h reset.
+    hours_ago = list(range(20, -1, -1))
+    history = [
+        _sample(now - h * 3600, 10.0 + (20 - h) * 0.07, resets_at) for h in hours_ago
+    ]
+    window = _window(WindowKind.W5H, history[-1].used_percent, now, resets_at)
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+    assert forecast.status == "OK"
+    assert forecast.eta_p50 is None
+    assert forecast.eta_calendar is None
+    assert forecast.exhausts_before_reset is False
 
 
 def test_idle_short_circuits_before_simulating(cfg):

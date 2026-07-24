@@ -67,7 +67,10 @@ class WindowsConfig:
 class ThresholdsConfig:
     warn_percent: float = 90.0
     burn_min_percent: float = 25.0
-    burn_margin_hours: float = 0.25
+    # The burn alert fires only when projected to actually exhaust the
+    # window within this many hours -- not merely "sometime before the
+    # window resets," which could be days away and isn't urgent.
+    burn_alert_within_hours: float = 1.0
     stale_after_minutes: float = 10.0
     threshold_hysteresis: float = 10.0
 
@@ -174,11 +177,28 @@ def _build_config(raw: dict) -> Config:
     return Config(**top_level, **sections)
 
 
+_RENAMED_KEYS = {
+    # old key -> new key. Grows (never shrinks) as fields get renamed, so
+    # anyone upgrading gets a fix, not a bare crash on their existing
+    # config.toml.
+    "burn_margin_hours": "burn_alert_within_hours",
+}
+
+
 def _build_section(cls: type, data: dict):
     valid_names = {f.name for f in dataclasses.fields(cls)}
     unknown = set(data) - valid_names
     if unknown:
-        raise ConfigError(f"{cls.__name__}: unknown key(s) {sorted(unknown)}")
+        parts = [
+            f"{key!r} was renamed to {_RENAMED_KEYS[key]!r}"
+            if key in _RENAMED_KEYS
+            else repr(key)
+            for key in sorted(unknown)
+        ]
+        raise ConfigError(
+            f"{cls.__name__}: unknown key(s) in config.toml: {', '.join(parts)} "
+            f"— update or remove them"
+        )
     return cls(**data)
 
 
@@ -287,7 +307,7 @@ watch = ["weekly", "w5h"]
 [thresholds]
 warn_percent = 90.0
 burn_min_percent = 25.0
-burn_margin_hours = 0.25
+burn_alert_within_hours = 1.0        # alert only if projected to exhaust this soon
 stale_after_minutes = 10
 threshold_hysteresis = 10.0
 

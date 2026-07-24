@@ -94,6 +94,79 @@ def test_desktop_source_maps_fh_sd_to_w5h_and_weekly(sandbox_home, tmp_path, sto
     assert windows[WindowKind.W5H].is_estimated is False
 
 
+def test_desktop_source_backfills_every_retained_sample(sandbox_home, tmp_path, store):
+    """Regression: Desktop retains ~5 days of history on its own regardless
+    of whether TokenWatchDog is running. Only ever reading the latest
+    point would silently drop that history during any downtime, even
+    though Desktop's own file already has it -- read() must return every
+    retained sample (engine.py persists each one; only the last is used
+    for the live forecast) so downtime isn't a gap for this source."""
+    desktop_dir = sandbox_home / "Library" / "Application Support" / "Claude"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "plan-usage-history.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "samples": [
+                    {"t": 1_000_000, "org": "org-1", "u": {"fh": 40, "sd": 12}},
+                    {"t": 2_000_000, "org": "org-1", "u": {"fh": 55, "sd": 15}},
+                    {"t": 3_000_000, "org": "org-1", "u": {"fh": 70, "sd": 18}},
+                ],
+            }
+        )
+    )
+    cfg = _write_config(tmp_path, '[claude]\nsource = "desktop"\n')
+
+    windows = claude_provider.ClaudeProvider().read(cfg, store)
+    w5h_percents = sorted(w.used_percent for w in windows if w.kind is WindowKind.W5H)
+    assert w5h_percents == [40.0, 55.0, 70.0]
+
+    for window in windows:
+        store.insert_sample(
+            captured_at=window.source_ts,
+            provider=window.provider,
+            window_kind=window.kind,
+            source_ts=window.source_ts,
+            used_percent=window.used_percent,
+            window_minutes=window.window_minutes,
+            resets_at=window.resets_at,
+            is_estimated=window.is_estimated,
+            source_file=window.source_file,
+        )
+    stored = store.recent_samples(Provider.CLAUDE, WindowKind.W5H, since_ts=0.0)
+    assert [s.used_percent for s in stored] == [40.0, 55.0, 70.0]
+
+
+def test_desktop_backfill_excludes_samples_from_a_different_org(
+    sandbox_home, tmp_path, store
+):
+    """Regression: Desktop can retain samples from more than one Claude org
+    if the account switched between them. Each org has its own independent
+    quota, and the store has no org dimension, so backfilling a prior org's
+    samples alongside the current one would look like an arbitrary usage
+    jump or a spurious reset in the current org's history."""
+    desktop_dir = sandbox_home / "Library" / "Application Support" / "Claude"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "plan-usage-history.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "samples": [
+                    {"t": 1_000_000, "org": "org-old", "u": {"fh": 90, "sd": 80}},
+                    {"t": 2_000_000, "org": "org-old", "u": {"fh": 95, "sd": 85}},
+                    {"t": 3_000_000, "org": "org-new", "u": {"fh": 5, "sd": 3}},
+                    {"t": 4_000_000, "org": "org-new", "u": {"fh": 10, "sd": 6}},
+                ],
+            }
+        )
+    )
+    cfg = _write_config(tmp_path, '[claude]\nsource = "desktop"\n')
+
+    windows = claude_provider.ClaudeProvider().read(cfg, store)
+    w5h_percents = sorted(w.used_percent for w in windows if w.kind is WindowKind.W5H)
+    assert w5h_percents == [5.0, 10.0]  # only org-new, never org-old's 90/95
+
+
 def test_desktop_source_missing_file_returns_empty(sandbox_home, tmp_path, store):
     cfg = _write_config(tmp_path, '[claude]\nsource = "desktop"\n')
     assert claude_provider.ClaudeProvider().read(cfg, store) == []

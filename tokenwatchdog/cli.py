@@ -10,20 +10,27 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections import deque
+from collections.abc import Sequence
 from datetime import datetime, tzinfo
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
 from tokenwatchdog.config import Config, load_config, resolve_timezone
 from tokenwatchdog.engine import Engine
-from tokenwatchdog.models import Forecast, MonitorState
+from tokenwatchdog.models import Alert, Forecast, MonitorState
 
 _CALM_EMOJI = "🐶"
 _ALERT_EMOJI = "🐕"
 _BURN_EMOJI = "🔥"
+
+# How many past alerts stay visible in the terminal after they fire — an OS
+# notification (and the bark) is easy to miss or forget the reason for, so
+# the dashboard keeps a short, visible trail of what actually fired and why.
+_ALERT_LOG_SIZE = 10
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,7 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     with Engine(cfg=cfg) as engine:
         if args.once:
             state = engine.tick()
-            Console().print(_render(state, cfg))
+            alert_log: deque[Alert] = deque(state.alerts, maxlen=_ALERT_LOG_SIZE)
+            Console().print(_render(state, cfg, alert_log))
             return 0
         if args.headless:
             return _run_headless(engine, cfg)
@@ -54,11 +62,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def _run_live(engine: Engine, cfg: Config) -> int:
     console = Console()
+    alert_log: deque[Alert] = deque(maxlen=_ALERT_LOG_SIZE)
     try:
         with Live(console=console, screen=False, refresh_per_second=1) as live:
             while True:
                 state = engine.tick()
-                live.update(_render(state, cfg))
+                alert_log.extend(state.alerts)
+                live.update(_render(state, cfg, alert_log))
                 time.sleep(cfg.poll_interval_seconds)
     except KeyboardInterrupt:
         pass
@@ -75,7 +85,7 @@ def _run_headless(engine: Engine, cfg: Config) -> int:
     return 0
 
 
-def _render(state: MonitorState, cfg: Config) -> Panel:
+def _render(state: MonitorState, cfg: Config, alert_log: Sequence[Alert]) -> Group:
     tz = resolve_timezone(cfg)
     table = Table(expand=True)
     for column in (
@@ -98,12 +108,29 @@ def _render(state: MonitorState, cfg: Config) -> Panel:
 
     mascot = _mascot_glyph(state.forecasts)
     updated = datetime.fromtimestamp(state.now, tz=tz).strftime("%Y-%m-%d %H:%M:%S %Z")
-    return Panel(
+    panel = Panel(
         table,
         title=f"{mascot} TokenWatchDog — updated {updated}",
         subtitle="* = estimated (token-based limit is a guess, not an official cap)",
         border_style="blue",
     )
+    if not alert_log:
+        return Group(panel)
+    return Group(panel, _render_alert_log(alert_log, tz))
+
+
+def _render_alert_log(alert_log: Sequence[Alert], tz: tzinfo) -> Panel:
+    """What actually fired, and why — a notification banner or a bark is
+    easy to miss or forget the reason for once it's gone; this stays on
+    screen so "why did it just bark" always has an answer close by."""
+    table = Table(expand=True, box=None, show_header=True)
+    table.add_column("Fired", width=8)
+    table.add_column("Alert")
+    for alert in reversed(list(alert_log)):
+        fired = datetime.fromtimestamp(alert.fired_at, tz=tz).strftime("%H:%M:%S")
+        label = f"{alert.provider.value}/{alert.kind.value} · {alert.alert_kind}"
+        table.add_row(fired, f"[bold]{label}[/bold] — {alert.message}")
+    return Panel(table, title="🔔 Recent alerts", border_style="yellow")
 
 
 def _row(forecast: Forecast, tz: tzinfo) -> tuple[str, ...]:

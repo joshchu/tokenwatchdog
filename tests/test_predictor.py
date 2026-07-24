@@ -118,6 +118,12 @@ def test_100_percent_used_exhausts_immediately(cfg):
 
 
 def test_w5h_caps_exhaustion_claim_at_reset_when_burn_is_slow(cfg):
+    """Regression: a linear projection that would only reach 100% well
+    after a known, imminent reset must not be reported as an ETA at all —
+    the window refills before usage ever gets there, so there's nothing
+    to warn about. Reported previously as: the 5h ETA didn't account for
+    an imminent reset, showing a nonsensical far-future "exhaustion" time
+    for a window that was about to refresh in an hour."""
     now = 100_000.0
     resets_at = now + 1 * 3600  # resets in 1h
     history = [_sample(now - 900, 10.0, resets_at), _sample(now, 11.0, resets_at)]
@@ -125,6 +131,9 @@ def test_w5h_caps_exhaustion_claim_at_reset_when_burn_is_slow(cfg):
     forecast = LinearPredictor().forecast(window, history, [], cfg, now)
     assert forecast.status == "OK"
     assert forecast.exhausts_before_reset is False
+    assert forecast.eta_calendar is None
+    assert forecast.eta_workhours is None
+    assert forecast.time_to_reset_h == pytest.approx(1.0, rel=0.01)
     assert forecast.time_to_reset_h == pytest.approx(1.0, rel=0.01)
 
 
@@ -162,20 +171,64 @@ def test_unknown_w5h_block_start_leaves_reset_unknown(cfg):
     assert forecast.exhausts_before_reset is False
 
 
-def test_weekly_resets_at_derived_as_next_monday_midnight_utc(cfg):
-    # Verified: 2026-07-24 is a Friday, 2026-07-27 is the following Monday.
-    now_dt = datetime(2026, 7, 24, 15, 0, tzinfo=UTC)
-    now = now_dt.timestamp()
-    history = [_sample(now - 60, 8.0, None), _sample(now, 10.0, None)]
+def test_weekly_resets_at_derived_from_observed_reset_not_a_calendar_guess(cfg):
+    """Regression: the weekly reset time must come from an actually
+    observed reset (block_started_at + 7 days), never a hardcoded
+    calendar assumption like "next Monday" — Anthropic doesn't publish
+    the true anchor, and guessing one would violate "never fabricate.\""""
+    now = 100_000.0
+    block_start = now - 3 * 24 * 3600  # a reset was observed 3 days ago
+    history = [
+        _sample(block_start - 60, 98.0, None),
+        _sample(block_start, 1.0, None),  # reset happened here
+        _sample(now, 20.0, None),
+    ]
     window = _window(
-        Provider.CLAUDE, WindowKind.WEEKLY, 10.0, now, resets_at=None, is_estimated=True
+        Provider.CLAUDE, WindowKind.WEEKLY, 20.0, now, resets_at=None, is_estimated=True
     )
-    cfg_utc = dataclasses.replace(cfg, timezone="UTC")
-    forecast = LinearPredictor().forecast(window, history, [], cfg_utc, now)
-    expected_monday = datetime(2026, 7, 27, 0, 0, tzinfo=UTC)
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+    expected_resets_at = block_start + 7 * 24 * 3600
+    assert forecast.window.resets_at == pytest.approx(expected_resets_at, rel=0.01)
     assert forecast.time_to_reset_h == pytest.approx(
-        (expected_monday.timestamp() - now) / 3600, rel=0.001
+        (expected_resets_at - now) / 3600, rel=0.01
     )
+
+
+def test_stale_derived_reset_is_advanced_to_a_future_cycle_not_left_in_the_past(cfg):
+    """Regression: if the observed reset is more than a full cycle old —
+    e.g. a lightly used window whose real reset produced a drop too small
+    for `_is_reset` to catch — the derived resets_at must not come out in
+    the past. It should advance by whole cycles instead, since the same
+    fixed-cycle assumption already being made implies the window kept
+    resetting on schedule even though we didn't see the boundary."""
+    now = 100_000.0
+    block_start = now - 13 * 3600  # W5H (5h) cycle: 2 whole cycles have elapsed
+    history = [
+        _sample(block_start - 60, 98.0, None),
+        _sample(block_start, 1.0, None),  # the one reset we DID observe
+        _sample(now, 30.0, None),
+    ]
+    window = _window(
+        Provider.CLAUDE, WindowKind.W5H, 30.0, now, resets_at=None, is_estimated=True
+    )
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+    assert forecast.window.resets_at is not None
+    assert forecast.window.resets_at > now
+    # Anchored to the same block_start + a whole number of 5h cycles.
+    assert (forecast.window.resets_at - block_start) % (5 * 3600) == pytest.approx(
+        0.0, abs=0.01
+    )
+
+
+def test_weekly_resets_at_unknown_when_no_reset_ever_observed(cfg):
+    now = 100_000.0
+    history = [_sample(now - 60, 18.0, None), _sample(now, 20.0, None)]
+    window = _window(
+        Provider.CLAUDE, WindowKind.WEEKLY, 20.0, now, resets_at=None, is_estimated=True
+    )
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+    assert forecast.window.resets_at is None
+    assert forecast.time_to_reset_h is None
 
 
 def test_working_hours_projection_skips_the_weekend(cfg):
