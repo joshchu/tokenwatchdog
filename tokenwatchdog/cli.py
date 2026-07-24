@@ -153,7 +153,7 @@ def _row(forecast: Forecast, tz: tzinfo) -> tuple[str, ...]:
         _fmt_dt(forecast.eta_calendar, tz),
         _fmt_dt(forecast.eta_workhours, tz),
         _fmt_dt(resets_dt, tz),
-        forecast.confidence,
+        forecast.confidence or "—",
     )
 
 

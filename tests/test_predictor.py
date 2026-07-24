@@ -67,6 +67,21 @@ def test_steady_weekly_burn_produces_sane_eta_and_exhausts_before_reset(cfg):
     )
 
 
+def test_flat_burn_reports_no_confidence_not_a_number_for_a_missing_eta(cfg):
+    """Regression: confidence rates the burn-rate estimate, not whether an
+    ETA is shown. With zero burn there's no exhaustion trajectory at all —
+    showing e.g. "medium" next to a blank ETA read as confidence in a
+    forecast that doesn't exist."""
+    now = 100_000.0
+    history = [_sample(now - 3600, 40.0), _sample(now - 1800, 40.0), _sample(now, 40.0)]
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 40.0, now)
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.burn_per_hour == pytest.approx(0.0)
+    assert forecast.eta_calendar is None
+    assert forecast.confidence is None
+
+
 def test_stale_sample_is_idle(cfg):
     now = 100_000.0
     stale_source_ts = now - cfg.thresholds.stale_after_minutes * 60 - 60

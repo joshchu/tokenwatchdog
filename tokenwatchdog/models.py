@@ -55,7 +55,7 @@ class Forecast:
     eta_p50: datetime | None
     eta_p90: datetime | None
     prob_exhaust_before_reset: float | None
-    confidence: Confidence
+    confidence: Confidence | None  # None when there's no exhaustion trajectory at all
     exhausts_before_reset: bool
     n_samples: int
 

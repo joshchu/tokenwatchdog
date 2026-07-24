@@ -596,6 +596,11 @@ def _project_forecast(
     time_to_reset_h = (resets_at - now) / 3600.0 if resets_at is not None else None
 
     if burn_per_hour <= 0:
+        # Flat/negative burn means there's no exhaustion trajectory at all —
+        # not "unknown," "none." Confidence rates how much a burn-rate
+        # estimate should be trusted; with nothing being forecast, there's
+        # nothing for it to rate, so it's None rather than a number that
+        # reads as confidence in an ETA that isn't shown.
         return Forecast(
             window=window,
             status="OK",
@@ -607,7 +612,7 @@ def _project_forecast(
             eta_p50=None,
             eta_p90=None,
             prob_exhaust_before_reset=None,
-            confidence=_confidence(n_samples),
+            confidence=None,
             exhausts_before_reset=False,
             n_samples=n_samples,
         )
