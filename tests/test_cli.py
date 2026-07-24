@@ -4,11 +4,16 @@ alert log only appears when there's something to show."""
 from __future__ import annotations
 
 import dataclasses
+import os
+import pty
+import sys
+import time
+import tty
 from datetime import datetime, timezone
 
 from rich.console import Console
 
-from tokenwatchdog.cli import _render, _row_style
+from tokenwatchdog.cli import _render, _row_style, _spacebar_pressed
 from tokenwatchdog.models import (
     Alert,
     Forecast,
@@ -118,3 +123,58 @@ def test_row_style_is_none_for_stale_idle_even_over_threshold(cfg):
     unreliable."""
     forecast = dataclasses.replace(_forecast(_window(used_percent=95.0)), status="IDLE")
     assert _row_style(forecast, cfg, now=1000.0) is None
+
+
+def test_spacebar_pressed_falls_back_to_plain_sleep_when_not_a_tty(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+    class _NotATty:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _NotATty())
+    assert _spacebar_pressed(42.0) is False
+    assert sleeps == [42.0]
+
+
+def test_spacebar_pressed_returns_true_on_a_real_keypress(monkeypatch):
+    """A real pty, not a mock -- proves the select/read wiring actually
+    reacts to a keypress instead of just asserting the fallback branch.
+    cbreak is set on the slave BEFORE writing the key: writing first (then
+    switching modes) leaves the byte sitting in the canonical-mode line
+    buffer, which is not guaranteed to become visible to select/read after
+    the mode switch and made this flaky."""
+    master_fd, slave_fd = pty.openpty()
+    tty.setcbreak(slave_fd)
+    stdin_fake = os.fdopen(slave_fd, "r")
+    try:
+        monkeypatch.setattr(sys, "stdin", stdin_fake)
+        os.write(master_fd, b" ")
+        start = time.monotonic()
+        assert _spacebar_pressed(5.0) is True
+        assert time.monotonic() - start < 2.0
+    finally:
+        stdin_fake.close()
+        os.close(master_fd)
+
+
+def test_spacebar_pressed_returns_false_when_the_interval_elapses(monkeypatch):
+    master_fd, slave_fd = pty.openpty()
+    tty.setcbreak(slave_fd)
+    stdin_fake = os.fdopen(slave_fd, "r")
+    try:
+        monkeypatch.setattr(sys, "stdin", stdin_fake)
+        assert _spacebar_pressed(0.05) is False
+    finally:
+        stdin_fake.close()
+        os.close(master_fd)
+
+
+def test_render_shows_a_refreshing_indicator_in_the_header(cfg):
+    window = _window()
+    state = MonitorState(
+        now=1000.0, windows=(window,), forecasts=(_forecast(window),), alerts=()
+    )
+    text = _render_to_text(_render(state, cfg, [], refreshing=True))
+    assert "refreshing" in text

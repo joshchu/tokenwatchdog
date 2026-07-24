@@ -8,6 +8,8 @@ module.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import select
 import sys
 import time
 from collections import deque
@@ -22,6 +24,13 @@ from rich.table import Table
 from tokenwatchdog.config import Config, load_config, resolve_timezone
 from tokenwatchdog.engine import Engine
 from tokenwatchdog.models import Alert, Forecast, MonitorState
+
+try:
+    import termios
+    import tty
+except ImportError:  # Windows has neither -- fall back to a plain sleep
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 _CALM_EMOJI = "🐶"
 _ALERT_EMOJI = "🐕"
@@ -62,17 +71,72 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def _run_live(engine: Engine, cfg: Config) -> int:
     console = Console()
+    console.clear()  # start at the top of the terminal, not wherever the shell left it
+    console.print("[dim]Press space to refresh now, Ctrl-C to quit.[/dim]")
     alert_log: deque[Alert] = deque(maxlen=_ALERT_LOG_SIZE)
     try:
-        with Live(console=console, screen=False, refresh_per_second=1) as live:
+        with (
+            _cbreak_stdin(),
+            Live(console=console, screen=False, refresh_per_second=4) as live,
+        ):
             while True:
                 state = engine.tick()
                 alert_log.extend(state.alerts)
-                live.update(_render(state, cfg, alert_log))
-                time.sleep(cfg.poll_interval_seconds)
+                live.update(_render(state, cfg, alert_log), refresh=True)
+                if _spacebar_pressed(cfg.poll_interval_seconds):
+                    # Immediate feedback that the keypress registered -- the
+                    # next tick can still take a moment (reading Codex/Claude
+                    # logs), so without this the display just looks frozen.
+                    live.update(
+                        _render(state, cfg, alert_log, refreshing=True), refresh=True
+                    )
     except KeyboardInterrupt:
         pass
     return 0
+
+
+@contextlib.contextmanager
+def _cbreak_stdin():
+    """Puts the terminal into cbreak mode (no line-buffering, no echo) for
+    the whole live session. Toggling this on/off every poll cycle left a
+    window where the terminal was back in cooked/echo-on mode in between --
+    a keypress landing in that window got echoed straight to the screen by
+    the tty driver itself (bypassing Rich entirely), desyncing Live's
+    line-count bookkeeping and leaving a stray duplicate border line
+    behind on the next redraw. Falls back to a no-op when stdin isn't an
+    interactive TTY or on a platform without termios/tty (Windows)."""
+    if termios is None or tty is None or not sys.stdin.isatty():
+        yield
+        return
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    tty.setcbreak(fd)  # keeps ISIG, so Ctrl-C still raises KeyboardInterrupt
+    try:
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
+def _spacebar_pressed(seconds: float) -> bool:
+    """Waits up to `seconds`, returning True if a spacebar press woke it
+    early (so the caller can trigger an immediate refresh) or False once
+    the full interval elapses. Assumes stdin is already in cbreak mode
+    (see _cbreak_stdin) — falls back to a plain sleep, always returning
+    False, when stdin isn't an interactive TTY or termios/tty aren't
+    available."""
+    if termios is None or tty is None or not sys.stdin.isatty():
+        time.sleep(seconds)
+        return False
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        ready, _, _ = select.select([sys.stdin], [], [], remaining)
+        if not ready:
+            return False
+        if sys.stdin.read(1) == " ":
+            return True
 
 
 def _run_headless(engine: Engine, cfg: Config) -> int:
@@ -85,7 +149,13 @@ def _run_headless(engine: Engine, cfg: Config) -> int:
     return 0
 
 
-def _render(state: MonitorState, cfg: Config, alert_log: Sequence[Alert]) -> Group:
+def _render(
+    state: MonitorState,
+    cfg: Config,
+    alert_log: Sequence[Alert],
+    *,
+    refreshing: bool = False,
+) -> Group:
     tz = resolve_timezone(cfg)
     # All wall-clock columns below are already tz-converted (see _row/_fmt_dt)
     # — label them with the actual abbreviation so a local time is never
@@ -112,9 +182,10 @@ def _render(state: MonitorState, cfg: Config, alert_log: Sequence[Alert]) -> Gro
 
     mascot = _mascot_glyph(state.forecasts, cfg)
     updated = datetime.fromtimestamp(state.now, tz=tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+    status_suffix = " — refreshing…" if refreshing else ""
     panel = Panel(
         table,
-        title=f"{mascot} TokenWatchDog — updated {updated}",
+        title=f"{mascot} TokenWatchDog — updated {updated}{status_suffix}",
         subtitle=(
             "* = estimated (token-based limit is a guess, not an official cap)"
             " · red = alert · yellow = trending toward exhaustion"
