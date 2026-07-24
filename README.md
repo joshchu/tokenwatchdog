@@ -52,7 +52,7 @@ enough that it will run out before the window naturally resets.
 Requires Python 3.13+.
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/joshchu/tokenwatchdog.git
 cd tokenwatchdog
 uv sync
 uv run python -m tokenwatchdog
