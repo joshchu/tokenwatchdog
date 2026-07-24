@@ -10,6 +10,10 @@
   predicts when each window will actually run out.
 </p>
 
+<p align="center">
+  <img src="tokenwatchdog/assets/screenshot.svg" alt="TokenWatchDog terminal dashboard">
+</p>
+
 ---
 
 ## Why
