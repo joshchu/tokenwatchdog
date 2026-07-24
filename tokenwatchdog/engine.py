@@ -7,6 +7,7 @@ is a thin shell over this.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 
 from tokenwatchdog.alerts import evaluate as evaluate_alerts
@@ -20,7 +21,12 @@ from tokenwatchdog.models import (
     WindowKind,
 )
 from tokenwatchdog.notify import notify
-from tokenwatchdog.predictor import Predictor, select_predictor
+from tokenwatchdog.predictor import (
+    Predictor,
+    overage_cost_usd,
+    select_predictor,
+    tokens_burned_past_quota,
+)
 from tokenwatchdog.providers.base import QuotaProvider
 from tokenwatchdog.providers.claude import ClaudeProvider
 from tokenwatchdog.providers.codex import CodexProvider
@@ -113,12 +119,24 @@ class Engine:
         weeks = max(self.cfg.predictor.history_retention_weeks, 1)
         lookback_seconds = weeks * 7 * 24 * 3600
         history = self.store.recent_samples(provider_enum, kind, now - lookback_seconds)
-        token_events = (
-            self.store.recent_token_events(provider_enum, now - lookback_seconds)
-            if provider_enum is Provider.CLAUDE
-            else []
+        # Unconditional: Codex now ingests its own per-event token counts too
+        # (providers/codex.py), so this is real data for both providers, not
+        # just Claude -- empty and harmless for any provider that doesn't.
+        token_events = self.store.recent_token_events(
+            provider_enum, now - lookback_seconds
         )
-        return self._predictor.forecast(window, history, token_events, self.cfg, now)
+        forecast = self._predictor.forecast(
+            window, history, token_events, self.cfg, now
+        )
+        burned = tokens_burned_past_quota(window, history, token_events)
+        cost = overage_cost_usd(window, history, token_events, self.cfg)
+        if burned is None and cost is None:
+            return forecast
+        return dataclasses.replace(
+            forecast,
+            tokens_burned_past_quota=burned,
+            cost_burned_past_quota_usd=cost,
+        )
 
     def _watched_pairs(self) -> list[tuple[Provider, WindowKind]]:
         kinds = [WindowKind(k) for k in self.cfg.windows.watch]

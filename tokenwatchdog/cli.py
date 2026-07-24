@@ -166,6 +166,7 @@ def _render(
         "Provider",
         "Window",
         "Used %",
+        "Past cap",
         "Status",
         "Burn %/h",
         f"ETA (calendar, {tz_label})",
@@ -222,6 +223,7 @@ def _row(forecast: Forecast, tz: tzinfo) -> tuple[str, ...]:
         window.provider.value,
         window.kind.value,
         used,
+        _fmt_overage(forecast),
         _status_label(forecast),
         burn,
         _fmt_dt(forecast.eta_calendar, tz),
@@ -229,6 +231,27 @@ def _row(forecast: Forecast, tz: tzinfo) -> tuple[str, ...]:
         _fmt_dt(resets_dt, tz),
         forecast.confidence or "—",
     )
+
+
+def _fmt_overage(forecast: Forecast) -> str:
+    """The most informative thing we know about usage since the window
+    pinned at 100% -- a priced $ estimate when configured (see
+    predictor.overage_cost_usd), else the raw token count, else nothing.
+    used_percent alone reads as "0 burn" here (see _row for why); this is
+    what actually moves once it does."""
+    if forecast.cost_burned_past_quota_usd is not None:
+        return f"${forecast.cost_burned_past_quota_usd:,.2f}"
+    if forecast.tokens_burned_past_quota is not None:
+        return _fmt_tokens(forecast.tokens_burned_past_quota)
+    return "—"
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M tok"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K tok"
+    return f"{n} tok"
 
 
 def _status_label(forecast: Forecast) -> str:

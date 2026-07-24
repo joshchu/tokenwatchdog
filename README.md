@@ -44,11 +44,18 @@ enough that it will run out before the window naturally resets.
   you get at most one ping per window
 - Persists history locally (SQLite) so the Monte Carlo model has real data
   to learn from, from the very first run
-- Terminal dashboard UI — rows highlight red for an active alert or yellow
-  for usage trending toward exhaustion — with a `--headless` mode for
-  running as a background agent
+- Terminal dashboard UI — rows highlight red for an active alert, at 100%
+  used, or yellow for usage trending toward exhaustion — with a `--headless`
+  mode for running as a background agent
 - Works with either provider alone or both at once; gracefully shows "no
   data" instead of guessing when a provider doesn't expose a window
+- Once Codex's own reported percentage pins at 100%, its burn rate alone
+  goes blind — the "Past cap" column keeps tracking real tokens spent past
+  that point (from the same session logs), and shows a `$` estimate instead
+  of a raw token count once you set your plan's real overage rate in
+  `codex.input_price_per_million_usd` / `codex.output_price_per_million_usd`
+  in `config.toml` (both default to `0`, i.e. off — this tool never guesses
+  a price for you)
 
 ## Quickstart
 

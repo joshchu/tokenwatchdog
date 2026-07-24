@@ -46,6 +46,13 @@ class ProvidersConfig:
 @dataclass(frozen=True)
 class CodexConfig:
     home: str = ""  # "" -> $CODEX_HOME or ~/.codex
+    # 0.0 = not configured -> no $ estimate shown, tokens-past-quota shows
+    # instead. Codex's own API never reports a price -- these only ever
+    # reflect what you configure yourself, matching your actual plan's
+    # overage/credit rate. Output pricing (which includes reasoning
+    # tokens) is usually several times input pricing.
+    input_price_per_million_usd: float = 0.0
+    output_price_per_million_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -215,6 +222,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("thresholds.warn_percent must be within [0, 100]")
     if not 0.0 <= cfg.thresholds.burn_min_percent <= 100.0:
         raise ConfigError("thresholds.burn_min_percent must be within [0, 100]")
+    if cfg.codex.input_price_per_million_usd < 0.0:
+        raise ConfigError("codex.input_price_per_million_usd must not be negative")
+    if cfg.codex.output_price_per_million_usd < 0.0:
+        raise ConfigError("codex.output_price_per_million_usd must not be negative")
     if cfg.predictor.model not in _VALID_PREDICTOR_MODELS:
         raise ConfigError(
             f"predictor.model must be one of {sorted(_VALID_PREDICTOR_MODELS)}, "
@@ -292,6 +303,8 @@ claude = true
 
 [codex]
 home = ""                            # "" -> $CODEX_HOME or ~/.codex
+input_price_per_million_usd = 0.0    # set to your plan's real overage/credit rate
+output_price_per_million_usd = 0.0   # to show $ burned past quota instead of just tokens
 
 [claude]
 source = "auto"                      # "auto" (desktop->tokens) | "desktop" | "tokens"

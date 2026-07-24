@@ -40,3 +40,15 @@ def test_working_hours_start_must_be_before_end(tmp_path):
     )
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_codex_token_prices_default_to_unconfigured(tmp_path):
+    cfg = load_config(tmp_path / "config.toml")
+    assert cfg.codex.input_price_per_million_usd == 0.0
+    assert cfg.codex.output_price_per_million_usd == 0.0
+
+
+def test_negative_codex_token_price_fails_loud(tmp_path):
+    path = _write(tmp_path, "[codex]\ninput_price_per_million_usd = -1.0\n")
+    with pytest.raises(ConfigError, match="input_price_per_million_usd"):
+        load_config(path)

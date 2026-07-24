@@ -25,6 +25,7 @@ from tokenwatchdog.models import (
     Confidence,
     Forecast,
     ForecastStatus,
+    Provider,
     Window,
     WindowKind,
 )
@@ -362,6 +363,81 @@ def _current_block(history: list[SampleRow]) -> _BlockView:
     block = blocks[-1]
     started_at = block[0].source_ts if len(blocks) > 1 else None
     return _BlockView(samples=block, block_started_at=started_at)
+
+
+def tokens_burned_past_quota(
+    window: Window, history: list[SampleRow], token_events: list[TokenEventRow]
+) -> int | None:
+    """Tokens actually consumed since `used_percent` pinned at its 100%
+    ceiling this cycle -- Codex's own reported percentage cannot go past
+    100, so `burn_per_hour` reads a flat 0.00 once it's there even while
+    real usage (and real cost) continues. None until `window` has actually
+    hit 100%; once it has, sums every token event observed since the
+    earliest sample in the live streak that's still >= 100%, so tokens
+    burned while climbing TOWARD the cap aren't counted as burned PAST it.
+    None (not 0) when there's no token-event history to sum -- a provider
+    that doesn't ingest per-event token counts (Claude Desktop) has
+    nothing to report here, and 0 would misleadingly claim it does."""
+    if window.used_percent < 100.0:
+        return None
+    boundary_ts = _saturation_started_at(history)
+    if boundary_ts is None or not token_events:
+        return None
+    return sum(
+        e.input_tokens + e.output_tokens + e.cache_creation + e.cache_read
+        for e in token_events
+        if e.ts >= boundary_ts
+    )
+
+
+def overage_cost_usd(
+    window: Window,
+    history: list[SampleRow],
+    token_events: list[TokenEventRow],
+    cfg: Config,
+) -> float | None:
+    """Dollar estimate for tokens burned since `window` pinned at 100%,
+    priced from `cfg.codex.{input,output}_price_per_million_usd`. None
+    (never 0.0) unless a price is actually configured AND there's overage
+    token data to price -- $0.00 would read as "you owe nothing," a
+    materially different claim from "unpriced."
+
+    Codex only: Claude's own accounting model splits cache tokens on a
+    different axis (see providers/claude.py), so pricing it through this
+    same two-rate formula would silently misprice it -- that needs its
+    own deliberate rates, not a reuse of Codex's."""
+    input_rate = cfg.codex.input_price_per_million_usd
+    output_rate = cfg.codex.output_price_per_million_usd
+    if window.provider is not Provider.CODEX:
+        return None
+    if input_rate <= 0.0 and output_rate <= 0.0:
+        return None
+    if window.used_percent < 100.0:
+        return None
+    boundary_ts = _saturation_started_at(history)
+    if boundary_ts is None:
+        return None
+    relevant = [e for e in token_events if e.ts >= boundary_ts]
+    if not relevant:
+        return None
+    input_tokens = sum(e.input_tokens for e in relevant)
+    output_tokens = sum(e.output_tokens for e in relevant)
+    return (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000.0
+
+
+def _saturation_started_at(history: list[SampleRow]) -> float | None:
+    """The source_ts of the earliest sample, walking back from the newest,
+    in an unbroken run of used_percent >= 100 -- i.e. since quota was
+    first hit in the CURRENT cycle. A real reset always drops used_percent
+    well below 100 (see _is_reset), so this can never walk back across a
+    reset boundary without hitting a < 100 sample first; no block-splitting
+    needed."""
+    boundary_ts: float | None = None
+    for sample in reversed(history):
+        if sample.used_percent < 100.0:
+            break
+        boundary_ts = sample.source_ts
+    return boundary_ts
 
 
 _SEVEN_DAYS_SECONDS = 7 * 24 * 3600

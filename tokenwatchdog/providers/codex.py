@@ -10,12 +10,21 @@ Two load-bearing rules, both learned the hard way from real rollout files:
 
 Malformed/missing data returns an empty list rather than a guessed value —
 never fabricate a reading.
+
+Every `token_count` event also carries `payload.info.last_token_usage` — the
+real per-step token delta for that turn, independent of `used_percent`
+(which clamps at 100 and goes blind to further usage). Ingested into
+`store.token_events` the same way providers/claude.py ingests its own token
+log, so `predictor.tokens_burned_past_quota` has real data once a window
+saturates.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +50,7 @@ class CodexProvider:
 
     def read(self, cfg: Config, store: Store) -> list[Window]:
         home = _codex_home(cfg)
+        _ingest_token_events(cfg, home, store, time.time())
         candidates = _rollout_files_newest_first(home)[:_MAX_CANDIDATE_FILES]
         for path in candidates:
             event = _find_last_token_count_event(path)
@@ -91,8 +101,7 @@ def _classify(window_minutes: int) -> WindowKind | None:
     return None
 
 
-def _find_last_token_count_event(path: Path) -> dict[str, Any] | None:
-    last: dict[str, Any] | None = None
+def _iter_token_count_events(path: Path) -> Iterator[dict[str, Any]]:
     try:
         with path.open("r", errors="replace") as fh:
             for raw_line in fh:
@@ -106,16 +115,77 @@ def _find_last_token_count_event(path: Path) -> dict[str, Any] | None:
                 if not isinstance(line, dict):
                     continue
                 payload = line.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-                if payload.get("type") != "token_count":
-                    continue
-                if not isinstance(payload.get("rate_limits"), dict):
-                    continue
-                last = line
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    yield line
     except OSError:
-        return None
+        return
+
+
+def _find_last_token_count_event(path: Path) -> dict[str, Any] | None:
+    last: dict[str, Any] | None = None
+    for line in _iter_token_count_events(path):
+        if isinstance(line["payload"].get("rate_limits"), dict):
+            last = line
     return last
+
+
+def _lookback_seconds(cfg: Config) -> float:
+    weeks = max(cfg.predictor.history_retention_weeks, 1)
+    return weeks * 7 * 24 * 3600
+
+
+def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> None:
+    """Upserts every token_count event's real per-step token delta
+    (`payload.info.last_token_usage`) into store.token_events -- the
+    signal `used_percent` alone can't provide once it clamps at 100%.
+    Dedup key is the session file + the event's own timestamp (Codex has
+    no message/request id of its own), so re-scanning an already-seen
+    line is a harmless no-op re-upsert of identical values -- mirrors
+    providers/claude.py's own token-log ingestion, including the same
+    mtime-bounded file scan (older files can't affect a current-window
+    computation)."""
+    since_mtime = now - _lookback_seconds(cfg)
+    for path in _rollout_files_newest_first(home):
+        try:
+            if path.stat().st_mtime < since_mtime:
+                continue
+        except OSError:
+            continue
+        for line in _iter_token_count_events(path):
+            event = _token_event_from_line(line, path)
+            if event is None:
+                continue
+            store.upsert_token_event(provider=Provider.CODEX, **event)
+
+
+def _token_event_from_line(line: dict[str, Any], path: Path) -> dict[str, Any] | None:
+    ts = parse_iso_to_epoch(line.get("timestamp"))
+    info = line["payload"].get("info")
+    last_usage = info.get("last_token_usage") if isinstance(info, dict) else None
+    if ts is None or not isinstance(last_usage, dict):
+        return None
+    input_tokens = last_usage.get("input_tokens")
+    output_tokens = last_usage.get("output_tokens")
+    if not isinstance(input_tokens, (int, float)) or not isinstance(
+        output_tokens, (int, float)
+    ):
+        return None
+    return {
+        "request_id": path.stem,
+        "message_id": line["timestamp"],
+        "ts": ts,
+        "model": "codex",
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        # Codex's cache breakdown (cached_input_tokens, cache_write_
+        # input_tokens) is already folded INTO input/output above, unlike
+        # Claude's, where cache reads/writes are separate additive
+        # dimensions -- setting these to 0 avoids double-counting rather
+        # than reusing Claude's schema-shape for a different accounting
+        # model.
+        "cache_creation": 0,
+        "cache_read": 0,
+    }
 
 
 def _resets_at(block: dict[str, Any], event_epoch: float | None) -> float | None:

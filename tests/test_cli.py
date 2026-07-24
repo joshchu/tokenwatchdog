@@ -137,6 +137,33 @@ def test_row_style_is_red_at_full_exhaustion_even_when_idle(cfg):
     assert _row_style(forecast, cfg, now=1000.0) == "red"
 
 
+def test_row_shows_tokens_burned_past_quota_when_set(cfg):
+    forecast = dataclasses.replace(
+        _forecast(_window(used_percent=100.0)), tokens_burned_past_quota=530_000
+    )
+    state = MonitorState(
+        now=1000.0, windows=(forecast.window,), forecasts=(forecast,), alerts=()
+    )
+    text = _render_to_text(_render(state, cfg, []))
+    assert "530K tok" in text
+
+
+def test_row_shows_dollar_cost_over_token_count_when_both_are_set(cfg):
+    """A priced $ estimate is more informative than the raw token count it
+    was computed from -- show one or the other, not both."""
+    forecast = dataclasses.replace(
+        _forecast(_window(used_percent=100.0)),
+        tokens_burned_past_quota=530_000,
+        cost_burned_past_quota_usd=12.34,
+    )
+    state = MonitorState(
+        now=1000.0, windows=(forecast.window,), forecasts=(forecast,), alerts=()
+    )
+    text = _render_to_text(_render(state, cfg, []))
+    assert "$12.34" in text
+    assert "530K tok" not in text
+
+
 def test_spacebar_pressed_falls_back_to_plain_sleep_when_not_a_tty(monkeypatch):
     sleeps = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))

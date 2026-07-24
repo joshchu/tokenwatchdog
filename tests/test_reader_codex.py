@@ -31,11 +31,12 @@ def _cfg_for(tmp_path, codex_home):
     return load_config(config_path)
 
 
-def _token_count_event(ts, rate_limits):
+def _token_count_event(ts, rate_limits, last_token_usage=None):
+    info = {"last_token_usage": last_token_usage} if last_token_usage else {}
     return {
         "timestamp": ts,
         "type": "event_msg",
-        "payload": {"type": "token_count", "info": {}, "rate_limits": rate_limits},
+        "payload": {"type": "token_count", "info": info, "rate_limits": rate_limits},
     }
 
 
@@ -162,6 +163,143 @@ def test_malformed_lines_are_skipped(tmp_path, store):
 def test_no_rollout_files_returns_empty(tmp_path, store):
     cfg = _cfg_for(tmp_path, tmp_path / "empty_codex_home")
     assert CodexProvider().read(cfg, store) == []
+
+
+def test_ingests_token_events_from_last_token_usage(tmp_path, store):
+    """Regression: `used_percent` clamps at 100 and goes blind past it, but
+    the same line's `info.last_token_usage` is the real per-step delta --
+    already computed by Codex itself, verified against a live session to
+    match total_token_usage's own running delta exactly."""
+    codex_home = tmp_path / "codex_home"
+    _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-07-24T19:40:04.014Z",
+                {
+                    "primary": {
+                        "used_percent": 100.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1785260936,
+                    },
+                    "secondary": None,
+                },
+                last_token_usage={
+                    "input_tokens": 128544,
+                    "cached_input_tokens": 126720,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 115,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 128659,
+                },
+            )
+        ],
+    )
+    cfg = _cfg_for(tmp_path, codex_home)
+    CodexProvider().read(cfg, store)
+
+    events = store.recent_token_events(Provider.CODEX, 0.0)
+    assert len(events) == 1
+    assert events[0].input_tokens == 128544
+    assert events[0].output_tokens == 115
+    # Codex's cache breakdown is already folded into input/output above --
+    # these stay 0 rather than double-counting a subset of input_tokens.
+    assert events[0].cache_creation == 0
+    assert events[0].cache_read == 0
+    assert events[0].ts == parse_iso_to_epoch("2026-07-24T19:40:04.014Z")
+
+
+def test_ingests_every_token_count_event_not_just_the_last(tmp_path, store):
+    codex_home = tmp_path / "codex_home"
+    rate_limits = {
+        "primary": {"used_percent": 100.0, "window_minutes": 10080, "resets_at": 1.0},
+        "secondary": None,
+    }
+    _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-07-24T19:40:00.000Z",
+                rate_limits,
+                last_token_usage={
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                },
+            ),
+            _token_count_event(
+                "2026-07-24T19:40:04.000Z",
+                rate_limits,
+                last_token_usage={
+                    "input_tokens": 20,
+                    "output_tokens": 8,
+                    "total_tokens": 28,
+                },
+            ),
+        ],
+    )
+    cfg = _cfg_for(tmp_path, codex_home)
+    CodexProvider().read(cfg, store)
+
+    events = store.recent_token_events(Provider.CODEX, 0.0)
+    assert {e.input_tokens for e in events} == {10, 20}
+
+
+def test_token_event_ingestion_is_idempotent_on_rescan(tmp_path, store):
+    """The same session file gets rescanned every poll tick while it's
+    still within the retention lookback -- re-upserting an already-seen
+    line must not double-count it."""
+    codex_home = tmp_path / "codex_home"
+    _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-07-24T19:40:00.000Z",
+                {
+                    "primary": {
+                        "used_percent": 50.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1.0,
+                    },
+                    "secondary": None,
+                },
+                last_token_usage={
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                },
+            )
+        ],
+    )
+    cfg = _cfg_for(tmp_path, codex_home)
+    CodexProvider().read(cfg, store)
+    CodexProvider().read(cfg, store)  # a second poll tick, same file unchanged
+
+    assert len(store.recent_token_events(Provider.CODEX, 0.0)) == 1
+
+
+def test_missing_last_token_usage_is_skipped_not_crashed(tmp_path, store):
+    codex_home = tmp_path / "codex_home"
+    _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-07-24T19:40:00.000Z",
+                {
+                    "primary": {
+                        "used_percent": 50.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1.0,
+                    },
+                    "secondary": None,
+                },
+            )  # no last_token_usage at all
+        ],
+    )
+    cfg = _cfg_for(tmp_path, codex_home)
+    windows = CodexProvider().read(cfg, store)
+    assert len(windows) == 1  # window detection is unaffected
+    assert store.recent_token_events(Provider.CODEX, 0.0) == []
 
 
 def test_newest_by_mtime_is_selected(tmp_path, store):

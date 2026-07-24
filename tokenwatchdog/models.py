@@ -58,6 +58,14 @@ class Forecast:
     confidence: Confidence | None  # None when there's no exhaustion trajectory at all
     exhausts_before_reset: bool
     n_samples: int
+    # None until used_percent has actually pinned at 100 this cycle -- see
+    # predictor.tokens_burned_past_quota for why burn_per_hour alone goes
+    # blind right at the one moment it matters most.
+    tokens_burned_past_quota: int | None = None
+    # None unless a per-token price is configured (see predictor.
+    # overage_cost_usd) -- distinct from 0.0, which would claim "you owe
+    # nothing" rather than "unpriced."
+    cost_burned_past_quota_usd: float | None = None
 
 
 @dataclass(frozen=True)

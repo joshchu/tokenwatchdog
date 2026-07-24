@@ -14,9 +14,11 @@ from tokenwatchdog.models import Provider, Window, WindowKind
 from tokenwatchdog.predictor import (
     LinearPredictor,
     _is_reset,
+    overage_cost_usd,
     project_workhours_exhaustion,
+    tokens_burned_past_quota,
 )
-from tokenwatchdog.store import SampleRow
+from tokenwatchdog.store import SampleRow, TokenEventRow
 
 UTC = ZoneInfo("UTC")
 
@@ -28,6 +30,17 @@ def _sample(source_ts, used_percent, resets_at=None, is_estimated=False):
         used_percent=used_percent,
         resets_at=resets_at,
         is_estimated=is_estimated,
+    )
+
+
+def _token_event(ts, input_tokens=0, output_tokens=0, cache_creation=0, cache_read=0):
+    return TokenEventRow(
+        ts=ts,
+        model="codex",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation=cache_creation,
+        cache_read=cache_read,
     )
 
 
@@ -260,3 +273,93 @@ def test_working_hours_disabled_matches_plain_24_7_projection(cfg):
     start = datetime(2026, 7, 24, 15, 0, tzinfo=UTC)
     result = project_workhours_exhaustion(start, 5.0, disabled)
     assert result == datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+
+
+def test_tokens_burned_past_quota_is_none_below_100_percent():
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 99.0, 1000.0)
+    history = [_sample(1000.0, 99.0)]
+    events = [_token_event(1000.0, input_tokens=500)]
+    assert tokens_burned_past_quota(window, history, events) is None
+
+
+def test_tokens_burned_past_quota_is_none_without_token_events():
+    """A provider that doesn't ingest per-event token counts (Claude
+    Desktop) has nothing to report -- None, not a fabricated 0."""
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [_sample(900.0, 90.0), _sample(1000.0, 100.0)]
+    assert tokens_burned_past_quota(window, history, []) is None
+
+
+def test_tokens_burned_past_quota_sums_events_since_saturation():
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [
+        _sample(800.0, 80.0),
+        _sample(900.0, 100.0),  # first sample to hit the cap -- the boundary
+        _sample(1000.0, 100.0),
+    ]
+    events = [
+        _token_event(850.0, input_tokens=999),  # before saturation -- excluded
+        _token_event(900.0, input_tokens=100, output_tokens=50),  # at the boundary
+        _token_event(950.0, input_tokens=200, output_tokens=25),
+    ]
+    assert tokens_burned_past_quota(window, history, events) == 100 + 50 + 200 + 25
+
+
+def test_tokens_burned_past_quota_excludes_a_prior_cycles_overage_after_reset():
+    """Regression: walking back from the newest sample must stop at the
+    reset, not keep summing an old cycle's overage into the new one -- a
+    real reset always drops used_percent well below 100 (see _is_reset),
+    so the walk-back naturally stops there without needing block-aware
+    logic of its own."""
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 100.0, 2000.0)
+    history = [
+        _sample(800.0, 100.0),  # old cycle, already at cap
+        _sample(900.0, 100.0),  # old cycle, still at cap
+        _sample(1000.0, 3.0),  # reset
+        _sample(2000.0, 100.0),  # new cycle hits the cap again -- the real boundary
+    ]
+    events = [
+        _token_event(850.0, input_tokens=999_999),  # old cycle -- must be excluded
+        _token_event(2000.0, input_tokens=42),
+    ]
+    assert tokens_burned_past_quota(window, history, events) == 42
+
+
+def test_overage_cost_usd_is_none_without_a_configured_price(cfg):
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [_sample(1000.0, 100.0)]
+    events = [_token_event(1000.0, input_tokens=1_000_000)]
+    assert overage_cost_usd(window, history, events, cfg) is None
+
+
+def test_overage_cost_usd_prices_input_and_output_separately(cfg):
+    priced = dataclasses.replace(
+        cfg,
+        codex=dataclasses.replace(
+            cfg.codex,
+            input_price_per_million_usd=2.0,
+            output_price_per_million_usd=8.0,
+        ),
+    )
+    window = _window(Provider.CODEX, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [_sample(900.0, 100.0), _sample(1000.0, 100.0)]
+    events = [_token_event(900.0, input_tokens=1_000_000, output_tokens=500_000)]
+    cost = overage_cost_usd(window, history, events, priced)
+    assert cost == pytest.approx(2.0 + 4.0)
+
+
+def test_overage_cost_usd_never_prices_claude_with_codexs_rate(cfg):
+    """Regression: Claude's cache accounting is a different shape (see
+    providers/claude.py) -- pricing it through Codex's two-rate formula
+    would silently misprice it, so this is Codex-only until Claude gets
+    its own deliberate rates."""
+    priced = dataclasses.replace(
+        cfg,
+        codex=dataclasses.replace(
+            cfg.codex, input_price_per_million_usd=2.0, output_price_per_million_usd=8.0
+        ),
+    )
+    window = _window(Provider.CLAUDE, WindowKind.WEEKLY, 100.0, 1000.0)
+    history = [_sample(1000.0, 100.0)]
+    events = [_token_event(1000.0, input_tokens=1_000_000)]
+    assert overage_cost_usd(window, history, events, priced) is None
