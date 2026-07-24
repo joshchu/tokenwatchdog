@@ -8,7 +8,10 @@ Two sources, both handled here:
   this module's.
 - **Source B — token-compute**: sum per-message token usage from
   `~/.claude/projects/**/*.jsonl` and divide by an estimated limit, since
-  the CLI never persists a percentage or a reset time. Every parsed usage
+  the CLI never persists a percentage. The 5-hour window sums its own
+  fixed block (see `blocks.block_anchor`) and can therefore report a real
+  `resets_at`; the 7-day window has no comparable anchor rule and stays a
+  trailing sum with an unknown reset. Every parsed usage
   line is durably upserted into `store.token_events` (dedup keep-LAST,
   ccusage bug #888) — that's what lets `_read_tokens` avoid re-scanning
   hundreds of MB of transcripts on every ~1-minute poll: only files touched
@@ -31,6 +34,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from tokenwatchdog.blocks import block_anchor
 from tokenwatchdog.config import Config
 from tokenwatchdog.models import Provider, Window, WindowKind
 from tokenwatchdog.store import Store, TokenEventRow
@@ -266,23 +270,42 @@ def _read_tokens(cfg: Config, store: Store, now: float) -> list[Window]:
     latest_ts = all_events[-1].ts
     tier = _read_rate_limit_tier()
     source_file = str(_claude_config_dir(cfg) / "projects")
+    # The 5-hour window is a fixed block anchored at the first request after
+    # an idle gap, not a rolling 5-hour sum -- so its usage is the block's
+    # own tokens, and its reset is the block's own expiry. Summing a
+    # trailing 5 hours instead kept pre-reset tokens in the total across a
+    # boundary, which both over-reported usage and smeared the drop that
+    # `predictor._is_reset` needs to see out over hours, so the reset was
+    # usually never detected at all.
+    w5h_anchor = block_anchor([e.ts for e in all_events], _W5H_SECONDS, now)
 
     windows: list[Window] = []
     for kind, window_minutes, window_seconds in (
         (WindowKind.W5H, _W5H_WINDOW_MINUTES, _W5H_SECONDS),
         (WindowKind.WEEKLY, _WEEKLY_WINDOW_MINUTES, _WEEKLY_SECONDS),
     ):
-        limit = _estimate_limit_tokens(cfg, all_events, kind, window_seconds, tier, now)
+        # The weekly window has no equally real anchor rule (a 7-day gap in
+        # activity is not what starts a new weekly cycle), so it stays a
+        # trailing sum rather than getting an invented anchor.
+        if kind is WindowKind.W5H:
+            window_start = w5h_anchor if w5h_anchor is not None else now
+            resets_at = w5h_anchor + _W5H_SECONDS if w5h_anchor is not None else None
+        else:
+            window_start = now - window_seconds
+            resets_at = None
+        limit = _estimate_limit_tokens(
+            cfg, all_events, kind, window_seconds, tier, now, window_start
+        )
         if limit is None:
             continue  # not enough history to estimate responsibly -> NO_DATA
-        events_in_window = [e for e in all_events if e.ts >= now - window_seconds]
+        events_in_window = [e for e in all_events if e.ts >= window_start]
         windows.append(
             Window(
                 provider=Provider.CLAUDE,
                 kind=kind,
                 used_percent=_usage_percent(events_in_window, limit),
                 window_minutes=window_minutes,
-                resets_at=None,
+                resets_at=resets_at,
                 source_ts=latest_ts,
                 is_estimated=True,
                 source_file=source_file,
@@ -294,10 +317,7 @@ def _read_tokens(cfg: Config, store: Store, now: float) -> list[Window]:
 def _usage_percent(events: list[TokenEventRow], limit_tokens: int) -> float:
     if limit_tokens <= 0:
         return 0.0
-    total = sum(
-        e.input_tokens + e.output_tokens + e.cache_creation + e.cache_read
-        for e in events
-    )
+    total = sum(e.total_tokens for e in events)
     return min(100.0, 100.0 * total / limit_tokens)
 
 
@@ -323,6 +343,7 @@ def _estimate_limit_tokens(
     window_seconds: float,
     tier: str,
     now: float,
+    window_start: float,
 ) -> int | None:
     is_5h = kind is WindowKind.W5H
     if cfg.claude.limit_mode == "plan":
@@ -336,7 +357,14 @@ def _estimate_limit_tokens(
     # candidates the max is taken over, so the live total could never
     # exceed limit * _P90_SAFETY_FACTOR — a self-referential ceiling that
     # silently caps every p90 reading at 90%, no matter how much is used.
-    historical = [e for e in events if e.ts < now - window_seconds]
+    #
+    # Cut at the live window's own start, not at `now - window_seconds`:
+    # the latter creeps forward every tick, so the denominator moved
+    # continuously and used_percent drifted for reasons that had nothing to
+    # do with usage — phantom burn, and phantom drops for `_is_reset` to
+    # misread. Anchored this way it only changes when a window actually
+    # turns over, which is when it should.
+    historical = [e for e in events if e.ts < window_start]
     span = historical[-1].ts - historical[0].ts if historical else 0.0
     min_history = (
         _MIN_HISTORY_FOR_P90_5H_SECONDS
@@ -361,10 +389,7 @@ def _sliding_window_max_tokens(
     real rate-limit event teaches us the truth."""
     if not events:
         return 0
-    totals = [
-        e.input_tokens + e.output_tokens + e.cache_creation + e.cache_read
-        for e in events
-    ]
+    totals = [e.total_tokens for e in events]
     left = 0
     running = 0
     best = 0

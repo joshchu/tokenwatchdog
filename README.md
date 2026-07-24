@@ -24,7 +24,11 @@ local usage data every minute and answers two questions existing usage
 trackers don't:
 
 - **When will I actually run out?** Not "you're at 62%" — an ETA, computed
-  from your own recent burn rate, capped sensibly at the window's reset.
+  from your own recent burn rate, capped sensibly at the window's reset. That
+  rate comes from real token throughput, not from the slope of the reported
+  percentage: both providers round that percentage to whole numbers, and a
+  weekly window burned evenly moves ~0.6% an hour, so the integer doesn't
+  change often enough to forecast from at all.
 - **When will I run out, given I only work certain hours?** The weekly
   projection can count only your configured working hours instead of
   assuming you burn quota 24/7 — so "exhausts Thursday" means Thursday
@@ -37,10 +41,25 @@ enough that it will run out before the window naturally resets.
 
 - Polls Codex CLI and Claude Code quota (5-hour + weekly) on a configurable
   interval (default ~1 minute)
+- Burn rate measured from per-request token throughput, converted to %/h by a
+  ratio calibrated against the provider's own reported percentage — so it
+  needs no knowledge of an unpublished token cap, and falls back to the
+  percentage's own slope (marked `~` in the dashboard) when there's nothing
+  to calibrate against
 - Two exhaustion predictors: a robust (outlier-resistant) burn-rate fit by
   default, or an opt-in Monte Carlo model that learns your hour-of-week usage
-  rhythm and simulates a P50/P90 exhaustion band instead of one point guess
-- Working-hours-aware calendar projection alongside the plain 24/7 ETA
+  rhythm from token history and simulates a P50/P90 exhaustion band plus a
+  probability of running out before the reset, instead of one point guess
+- Working-hours-aware calendar projection alongside the plain 24/7 ETA, each
+  capped independently against the next reset — an ETA past the reset
+  describes an event that can't happen, and no window is ever projected to
+  take longer to exhaust than its own duration
+- Staleness applies to the burn *rate*, not the used-% *level*: quota doesn't
+  un-consume while you're away, so a 100%-used reading still alerts once its
+  cycle is confirmed live, while nothing extrapolates from a stale rate
+- `scripts/backtest.py` replays your stored history to score each predictor
+  (ETA coverage, mean error, bias, P90 calibration), so "which model is
+  better" is a measurement rather than an argument
 - 90%-usage alert and a separate "burning too fast" alert, both native
   notifications with a cute spoken "Woof! Woof!" by default (any system
   sound name works too, or turn notifications off entirely with
@@ -97,17 +116,31 @@ ever extracts numeric usage fields (token counts, timestamps, model names)
 from each line — the message content itself is never logged, stored, or
 transmitted anywhere.
 
+Burn rate is measured from token throughput wherever possible. Neither
+provider publishes its real token cap, so instead of guessing one, the tool
+measures how much of the window one token actually consumed — the reported
+percentage's movement across the current cycle, divided by the tokens spent
+over that same span — and uses that ratio to turn recent tokens/hour into
+%/h. It refuses to calibrate from a cycle that hasn't moved at least a few
+points, or one that ends pinned at 100%, and falls back to the percentage's
+own slope in those cases.
+
 By default, exhaustion is predicted from a robust (outlier-resistant) fit of
-your own recent burn rate, projected forward to when usage would hit 100% —
-capped sensibly at the window's own reset. Set `predictor.model = "montecarlo"`
-in config to switch to the learned model instead: it buckets historical burn
-rate by hour-of-week and simulates thousands of random futures to produce a
-P50/P90 exhaustion band and a probability of exhausting before the window
-resets, rather than one linear guess. It needs real history to say anything
-sharper than the default, which is exactly why history is persisted from the
-first run. The working-hours projection (either model) runs the burn budget
-through only your configured working intervals instead of treating every
-hour as billable.
+that rate, projected forward to when usage would hit 100% — capped at the
+window's own reset, or at its duration when no reset time has been derived
+yet. Set `predictor.model = "montecarlo"` in config to switch to the learned
+model instead: it buckets historical burn by hour-of-week and simulates
+thousands of random futures to produce a P50/P90 band and a probability of
+exhausting before the reset, rather than one linear guess. Because that
+bucketing is built from token history, an hour with no requests contributes a
+real zero rather than no data at all — which is what lets it learn that you
+don't burn quota overnight, instead of filling those hours in from your
+daytime average.
+
+The working-hours projection (either model) runs the burn budget through only
+your configured working intervals instead of treating every hour as billable.
+The "burning too fast" alert deliberately uses the 24/7 projection, not that
+one: usage happening right now doesn't pause because it's 9pm.
 
 ## Status
 
@@ -137,11 +170,23 @@ steps but aren't built yet.
   untested on a real Windows machine. The core polling/prediction logic is
   plain Python and *should* run elsewhere, but it hasn't been run or
   verified on Linux or Windows.
-- Claude's weekly and 5-hour reset times are derived from an actually
-  observed reset in your own history (not assumed), but there's no reset to
-  learn from until one has happened at least once since the tool started
-  watching — until then, the reset countdown for that window is honestly
-  unknown rather than guessed.
+- **Claude's 5-hour reset is computed; its weekly reset still has to be
+  observed.** Claude reports no reset time at all. The 5-hour window is a
+  fixed block anchored at your first request after an idle gap, so its reset
+  follows from the token log immediately. The weekly window has no equivalent
+  rule — a 7-day gap in activity isn't what starts a new weekly cycle — so it
+  waits for an actual reset to appear in your history, and until one does the
+  countdown is honestly unknown rather than guessed.
+- **The weekly token-based percentage is a trailing 7-day sum**, not a true
+  fixed cycle, for the same reason: there's no anchor to align it to. It's an
+  estimate (flagged `*` in the dashboard), and the tail of it drifts as old
+  usage ages out.
+- **Only the CLI's own token log is visible.** Claude Desktop and agent mode
+  burn the same account quota without writing a transcript here. The
+  percent-per-token calibration absorbs a steady share of that, and the tool
+  falls back to the reported percentage's own slope whenever the percentage
+  is moving while the local log is silent — but an abrupt shift in that mix
+  will briefly under-read.
 
 ## Development
 
@@ -152,6 +197,17 @@ uv run ruff check .    # lint
 uv run ruff format .   # format
 uv run mypy tokenwatchdog
 ```
+
+To check whether a prediction change actually helped, score the models
+against your own stored history rather than eyeballing the dashboard:
+
+```bash
+uv run python scripts/backtest.py --stride 4
+```
+
+It replays every stored sample, hides everything after it, runs each
+predictor as it would have run at that moment, and compares the answer to
+what the store already knows happened next.
 
 ## License
 

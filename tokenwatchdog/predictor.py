@@ -6,15 +6,26 @@ burn profile, simulated forward to a P50/P90 exhaustion band once enough
 history exists to populate it). Both share resets_at derivation and the
 working-hours projector via the same `Predictor` protocol, so a front-end
 or alerts.py never has to know which one produced a given Forecast.
+
+Both measure burn from **token throughput** when they can, not from the
+slope of the reported percentage. Both providers quantize that percentage to
+whole numbers, which is fine for a 5-hour window moving ~20%/h and useless
+for a 7-day window moving ~0.6%/h: over any short lookback the integer
+simply doesn't change, and the honest slope of an unchanging series is zero.
+`token_events` has no such floor — and a calibration against the
+authoritative percentage over the whole block converts tokens/h into %/h
+without needing to know the provider's real token cap.
 """
 
 from __future__ import annotations
 
+import itertools
 import random
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, tzinfo
 from typing import Protocol
 
+from tokenwatchdog.blocks import block_anchor
 from tokenwatchdog.config import (
     Config,
     ConfigError,
@@ -22,6 +33,7 @@ from tokenwatchdog.config import (
     resolve_timezone,
 )
 from tokenwatchdog.models import (
+    BurnBasis,
     Confidence,
     Forecast,
     ForecastStatus,
@@ -32,6 +44,11 @@ from tokenwatchdog.models import (
 from tokenwatchdog.store import SampleRow, TokenEventRow
 
 _FIVE_HOURS_SECONDS = 5 * 3600
+_SEVEN_DAYS_SECONDS = 7 * 24 * 3600
+
+
+def window_duration_seconds(kind: WindowKind) -> float:
+    return _FIVE_HOURS_SECONDS if kind is WindowKind.W5H else _SEVEN_DAYS_SECONDS
 
 
 class Predictor(Protocol):
@@ -46,9 +63,9 @@ class Predictor(Protocol):
         now: float,
     ) -> Forecast:
         """`history` is this (provider, kind)'s recent samples, oldest
-        first. `token_events` is Claude's finer-grained signal — unused by
-        both current models, present so a future token-native model
-        doesn't need an interface change to get it."""
+        first. `token_events` is the same provider's per-request token
+        usage, oldest first — the high-resolution burn signal both models
+        prefer over differencing `history`'s quantized percentages."""
         ...
 
 
@@ -63,13 +80,11 @@ class LinearPredictor:
         cfg: Config,
         now: float,
     ) -> Forecast:
-        del token_events  # unused by linear; kept for v1.1 models' sake
-
         tz = resolve_timezone(cfg)
         block = _current_block(history)
         resets_at = window.resets_at
         if resets_at is None:
-            resets_at = _derive_resets_at(window, block, now)
+            resets_at = _derive_resets_at(window, block, token_events, now)
             if resets_at is not None:
                 # Thread the derived value back onto the window so it rides
                 # along on Forecast.window — alerts.py re-arms on resets_at
@@ -78,8 +93,7 @@ class LinearPredictor:
                 # provider).
                 window = replace(window, resets_at=resets_at)
 
-        is_idle = (now - window.source_ts) > cfg.thresholds.stale_after_minutes * 60
-        if is_idle:
+        if _is_rate_stale(window, cfg, now):
             return _status_only_forecast(
                 window,
                 self.name,
@@ -110,16 +124,37 @@ class LinearPredictor:
             )
 
         fit_samples = _slope_fit_samples(block.samples, cfg, window.kind, now)
-        burn_per_hour = _robust_slope_per_hour(fit_samples)
+        percent_burn = _robust_slope_per_hour(fit_samples)
+        token_burn = _token_burn_per_hour(block.samples, token_events, cfg, window, now)
+
+        if token_burn is not None and (
+            token_burn.burn_per_hour > 0 or percent_burn <= 0
+        ):
+            burn_per_hour = token_burn.burn_per_hour
+            basis: BurnBasis = "tokens"
+            n_samples = token_burn.n_events
+        else:
+            # Either nothing calibrated, or the token log claims zero burn
+            # while the authoritative percentage says otherwise. The latter
+            # is real: an account-wide percentage also counts usage that
+            # never lands in this machine's token log (Claude Desktop and
+            # agent mode burn the same quota without writing a CLI
+            # transcript). Reporting a confident zero there would be worse
+            # than a coarse slope, so the coarse slope wins that tie.
+            burn_per_hour = percent_burn
+            basis = "percent"
+            n_samples = len(fit_samples)
+
         return _project_forecast(
             window=window,
             burn_per_hour=burn_per_hour,
             resets_at=resets_at,
-            n_samples=len(fit_samples),
+            n_samples=n_samples,
             cfg=cfg,
             now=now,
             tz=tz,
             model_name=self.name,
+            burn_basis=basis,
         )
 
 
@@ -142,18 +177,15 @@ class MonteCarloPredictor:
         cfg: Config,
         now: float,
     ) -> Forecast:
-        del token_events  # bucketing works off used_percent samples, not raw tokens
-
         tz = resolve_timezone(cfg)
         block = _current_block(history)
         resets_at = window.resets_at
         if resets_at is None:
-            resets_at = _derive_resets_at(window, block, now)
+            resets_at = _derive_resets_at(window, block, token_events, now)
             if resets_at is not None:
                 window = replace(window, resets_at=resets_at)
 
-        is_idle = (now - window.source_ts) > cfg.thresholds.stale_after_minutes * 60
-        if is_idle:
+        if _is_rate_stale(window, cfg, now):
             return _status_only_forecast(
                 window,
                 self.name,
@@ -172,7 +204,11 @@ class MonteCarloPredictor:
                 resets_at=resets_at,
             )
 
-        raw_buckets = _build_burn_buckets(history, tz)
+        percent_per_token = _percent_per_token(block.samples, token_events)
+        raw_buckets = _build_burn_buckets(
+            history, token_events, percent_per_token, tz, now
+        )
+        basis: BurnBasis = "tokens" if percent_per_token else "percent"
         n_observations = sum(len(entries) for entries in raw_buckets.values())
         if n_observations == 0:
             return _status_only_forecast(
@@ -185,15 +221,23 @@ class MonteCarloPredictor:
             )
 
         halflife_days = cfg.predictor.bucket_decay_halflife_days
-        buckets = {
+        weighted = {
             bucket: _weighted_pool(entries, now, halflife_days)
             for bucket, entries in raw_buckets.items()
         }
-        fallback_pool = (
-            [v for values, _ in buckets.values() for v in values],
-            [w for _, weights in buckets.values() for w in weights],
-        )
-        mean_burn = sum(fallback_pool[0]) / len(fallback_pool[0])
+        all_values = [v for values, _ in weighted.values() for v in values]
+        all_weights = [w for _, weights in weighted.values() for w in weights]
+        # Decay-weighted, matching how every draw below is weighted -- a
+        # plain mean here would quietly disagree with the simulation it's
+        # reported alongside.
+        mean_burn = _weighted_mean(all_values, all_weights)
+        # Cumulative weights, built ONCE per bucket. random.choices()
+        # recomputes them on every single call when handed raw weights,
+        # which is O(bucket size) per draw against ~mc_runs * horizon draws
+        # per tick -- measured at 2.4us/draw for a 100-entry bucket versus
+        # 0.47us with cum_weights, and 21us versus 0.57us at 1000.
+        buckets = {b: _to_cumulative(pool) for b, pool in weighted.items()}
+        fallback_pool = _to_cumulative((all_values, all_weights))
 
         now_dt = datetime.fromtimestamp(now, tz=tz)
         time_to_reset_h = (resets_at - now) / 3600.0 if resets_at is not None else None
@@ -235,10 +279,17 @@ class MonteCarloPredictor:
 
         p50_h = _percentile_within_horizon(outcomes, 0.5, horizon_h)
         p90_h = _percentile_within_horizon(outcomes, 0.9, horizon_h)
+        confidence = _confidence(
+            n_observations,
+            coverage=_horizon_bucket_coverage(now, horizon_h, buckets, tz),
+        )
         if p50_h is None:
             # More than half the simulated futures never exhausted within
             # the horizon — there's no meaningful point ETA, so this is
             # the same "OK, no ETA" shape linear reports for burn <= 0.
+            # The probability still is meaningful, and this is precisely
+            # when it carries the most information: "the median future is
+            # fine, but 1 in 5 isn't" is the whole reason to simulate.
             return _project_forecast(
                 window=window,
                 burn_per_hour=mean_burn,
@@ -248,12 +299,21 @@ class MonteCarloPredictor:
                 now=now,
                 tz=tz,
                 model_name=self.name,
+                burn_basis=basis,
+                confidence=confidence,
+                prob_exhaust_before_reset=prob_before_reset,
             )
 
-        eta_p50 = now_dt + timedelta(hours=p50_h)
-        eta_p90 = now_dt + timedelta(hours=p90_h) if p90_h is not None else None
-        exhausts_before_reset = (
-            False if time_to_reset_h is None else p50_h < time_to_reset_h
+        horizon = _eta_horizon(window, resets_at, now_dt, tz)
+        eta_p50, eta_p90 = _cap_at_horizon(
+            now_dt + timedelta(hours=p50_h),
+            now_dt + timedelta(hours=p90_h) if p90_h is not None else None,
+            horizon,
+        )
+        eta_workhours, _ = _cap_at_horizon(
+            project_workhours_exhaustion(now_dt, p50_h, cfg.working_hours),
+            None,
+            horizon,
         )
 
         return Forecast(
@@ -263,15 +323,16 @@ class MonteCarloPredictor:
             burn_per_hour=mean_burn,
             time_to_reset_h=time_to_reset_h,
             eta_calendar=eta_p50,  # point estimate = the median simulated outcome
-            eta_workhours=project_workhours_exhaustion(
-                now_dt, p50_h, cfg.working_hours
-            ),
+            eta_workhours=eta_workhours,
             eta_p50=eta_p50,
             eta_p90=eta_p90,
             prob_exhaust_before_reset=prob_before_reset,
-            confidence=_confidence(n_observations),
-            exhausts_before_reset=exhausts_before_reset,
+            confidence=confidence,
+            # The simulation horizon IS the reset, so any uncensored p50 is
+            # already before it -- see the horizon_h comment above.
+            exhausts_before_reset=eta_p50 is not None and time_to_reset_h is not None,
             n_samples=n_observations,
+            burn_basis=basis,
         )
 
 
@@ -365,6 +426,83 @@ def _current_block(history: list[SampleRow]) -> _BlockView:
     return _BlockView(samples=block, block_started_at=started_at)
 
 
+# -- token-velocity burn: the high-resolution signal -------------------------
+
+# How far the authoritative percentage must have moved across the block
+# before its ratio to token count is worth trusting. Both providers report
+# whole numbers (measured: 901/901 Claude samples, 17/17 Codex), so a single
+# step carries +/-50% error; three steps brings that under ~17%.
+_MIN_CALIBRATION_PERCENT = 3.0
+
+
+@dataclass(frozen=True)
+class _TokenBurn:
+    burn_per_hour: float
+    n_events: int  # token events behind the rate — the evidence, for confidence
+
+
+def _percent_per_token(
+    block_samples: list[SampleRow], token_events: list[TokenEventRow]
+) -> float | None:
+    """How much of this window's quota one token consumes, measured rather
+    than assumed — the authoritative percentage's movement across the whole
+    block divided by the tokens spent over the same span.
+
+    This is what lets a token rate become a %/h rate without knowing the
+    provider's real token cap (which Codex never publishes and Claude only
+    estimates). It also self-corrects for tokens the local log can't see:
+    if some fraction of account-wide usage never writes a transcript here,
+    the ratio absorbs it as long as the mix stays roughly steady.
+
+    None when the block hasn't moved enough to calibrate against, or ends
+    saturated (a clipped percentage understates the real movement).
+    """
+    if len(block_samples) < 2:
+        return None
+    first, last = block_samples[0], block_samples[-1]
+    if last.used_percent >= 100.0:
+        return None
+    delta_percent = last.used_percent - first.used_percent
+    if delta_percent < _MIN_CALIBRATION_PERCENT:
+        return None
+    tokens = sum(
+        e.total_tokens
+        for e in token_events
+        if first.source_ts <= e.ts <= last.source_ts
+    )
+    if tokens <= 0:
+        return None
+    return delta_percent / tokens
+
+
+def _token_burn_per_hour(
+    block_samples: list[SampleRow],
+    token_events: list[TokenEventRow],
+    cfg: Config,
+    window: Window,
+    now: float,
+) -> _TokenBurn | None:
+    """Recent token throughput expressed as %/h. None when there's no
+    calibration to convert it with.
+
+    The rate divides by the *full* lookback, not by the span of the events
+    actually seen: one burst two minutes ago is a burst, not a sustained
+    rate, and dividing by its own two-minute span would report it as one.
+    """
+    percent_per_token = _percent_per_token(block_samples, token_events)
+    if percent_per_token is None:
+        return None
+    lookback_hours = _lookback_minutes(cfg, window.kind) / 60.0
+    if lookback_hours <= 0:
+        return None
+    recent = [e for e in token_events if e.ts >= now - lookback_hours * 3600]
+    tokens = sum(e.total_tokens for e in recent)
+    return _TokenBurn(
+        burn_per_hour=percent_per_token * tokens / lookback_hours,
+        n_events=len(recent),
+    )
+
+
 def tokens_burned_past_quota(
     window: Window, history: list[SampleRow], token_events: list[TokenEventRow]
 ) -> int | None:
@@ -383,11 +521,7 @@ def tokens_burned_past_quota(
     boundary_ts = _saturation_started_at(history)
     if boundary_ts is None or not token_events:
         return None
-    return sum(
-        e.input_tokens + e.output_tokens + e.cache_creation + e.cache_read
-        for e in token_events
-        if e.ts >= boundary_ts
-    )
+    return sum(e.total_tokens for e in token_events if e.ts >= boundary_ts)
 
 
 def _overage_rates(
@@ -472,40 +606,78 @@ def _saturation_started_at(history: list[SampleRow]) -> float | None:
     return boundary_ts
 
 
-_SEVEN_DAYS_SECONDS = 7 * 24 * 3600
+def _is_rate_stale(window: Window, cfg: Config, now: float) -> bool:
+    """Whether this reading is too old for its *rate* to mean anything.
+
+    Per-window, because the two windows live on different timescales: a
+    5-hour window's burn rate is meaningless minutes after the last
+    request, while a 7-day window's sustained pace is not invalidated by a
+    lunch break. One shared threshold had to be wrong for one of them.
+
+    This says nothing about the *level*. `used_percent` is a durable fact
+    for the rest of the cycle — quota does not un-consume while you are
+    away — which is why alerts.py gates the threshold alert on
+    `level_still_in_cycle` instead of on this.
+    """
+    stale_minutes = (
+        cfg.thresholds.stale_after_minutes_w5h
+        if window.kind is WindowKind.W5H
+        else cfg.thresholds.stale_after_minutes_weekly
+    )
+    return (now - window.source_ts) > stale_minutes * 60
 
 
-def _derive_resets_at(window: Window, block: _BlockView, now: float) -> float | None:
+def _derive_resets_at(
+    window: Window,
+    block: _BlockView,
+    token_events: list[TokenEventRow],
+    now: float,
+) -> float | None:
     """Only Claude ever needs this: Codex always supplies `resets_at`
     itself, straight from real account state; neither Claude Desktop nor
     token-compute do.
 
-    Both Claude windows are fixed-duration cycles (5h / 7d) that re-anchor
-    at each actual reset, so the next one is simply the last OBSERVED
-    reset plus that duration — derived from this account's own real
-    behavior, never assumed against a calendar. If no reset has been
-    observed yet (block_started_at is None), the true anchor predates our
-    history and is genuinely unknown — report that honestly rather than
-    guessing a calendar day.
+    Two derivations, best first:
 
-    If that next-cycle projection has already elapsed — a real reset
-    happened since but its used_percent drop was too small to clear
-    `_is_reset`'s threshold (a lightly used window can do this) — advance
-    by however many whole cycles were missed. It's the same fixed-cycle
-    assumption already being made, just carried forward through cycles we
-    didn't directly see a boundary for, rather than reporting a reset
-    that's already in the past.
+    1. **Deterministic anchor** (5-hour window only). The 5-hour window is
+       a fixed block anchored at the first request after an idle gap, so
+       `blocks.block_anchor` computes the reset outright from the token log
+       — available immediately, with no reset ever having to be caught in
+       the act. The 7-day window has no comparably real anchor rule, so it
+       does not get this path rather than getting a guessed one.
+    2. **Last observed reset + one duration.** Both windows are
+       fixed-duration cycles that re-anchor at each real reset, so the next
+       one follows from the last one we actually saw. If no reset appears
+       in history at all, the true anchor predates our data and is
+       genuinely unknown — report that rather than guessing a calendar day.
+
+    If a projection from (2) has already elapsed — a real reset happened
+    but its used_percent drop was too small to clear `_is_reset`'s
+    threshold, which a lightly used window can do — advance by however many
+    whole cycles were missed. Same fixed-cycle assumption, carried through
+    cycles we didn't directly witness, rather than reporting a reset in the
+    past.
     """
+    duration = window_duration_seconds(window.kind)
+    if window.kind is WindowKind.W5H:
+        anchor = block_anchor([e.ts for e in token_events], duration, now)
+        if anchor is not None:
+            return anchor + duration
     if block.block_started_at is None:
         return None
-    duration = (
-        _FIVE_HOURS_SECONDS if window.kind is WindowKind.W5H else _SEVEN_DAYS_SECONDS
-    )
     resets_at = block.block_started_at + duration
     if resets_at <= now:
         missed_cycles = int((now - resets_at) // duration) + 1
         resets_at += missed_cycles * duration
     return resets_at
+
+
+def _lookback_minutes(cfg: Config, kind: WindowKind) -> float:
+    return (
+        cfg.burn.lookback_w5h_minutes
+        if kind is WindowKind.W5H
+        else cfg.burn.lookback_weekly_minutes
+    )
 
 
 def _slope_fit_samples(
@@ -515,12 +687,7 @@ def _slope_fit_samples(
     deliberately narrower than the full block so an old burst doesn't bias
     'right now'. Widens to the last two block samples if the configured
     lookback is too tight to have caught anything."""
-    lookback_minutes = (
-        cfg.burn.lookback_w5h_minutes
-        if kind is WindowKind.W5H
-        else cfg.burn.lookback_weekly_minutes
-    )
-    cutoff = now - lookback_minutes * 60
+    cutoff = now - _lookback_minutes(cfg, kind) * 60
     tail = [s for s in block_samples if s.source_ts >= cutoff]
     if len(tail) >= 2:
         return tail
@@ -585,14 +752,63 @@ def _hour_of_week(ts: float, tz: tzinfo) -> int:
 
 
 def _build_burn_buckets(
+    history: list[SampleRow],
+    token_events: list[TokenEventRow],
+    percent_per_token: float | None,
+    tz: tzinfo,
+    now: float,
+) -> dict[int, list[tuple[float, float]]]:
+    """(observation_ts, burn_%/h) bucketed by hour-of-week — the profile the
+    simulation samples its futures from. Prefers the token series; falls
+    back to differencing percentages when there's no calibration."""
+    if percent_per_token is not None and percent_per_token > 0 and token_events:
+        return _token_burn_buckets(token_events, percent_per_token, tz, now)
+    return _percent_burn_buckets(history, tz)
+
+
+def _token_burn_buckets(
+    token_events: list[TokenEventRow],
+    percent_per_token: float,
+    tz: tzinfo,
+    now: float,
+) -> dict[int, list[tuple[float, float]]]:
+    """One observation per clock hour across the whole token history.
+
+    The important part is that an hour with **no** token events yields a
+    real zero rather than no observation at all. That distinction is what
+    the profile is for: an hour you were asleep did not burn quota, and
+    recording it as missing means the simulation fills it from the
+    all-hours average instead — i.e. assumes you burn quota overnight at
+    your daytime rate, which is exactly the flat-24/7 assumption the
+    hour-of-week model exists to replace.
+
+    (Differencing percentages can't produce those zeros for the sparse
+    sources: `source_ts` only advances when a request happens, so overnight
+    shows up as one wide gap that `_MAX_BUCKET_GAP_HOURS` then discards.)
+    """
+    tokens_by_hour: dict[int, int] = {}
+    for event in token_events:
+        slot = int(event.ts // 3600)
+        tokens_by_hour[slot] = tokens_by_hour.get(slot, 0) + event.total_tokens
+    first_slot = int(token_events[0].ts // 3600)
+    # Stop before the hour in progress: it is only partly elapsed, so its
+    # token count would read as a full hour's throughput and understate.
+    last_slot = int(now // 3600) - 1
+    buckets: dict[int, list[tuple[float, float]]] = {}
+    for slot in range(first_slot, last_slot + 1):
+        ts = slot * 3600.0
+        burn = percent_per_token * tokens_by_hour.get(slot, 0)
+        buckets.setdefault(_hour_of_week(ts, tz), []).append((ts, burn))
+    return buckets
+
+
+def _percent_burn_buckets(
     history: list[SampleRow], tz: tzinfo
 ) -> dict[int, list[tuple[float, float]]]:
-    """(source_ts, burn_%/h) observations bucketed by hour-of-week, built
-    from consecutive same-block sample pairs across EVERY observed block,
-    not just the live one — this is what lets the model learn "nothing
-    happens on weekends" instead of assuming a flat 24/7 rate. Keeping the
-    timestamp alongside each observation is what lets `_weighted_pool`
-    weigh recent weeks more than old ones."""
+    """Fallback profile: consecutive same-block sample pairs across EVERY
+    observed block, not just the live one. Coarser than the token path
+    (whole-number percentages, and long idle gaps get dropped rather than
+    counted as zero), but it needs no calibration."""
     buckets: dict[int, list[tuple[float, float]]] = {}
     for block in _split_into_blocks(history):
         for i in range(1, len(block)):
@@ -609,17 +825,50 @@ def _build_burn_buckets(
 def _weighted_pool(
     entries: list[tuple[float, float]], now: float, halflife_days: float
 ) -> WeightedPool:
-    """(values, weights) for `random.choices`, per
-    `predictor.bucket_decay_halflife_days` — an observation from one
-    halflife ago carries half the weight of one from today, so a rhythm
-    change (e.g. a vacation, a new project) ages out instead of
-    permanently anchoring the profile to old behavior."""
+    """(values, weights) per `predictor.bucket_decay_halflife_days` — an
+    observation from one halflife ago carries half the weight of one from
+    today, so a rhythm change (e.g. a vacation, a new project) ages out
+    instead of permanently anchoring the profile to old behavior."""
     values = [burn for _, burn in entries]
     if halflife_days <= 0:
         return values, [1.0] * len(values)
     halflife_seconds = halflife_days * 24 * 3600
     weights = [0.5 ** ((now - ts) / halflife_seconds) for ts, _ in entries]
     return values, weights
+
+
+def _to_cumulative(pool: WeightedPool) -> WeightedPool:
+    """(values, cumulative weights) — what `random.choices(cum_weights=...)`
+    wants, so it can binary-search instead of re-accumulating per draw."""
+    values, weights = pool
+    return values, list(itertools.accumulate(weights))
+
+
+def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return sum(values) / len(values) if values else 0.0
+    return sum(v * w for v, w in zip(values, weights, strict=True)) / total_weight
+
+
+def _horizon_bucket_coverage(
+    now: float, horizon_hours: float, buckets: dict[int, WeightedPool], tz: tzinfo
+) -> float:
+    """Fraction of the hours the simulation is about to walk through whose
+    own hour-of-week bucket has real history.
+
+    Raw observation count alone overstates confidence badly: hundreds of
+    observations concentrated in a few days still leaves most of a week
+    unlearned, and every uncovered hour is silently drawn from the
+    all-hours pool instead. This is what `_confidence` needs in order not
+    to call that "high"."""
+    hours = max(int(horizon_hours), 1)
+    covered = sum(
+        1
+        for i in range(hours)
+        if buckets.get(_hour_of_week(now + i * 3600.0, tz), ([], []))[0]
+    )
+    return covered / hours
 
 
 def _simulate_exhaustion_hours(
@@ -636,7 +885,10 @@ def _simulate_exhaustion_hours(
     history yet), accumulating usage until it would hit 100%. Returns None
     if it doesn't exhaust within `horizon_hours` — "didn't run out," not
     an error; the caller treats that as right-censored AT the horizon
-    rather than discarding the run."""
+    rather than discarding the run.
+
+    Both pools carry CUMULATIVE weights (see `_to_cumulative`) — this is
+    the hot loop, `mc_runs * horizon_hours` draws per tick."""
     remaining = 100.0 - used_percent
     if remaining <= 0:
         return 0.0
@@ -644,15 +896,21 @@ def _simulate_exhaustion_hours(
     cursor_ts = start_ts
     while elapsed < horizon_hours:
         bucket = _hour_of_week(cursor_ts, tz)
-        values, weights = buckets.get(bucket, ([], []))
+        values, cum_weights = buckets.get(bucket, ([], []))
         if not values:
-            values, weights = fallback_pool
-        burn = max(random.choices(values, weights=weights, k=1)[0], 0.0)
+            values, cum_weights = fallback_pool
+        burn = max(random.choices(values, cum_weights=cum_weights, k=1)[0], 0.0)
+        if burn >= remaining:
+            # Interpolate inside the hour it runs out in rather than
+            # rounding up to the whole hour. Without this the simulation
+            # can't express any exhaustion sooner than 60 minutes away --
+            # so for a window resetting in half an hour every outcome
+            # landed past the horizon and got censored, and the P50/P90
+            # band went silent exactly when it was most urgent.
+            return elapsed + remaining / burn
         remaining -= burn
         elapsed += 1.0
         cursor_ts += 3600.0
-        if remaining <= 0:
-            return elapsed
     return None
 
 
@@ -672,12 +930,63 @@ def _percentile_within_horizon(
     return None if value >= horizon_hours else value
 
 
-def _confidence(n_samples: int) -> Confidence:
+def _confidence(n_samples: int, coverage: float | None = None) -> Confidence:
+    """How much the burn estimate should be trusted, from the volume of
+    evidence behind it and — for the hour-of-week models — how much of the
+    period being projected through that evidence actually covers.
+
+    Coverage can only ever lower the rating, never raise it: simulating 168
+    hours off a profile that knows half of them is not a high-confidence
+    forecast no matter how many observations those known hours hold."""
     if n_samples >= 10:
-        return "high"
-    if n_samples >= 3:
+        rating: Confidence = "high"
+    elif n_samples >= 3:
+        rating = "medium"
+    else:
+        rating = "low"
+    if coverage is None:
+        return rating
+    if coverage < 0.5:
+        return "low"
+    if coverage < 0.8 and rating == "high":
         return "medium"
-    return "low"
+    return rating
+
+
+def _eta_horizon(
+    window: Window, resets_at: float | None, now_dt: datetime, tz: tzinfo
+) -> datetime:
+    """The moment past which an ETA stops meaning anything.
+
+    Normally the next reset. When that's unknown, the window's own duration
+    still bounds it: a 5-hour window refills at least every 5 hours, so an
+    exhaustion date beyond that is impossible regardless of what the
+    arithmetic says. Backtesting turned up a 5-hour window being handed a
+    3311-hour ETA — 4.5 months out — purely because no reset had been
+    derived yet, which is a precise-looking number for an event that cannot
+    occur. This is a bound implied by what the window is, not a guess about
+    when it resets."""
+    if resets_at is not None:
+        return datetime.fromtimestamp(resets_at, tz=tz)
+    return now_dt + timedelta(seconds=window_duration_seconds(window.kind))
+
+
+def _cap_at_horizon(
+    primary: datetime | None, secondary: datetime | None, horizon: datetime
+) -> tuple[datetime | None, datetime | None]:
+    """Blank out whichever of these ETAs lands at or after `horizon`.
+
+    Applied to each ETA on its own, deliberately. Deciding it once from the
+    24/7 projection and applying the answer to both is what let the
+    working-hours ETA — which is always the later of the two, often by days
+    — sit in the table pointing past a reset the code had already decided
+    not to show ETAs past. An ETA after the reset is not an exhaustion
+    time: the window refills first, so continued accumulation to 100% is
+    hypothetical."""
+    return (
+        None if primary is not None and primary >= horizon else primary,
+        None if secondary is not None and secondary >= horizon else secondary,
+    )
 
 
 def _status_only_forecast(
@@ -716,6 +1025,9 @@ def _project_forecast(
     now: float,
     tz: tzinfo,
     model_name: str,
+    burn_basis: BurnBasis | None = None,
+    confidence: Confidence | None = None,
+    prob_exhaust_before_reset: float | None = None,
 ) -> Forecast:
     now_dt = datetime.fromtimestamp(now, tz=tz)
     time_to_reset_h = (resets_at - now) / 3600.0 if resets_at is not None else None
@@ -736,45 +1048,34 @@ def _project_forecast(
             eta_workhours=None,
             eta_p50=None,
             eta_p90=None,
-            prob_exhaust_before_reset=None,
+            prob_exhaust_before_reset=prob_exhaust_before_reset,
             confidence=None,
             exhausts_before_reset=False,
             n_samples=n_samples,
+            burn_basis=burn_basis,
         )
 
     remaining_percent = max(0.0, 100.0 - window.used_percent)
     hours_to_exhaust = remaining_percent / burn_per_hour
-    exhausts_before_reset = (
-        False if time_to_reset_h is None else hours_to_exhaust < time_to_reset_h
-    )
-
-    # A linear projection that lands AFTER a known reset isn't a real ETA —
-    # the window refills before usage ever gets there, so "exhaustion"
-    # under continued accumulation is hypothetical, not a risk. Report no
-    # ETA rather than a number that reads as "you'll run out then" when
-    # you won't. (The reset time itself is already shown separately.)
-    if time_to_reset_h is not None and not exhausts_before_reset:
+    try:
+        eta_calendar, eta_workhours = _cap_at_horizon(
+            now_dt + timedelta(hours=hours_to_exhaust),
+            project_workhours_exhaustion(now_dt, hours_to_exhaust, cfg.working_hours),
+            _eta_horizon(window, resets_at, now_dt, tz),
+        )
+    except (OverflowError, RuntimeError):
+        # A burn rate close enough to zero (but not exactly zero -- e.g.
+        # floating-point noise off two nearly-identical readings) turns
+        # a tiny remaining-percent into an exhaustion horizon of
+        # literally centuries. Calendar arithmetic that far out either
+        # overflows datetime's range outright, or blows the
+        # working-hours projector's iteration guard (config is already
+        # validated at load time, so that guard can only fire here for
+        # an input too large to converge, never a real misconfiguration).
+        # Either way there's no meaningful ETA to report at that
+        # remove -- None is honest, not a crash.
         eta_calendar = None
         eta_workhours = None
-    else:
-        try:
-            eta_calendar = now_dt + timedelta(hours=hours_to_exhaust)
-            eta_workhours = project_workhours_exhaustion(
-                now_dt, hours_to_exhaust, cfg.working_hours
-            )
-        except (OverflowError, RuntimeError):
-            # A burn rate close enough to zero (but not exactly zero -- e.g.
-            # floating-point noise off two nearly-identical readings) turns
-            # a tiny remaining-percent into an exhaustion horizon of
-            # literally centuries. Calendar arithmetic that far out either
-            # overflows datetime's range outright, or blows the
-            # working-hours projector's iteration guard (config is already
-            # validated at load time, so that guard can only fire here for
-            # an input too large to converge, never a real misconfiguration).
-            # Either way there's no meaningful ETA to report at that
-            # remove -- None is honest, not a crash.
-            eta_calendar = None
-            eta_workhours = None
 
     return Forecast(
         window=window,
@@ -786,10 +1087,14 @@ def _project_forecast(
         eta_workhours=eta_workhours,
         eta_p50=None,
         eta_p90=None,
-        prob_exhaust_before_reset=None,
-        confidence=_confidence(n_samples),
-        exhausts_before_reset=exhausts_before_reset,
+        prob_exhaust_before_reset=prob_exhaust_before_reset,
+        confidence=confidence or _confidence(n_samples),
+        # The wall-clock question, on purpose (see Forecast.exhausts_before_
+        # reset): surviving the cap above means the 24/7 projection lands
+        # before the reset.
+        exhausts_before_reset=eta_calendar is not None and time_to_reset_h is not None,
         n_samples=n_samples,
+        burn_basis=burn_basis,
     )
 
 

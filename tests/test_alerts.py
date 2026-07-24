@@ -140,9 +140,40 @@ def test_burn_alert_rearms_when_resets_at_advances(cfg, store):
     assert any(a.alert_kind == "burn" for a in fired_again)
 
 
-def test_idle_forecast_never_fires(cfg, store):
-    forecast = _forecast(95.0, status="IDLE")
-    assert evaluate(forecast, cfg, store, 1000.0) == []
+def test_idle_threshold_still_fires_while_the_level_is_in_cycle(cfg, store):
+    """Staleness invalidates a burn RATE, not a used-% LEVEL. A window that
+    read 95% an hour ago and doesn't reset for another day is still at 95%
+    now -- quota doesn't un-consume while you're away, so staying silent
+    here was suppressing a true alert about a real number."""
+    forecast = _forecast(95.0, status="IDLE", resets_at=100_000.0)
+    fired = evaluate(forecast, cfg, store, 1000.0)
+    assert [a.alert_kind for a in fired] == ["threshold"]
+
+
+def test_idle_burn_alert_never_fires(cfg, store):
+    """The other half of the split: a rate measured from a stale reading is
+    exactly what shouldn't be trusted, so the burn alert stays suppressed
+    even though the threshold alert now gets through."""
+    forecast = _forecast(
+        95.0,
+        status="IDLE",
+        exhausts=True,
+        eta_calendar=_dt(1800.0),
+        resets_at=100_000.0,
+    )
+    fired = evaluate(forecast, cfg, store, 1000.0)
+    assert all(a.alert_kind != "burn" for a in fired)
+
+
+def test_idle_forecast_past_its_reset_never_fires(cfg, store):
+    """The case the blanket IDLE skip was really protecting: a daemon
+    started fresh against an old 95% reading whose window has since turned
+    over. Without a resets_at still in the future there's no basis for
+    claiming the level survived, so it stays quiet."""
+    stale = _forecast(95.0, status="IDLE", resets_at=500.0)
+    assert evaluate(stale, cfg, store, 1000.0) == []
+    unknown_reset = _forecast(95.0, status="IDLE", resets_at=None)
+    assert evaluate(unknown_reset, cfg, store, 1000.0) == []
 
 
 def test_no_data_forecast_never_fires(cfg, store):

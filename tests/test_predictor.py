@@ -97,12 +97,31 @@ def test_flat_burn_reports_no_confidence_not_a_number_for_a_missing_eta(cfg):
 
 def test_stale_sample_is_idle(cfg):
     now = 100_000.0
-    stale_source_ts = now - cfg.thresholds.stale_after_minutes * 60 - 60
+    stale_source_ts = now - cfg.thresholds.stale_after_minutes_w5h * 60 - 60
     window = _window(Provider.CLAUDE, WindowKind.W5H, 50.0, stale_source_ts)
     forecast = LinearPredictor().forecast(window, [], [], cfg, now)
     assert forecast.status == "IDLE"
     assert forecast.confidence is None
     assert forecast.eta_calendar is None
+
+
+def test_staleness_is_per_window_so_the_weekly_rate_survives_a_short_break(cfg):
+    """A gap that makes a 5-hour window's rate meaningless says nothing
+    about a 7-day window's sustained pace. One shared threshold forced the
+    weekly forecast -- the one the whole feature is about -- to go blank
+    over a coffee break."""
+    now = 100_000.0
+    gap_seconds = cfg.thresholds.stale_after_minutes_w5h * 60 + 60
+    assert gap_seconds < cfg.thresholds.stale_after_minutes_weekly * 60
+
+    source_ts = now - gap_seconds
+    history = [_sample(source_ts - 3600, 30.0), _sample(source_ts, 40.0)]
+
+    w5h = _window(Provider.CLAUDE, WindowKind.W5H, 40.0, source_ts)
+    weekly = _window(Provider.CLAUDE, WindowKind.WEEKLY, 40.0, source_ts)
+
+    assert LinearPredictor().forecast(w5h, history, [], cfg, now).status == "IDLE"
+    assert LinearPredictor().forecast(weekly, history, [], cfg, now).status == "OK"
 
 
 def test_negative_delta_is_reset_pending(cfg):

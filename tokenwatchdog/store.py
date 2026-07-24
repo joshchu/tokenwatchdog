@@ -56,18 +56,42 @@ CREATE TABLE IF NOT EXISTS alert_state (
   reset_epoch_at_fire REAL
 );
 
+-- Every tick's forecast, so scripts/backtest.py can score models against
+-- what actually happened. Everything a backtest needs to answer "was this
+-- forecast any good, and why" lives here: the working-hours ETA (the
+-- headline number), the rate and which signal it came from, and the status
+-- (without it there is no way to tell a missing ETA that was correctly
+-- withheld from one that was silently broken).
 CREATE TABLE IF NOT EXISTS forecasts (
   id INTEGER PRIMARY KEY,
-  made_at      REAL NOT NULL,
-  provider     TEXT NOT NULL,
-  window_kind  TEXT NOT NULL,
-  model_name   TEXT NOT NULL,
-  used_percent REAL NOT NULL,
-  eta_calendar REAL,
-  eta_p50      REAL,
-  eta_p90      REAL
+  made_at        REAL NOT NULL,
+  provider       TEXT NOT NULL,
+  window_kind    TEXT NOT NULL,
+  model_name     TEXT NOT NULL,
+  used_percent   REAL NOT NULL,
+  eta_calendar   REAL,
+  eta_p50        REAL,
+  eta_p90        REAL,
+  eta_workhours  REAL,
+  status         TEXT,
+  burn_per_hour  REAL,
+  burn_basis     TEXT,
+  time_to_reset_h REAL,
+  exhausts_before_reset INTEGER
 );
 """
+
+# Columns added to `forecasts` after the table first shipped. CREATE TABLE
+# IF NOT EXISTS silently leaves an existing table alone, so an upgrade needs
+# these applied explicitly or every write below fails on the old schema.
+_FORECAST_COLUMNS_ADDED_LATER = {
+    "eta_workhours": "REAL",
+    "status": "TEXT",
+    "burn_per_hour": "REAL",
+    "burn_basis": "TEXT",
+    "time_to_reset_h": "REAL",
+    "exhausts_before_reset": "INTEGER",
+}
 
 
 @dataclass(frozen=True)
@@ -87,6 +111,21 @@ class TokenEventRow:
     output_tokens: int
     cache_creation: int
     cache_read: int
+
+    @property
+    def total_tokens(self) -> int:
+        """All four buckets summed — what actually consumes quota.
+
+        Safe to add for both providers despite their different accounting
+        models: Claude's cache fields are separate additive dimensions, and
+        Codex's are already folded into input/output so it stores 0 in them
+        (see providers/codex.py)."""
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation
+            + self.cache_read
+        )
 
 
 @dataclass(frozen=True)
@@ -109,6 +148,24 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._add_missing_forecast_columns()
+
+    def _add_missing_forecast_columns(self) -> None:
+        """Bring an existing history.db up to the current `forecasts` shape.
+
+        Additive only, and each column is nullable — rows written before a
+        column existed keep NULL there, which is exactly right: the value
+        genuinely wasn't recorded, and backfilling a guess would corrupt the
+        very history a backtest reads."""
+        existing = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(forecasts)").fetchall()
+        }
+        for column, sql_type in _FORECAST_COLUMNS_ADDED_LATER.items():
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE forecasts ADD COLUMN {column} {sql_type}"
+                )
 
     def close(self) -> None:
         self._conn.close()
@@ -282,8 +339,9 @@ class Store:
         self._conn.execute(
             "INSERT INTO forecasts "
             "(made_at, provider, window_kind, model_name, used_percent, "
-            " eta_calendar, eta_p50, eta_p90) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " eta_calendar, eta_p50, eta_p90, eta_workhours, status, "
+            " burn_per_hour, burn_basis, time_to_reset_h, exhausts_before_reset) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 made_at,
                 window.provider.value,
@@ -293,6 +351,12 @@ class Store:
                 _to_epoch(forecast.eta_calendar),
                 _to_epoch(forecast.eta_p50),
                 _to_epoch(forecast.eta_p90),
+                _to_epoch(forecast.eta_workhours),
+                forecast.status,
+                forecast.burn_per_hour,
+                forecast.burn_basis,
+                forecast.time_to_reset_h,
+                int(forecast.exhausts_before_reset),
             ),
         )
 

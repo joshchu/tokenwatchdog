@@ -66,18 +66,27 @@ def _climb(
     return samples
 
 
-def test_low_slow_burn_over_a_ten_day_history_is_sane_not_alarming(cfg):
+def test_low_slow_burn_is_reported_as_no_exhaustion_not_a_distant_date(cfg):
     """The "low but slow burn" case: a genuinely low, steady pace sustained
-    for ten days should produce a sane, finite, far-out ETA -- not
-    something that reads as urgent, and not a crash."""
+    for ten days must read as calm -- and specifically must not put a date
+    in the ETA column.
+
+    At 0.05%/h a window sitting at ~22% needs ~1500 hours to reach 100%,
+    which is nine times a weekly window's own 168-hour life. It will reset
+    long before it ever gets there, so that date describes an event that
+    cannot happen; a bound of one window duration is implied by what the
+    window IS, independent of whether a reset time has been derived yet.
+    (Found by scripts/backtest.py, which caught a FIVE-hour window being
+    handed a 3311-hour ETA on exactly this path.)"""
     now = 2_000_000.0
+    rate = 0.05  # slow: ~1.2%/day
     history = _climb(
         now,
         start_seconds_ago=10 * 24 * 3600,
         end_seconds_ago=0,
         step_seconds=1800,  # every 30 min, realistic polling cadence
         start_percent=10.0,
-        rate_per_hour=0.05,  # slow: ~1.2%/day
+        rate_per_hour=rate,
     )
     window = _window(
         Provider.CLAUDE,
@@ -88,14 +97,38 @@ def test_low_slow_burn_over_a_ten_day_history_is_sane_not_alarming(cfg):
     )
     forecast = LinearPredictor().forecast(window, history, [], cfg, now)
 
+    # The rate is still measured and reported -- this is "you won't run
+    # out," not "we don't know anything."
     assert forecast.status == "OK"
-    assert forecast.burn_per_hour == pytest.approx(0.05, rel=0.1)
-    # No known reset here (none ever observed) -- exhaustion is a real,
-    # finite, distant number of hours out. It must stay representable
-    # (see the overflow regression below for what happens when it isn't).
+    assert forecast.burn_per_hour == pytest.approx(rate, rel=0.1)
+    assert (100.0 - window.used_percent) / rate > 9 * 168  # far past a week
+    assert forecast.eta_calendar is None
+    assert forecast.eta_workhours is None
+    assert forecast.exhausts_before_reset is False
+
+
+def test_a_burn_that_does_exhaust_within_the_window_still_gets_an_eta(cfg):
+    """The other side of the bound: it suppresses the impossible, not the
+    merely far-off. A pace that genuinely runs the window out inside its own
+    duration must still produce a date."""
+    now = 2_000_000.0
+    rate = 2.0  # ~50h to burn 100% -- comfortably inside a 168h window
+    history = _climb(
+        now,
+        start_seconds_ago=24 * 3600,
+        end_seconds_ago=0,
+        step_seconds=1800,
+        start_percent=10.0,
+        rate_per_hour=rate,
+    )
+    window = _window(Provider.CLAUDE, WindowKind.WEEKLY, history[-1].used_percent, now)
+
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+
     assert forecast.eta_calendar is not None
     hours_out = (forecast.eta_calendar.timestamp() - now) / 3600.0
-    assert 1000.0 < hours_out < 3000.0  # weeks out, not years, not minutes
+    assert hours_out == pytest.approx((100.0 - window.used_percent) / rate, rel=0.15)
+    assert hours_out < 168.0
 
 
 def test_vanishingly_small_burn_with_unknown_reset_does_not_overflow(cfg):
@@ -238,34 +271,43 @@ def test_robust_slope_resists_an_outlier_near_the_middle_of_the_window(cfg):
     assert forecast.burn_per_hour < naive_slope / 2
 
 
-def test_linear_reacts_to_a_sustained_pace_change_fast_monte_carlo_lags(cfg):
-    """The flip side of outlier-resistance: a REAL, sustained pace change
-    (not a one-off blip) must still be picked up, not smoothed away
-    forever. Linear's short recency-weighted lookback means it reflects
-    the new rate almost immediately. Monte Carlo instead pools burn
-    observations from the entire history (recency-decayed, not excluded),
-    so its plain mean stays anchored near the old rate until the new
-    rate has had time to outweigh days of old data -- a real tradeoff
-    between the two models, not a bug in either."""
-    now = 2_000_000.0
-    old_rate, new_rate = 0.3, 10.0  # %/h -- a genuine ~33x step up
+def _pace_change_history(now, *, old_rate, new_rate, new_phase_hours):
+    """Days at `old_rate`, then `new_phase_hours` at `new_rate`."""
     old_phase = _climb(
         now,
         start_seconds_ago=96 * 3600,
-        end_seconds_ago=2 * 3600 + 1800,  # ends one step before new_phase starts
+        end_seconds_ago=new_phase_hours * 3600 + 1800,  # one step before the change
         step_seconds=1800,
         start_percent=5.0,
         rate_per_hour=old_rate,
     )
     new_phase = _climb(
         now,
-        start_seconds_ago=2 * 3600,
+        start_seconds_ago=new_phase_hours * 3600,
         end_seconds_ago=0,
         step_seconds=900,
         start_percent=old_phase[-1].used_percent,
         rate_per_hour=new_rate,
     )
-    history = old_phase + new_phase
+    return old_phase + new_phase
+
+
+def test_linear_tracks_a_sustained_pace_change_monte_carlo_lags(cfg):
+    """The flip side of outlier-resistance: a REAL, sustained pace change
+    (not a one-off blip) must still be picked up, not smoothed away
+    forever. Once the new pace has held for the whole lookback, linear
+    reports it. Monte Carlo instead pools burn observations from the entire
+    history (recency-decayed, not excluded), so its mean stays anchored near
+    the old rate until the new rate has had time to outweigh days of old
+    data -- a real tradeoff between the two models, not a bug in either."""
+    now = 2_000_000.0
+    old_rate, new_rate = 0.3, 10.0  # %/h -- a genuine ~33x step up
+    history = _pace_change_history(
+        now,
+        old_rate=old_rate,
+        new_rate=new_rate,
+        new_phase_hours=cfg.burn.lookback_weekly_minutes / 60.0,
+    )
     window = _window(
         Provider.CLAUDE,
         WindowKind.WEEKLY,
@@ -279,7 +321,35 @@ def test_linear_reacts_to_a_sustained_pace_change_fast_monte_carlo_lags(cfg):
 
     assert linear_forecast.burn_per_hour == pytest.approx(new_rate, rel=0.3)
     # Monte Carlo's mean is volume-dominated by four days of old-rate data
-    # against two hours of new-rate data -- it must land far closer to the
+    # against a few hours of new-rate data -- it must land far closer to the
     # old rate than to the new one.
     assert mc_forecast.burn_per_hour < (old_rate + new_rate) / 2
     assert linear_forecast.burn_per_hour > mc_forecast.burn_per_hour * 5
+
+
+def test_weekly_burn_smooths_a_pace_change_shorter_than_its_lookback(cfg):
+    """The weekly lookback is hours wide on purpose, so a pace change that
+    has only just started is reported partially rather than in full -- a
+    7-day budget shouldn't have its ETA yanked around by a burst that
+    started twenty minutes ago.
+
+    That width is what makes the weekly window readable at all: its
+    percentage is reported in whole numbers, and an evenly-spread week burns
+    ~0.6%/h, so a one-hour lookback observes a change of 0 or 1 and nothing
+    in between. Pinned here because it is a deliberate trade against
+    responsiveness, not a free win."""
+    now = 2_000_000.0
+    old_rate, new_rate = 0.3, 10.0
+    lookback_hours = cfg.burn.lookback_weekly_minutes / 60.0
+    elapsed_hours = lookback_hours / 3.0
+    history = _pace_change_history(
+        now, old_rate=old_rate, new_rate=new_rate, new_phase_hours=elapsed_hours
+    )
+    window = _window(Provider.CLAUDE, WindowKind.WEEKLY, history[-1].used_percent, now)
+
+    burn = LinearPredictor().forecast(window, history, [], cfg, now).burn_per_hour
+
+    # Between the two rates, and visibly moved off the old one: the change
+    # registers immediately, it just isn't believed in full yet.
+    assert old_rate < burn < new_rate
+    assert burn > old_rate * 5

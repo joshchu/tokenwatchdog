@@ -20,17 +20,39 @@ def alert_key(provider: Provider, kind: WindowKind, alert_kind: AlertKind) -> st
     return f"{provider.value}:{kind.value}:{alert_kind}"
 
 
+def level_still_in_cycle(window: Window, now: float) -> bool:
+    """Whether `window.used_percent` still describes the live cycle.
+
+    Staleness is a fact about a *rate*, not a *level*: quota does not
+    un-consume while you're away, so a reading of 100% taken six hours ago
+    against a window that resets in four days is still exactly 100% now.
+    Requires a known `resets_at` — without one we can't establish that no
+    reset has happened since, and inventing that certainty is what this
+    check exists to avoid.
+
+    (This is the distinction that used to be missing: an authoritative 100%
+    reading was going unalerted purely because the process that wrote it had
+    been quiet for longer than the staleness threshold.)"""
+    return window.resets_at is not None and now < window.resets_at
+
+
 def evaluate(forecast: Forecast, cfg: Config, store: Store, now: float) -> list[Alert]:
     """Check both alert kinds for one Forecast. Persists any state change
     (fire, or re-arm) as it goes — called once per watched window per tick.
 
-    Skips IDLE the same as NO_DATA: an idle reading is explicitly a stale
-    snapshot the predictor didn't trust enough to compute a burn rate from,
-    so confidently notifying on its raw percentage would be acting on data
-    we've already flagged as unreliable — e.g. a daemon started fresh
-    against a 3-day-old 95%-used reading has no business firing "you're at
-    95%!" for a number that stopped being current three days ago."""
-    if forecast.status in ("NO_DATA", "IDLE"):
+    NO_DATA is skipped outright — there is no reading. IDLE is skipped only
+    when the level can't be vouched for either (see `level_still_in_cycle`);
+    when it can, the threshold alert is still allowed through on the
+    strength of the level alone, while the burn alert stays suppressed by
+    its own `status == "OK"` requirement, because a burn rate measured from
+    a stale reading really is untrustworthy.
+
+    A daemon started fresh against a 3-day-old 95% reading therefore still
+    stays quiet — not because the reading is old, but because a window whose
+    `resets_at` has since passed is no longer at 95%."""
+    if forecast.status == "NO_DATA":
+        return []
+    if forecast.status == "IDLE" and not level_still_in_cycle(forecast.window, now):
         return []
     fired = [
         alert

@@ -26,6 +26,14 @@ ForecastStatus = Literal["OK", "IDLE", "NO_DATA", "RESET_PENDING"]
 Confidence = Literal["low", "medium", "high"]
 AlertKind = Literal["threshold", "burn"]
 
+# Which signal a burn rate was measured from. "tokens" is the good case:
+# real per-request token throughput, scaled into %/h by a ratio calibrated
+# against the authoritative percentage. "percent" is the fallback — the slope
+# of the reported percentage itself, which both providers quantize to whole
+# numbers and which therefore cannot resolve a slow-moving weekly window.
+# Recorded per forecast so scripts/backtest.py can score the two separately.
+BurnBasis = Literal["tokens", "percent"]
+
 
 @dataclass(frozen=True)
 class Window:
@@ -56,8 +64,14 @@ class Forecast:
     eta_p90: datetime | None
     prob_exhaust_before_reset: float | None
     confidence: Confidence | None  # None when there's no exhaustion trajectory at all
+    # Whether the *wall-clock* projection lands before this window's next
+    # reset — deliberately the 24/7 question, not the working-hours one:
+    # this is what the burn alert means by urgent, and usage that is
+    # happening right now doesn't pause because it's 9pm. eta_workhours
+    # answers the separate planning question and is shown alongside.
     exhausts_before_reset: bool
     n_samples: int
+    burn_basis: BurnBasis | None = None  # None when nothing was measured
     # None until used_percent has actually pinned at 100 this cycle -- see
     # predictor.tokens_burned_past_quota for why burn_per_hour alone goes
     # blind right at the one moment it matters most.

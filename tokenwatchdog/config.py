@@ -89,21 +89,34 @@ class ThresholdsConfig:
     # window within this many hours -- not merely "sometime before the
     # window resets," which could be days away and isn't urgent.
     burn_alert_within_hours: float = 1.0
-    stale_after_minutes: float = 10.0
+    # How old a reading may be before its BURN RATE is treated as stale.
+    # Per-window because the two live on different timescales: minutes after
+    # your last request a 5-hour window's rate really is meaningless,
+    # while a 7-day window's sustained pace survives a lunch break. One
+    # shared number had to be wrong for one of them, and at 10 minutes it
+    # was wrong for the weekly window -- which is the one the exhaustion
+    # forecast is actually about. Neither affects the used-% level, which
+    # stays true for the rest of the cycle regardless (see alerts.py).
+    stale_after_minutes_w5h: float = 10.0
+    stale_after_minutes_weekly: float = 180.0
     threshold_hysteresis: float = 10.0
 
 
 @dataclass(frozen=True)
 class BurnConfig:
-    lookback_weekly_minutes: float = 60.0
+    # Six hours, not one: this doubles as the token-throughput averaging
+    # window, where it means "sustained working pace" rather than "typing
+    # right now," and as the fallback percent-slope lookback, where a
+    # whole-number weekly percentage needs hours of span to move at all
+    # (~0.6%/h evenly spread means a 60-minute window sees a change of 0
+    # or 1 and nothing in between).
+    lookback_weekly_minutes: float = 360.0
     lookback_w5h_minutes: float = 15.0
 
 
 @dataclass(frozen=True)
 class PredictorConfig:
     model: str = "auto"
-    min_history_days: int = 7
-    report_uncertainty: bool = True
     history_retention_weeks: int = 8
     mc_runs: int = 2000
     bucket_decay_halflife_days: int = 21
@@ -200,6 +213,14 @@ _RENAMED_KEYS = {
     # anyone upgrading gets a fix, not a bare crash on their existing
     # config.toml.
     "burn_margin_hours": "burn_alert_within_hours",
+    "stale_after_minutes": "stale_after_minutes_w5h / stale_after_minutes_weekly",
+    # Removed rather than renamed: both promised behavior that was never
+    # built (there is no seasonal_profile tier for min_history_days to
+    # graduate into, and the P50/P90 band is now always shown when the
+    # montecarlo model produces one). Named here so an existing config.toml
+    # says that instead of failing with a bare "unknown key".
+    "min_history_days": "removed (predictor.model selects the model directly)",
+    "report_uncertainty": "removed (the montecarlo band is always shown)",
 }
 
 
@@ -208,9 +229,7 @@ def _build_section(cls: type, data: dict):
     unknown = set(data) - valid_names
     if unknown:
         parts = [
-            f"{key!r} was renamed to {_RENAMED_KEYS[key]!r}"
-            if key in _RENAMED_KEYS
-            else repr(key)
+            f"{key!r} → {_RENAMED_KEYS[key]}" if key in _RENAMED_KEYS else repr(key)
             for key in sorted(unknown)
         ]
         raise ConfigError(
@@ -344,17 +363,16 @@ watch = ["weekly", "w5h"]
 warn_percent = 90.0
 burn_min_percent = 25.0
 burn_alert_within_hours = 1.0        # alert only if projected to exhaust this soon
-stale_after_minutes = 10
+stale_after_minutes_w5h = 10         # how old a reading may be before its BURN RATE
+stale_after_minutes_weekly = 180     # is stale (the used-% level never goes stale)
 threshold_hysteresis = 10.0
 
 [burn]
-lookback_weekly_minutes = 60
+lookback_weekly_minutes = 360        # doubles as the token-throughput averaging window
 lookback_w5h_minutes = 15
 
 [predictor]
 model = "auto"                       # auto | linear | seasonal_profile | montecarlo | holtwinters
-min_history_days = 7
-report_uncertainty = true
 history_retention_weeks = 8
 mc_runs = 2000
 bucket_decay_halflife_days = 21

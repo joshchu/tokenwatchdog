@@ -21,6 +21,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
+from tokenwatchdog.alerts import level_still_in_cycle
 from tokenwatchdog.config import Config, load_config, resolve_timezone
 from tokenwatchdog.engine import Engine
 from tokenwatchdog.models import Alert, Forecast, MonitorState
@@ -161,6 +162,10 @@ def _render(
     # — label them with the actual abbreviation so a local time is never
     # mistaken for UTC at a glance, matching the "updated ... EDT" header.
     tz_label = datetime.fromtimestamp(state.now, tz=tz).strftime("%Z")
+    # Only the simulating model produces a probability; under the default one
+    # the column would be an always-empty stripe of width, which on a narrow
+    # terminal costs every other column real characters.
+    show_risk = any(f.prob_exhaust_before_reset is not None for f in state.forecasts)
     table = Table(expand=True)
     for column in (
         "Provider",
@@ -172,6 +177,7 @@ def _render(
         f"ETA (calendar, {tz_label})",
         f"ETA (working hrs, {tz_label})",
         f"Resets ({tz_label})",
+        *(("Risk",) if show_risk else ()),
         "Conf.",
     ):
         table.add_column(column)
@@ -179,7 +185,10 @@ def _render(
     for forecast in sorted(
         state.forecasts, key=lambda f: (f.window.provider.value, f.window.kind.value)
     ):
-        table.add_row(*_row(forecast, tz), style=_row_style(forecast, cfg, state.now))
+        table.add_row(
+            *_row(forecast, tz, show_risk=show_risk),
+            style=_row_style(forecast, cfg, state.now),
+        )
 
     mascot = _mascot_glyph(state.forecasts, cfg)
     updated = datetime.fromtimestamp(state.now, tz=tz).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -212,10 +221,10 @@ def _render_alert_log(alert_log: Sequence[Alert], tz: tzinfo) -> Panel:
     return Panel(table, title="🔔 Recent alerts", border_style="yellow")
 
 
-def _row(forecast: Forecast, tz: tzinfo) -> tuple[str, ...]:
+def _row(forecast: Forecast, tz: tzinfo, *, show_risk: bool = False) -> tuple[str, ...]:
     window = forecast.window
     used = f"{window.used_percent:.0f}%" + ("*" if window.is_estimated else "")
-    burn = f"{forecast.burn_per_hour:+.2f}" if forecast.status == "OK" else "—"
+    burn = _fmt_burn(forecast)
     resets_dt = (
         datetime.fromtimestamp(window.resets_at, tz=tz) if window.resets_at else None
     )
@@ -226,11 +235,42 @@ def _row(forecast: Forecast, tz: tzinfo) -> tuple[str, ...]:
         _fmt_overage(forecast),
         _status_label(forecast),
         burn,
-        _fmt_dt(forecast.eta_calendar, tz),
+        _fmt_eta_band(forecast, tz),
         _fmt_dt(forecast.eta_workhours, tz),
         _fmt_dt(resets_dt, tz),
+        *((_fmt_risk(forecast),) if show_risk else ()),
         forecast.confidence or "—",
     )
+
+
+def _fmt_burn(forecast: Forecast) -> str:
+    """The rate, marked `~` when it came from the fallback percent slope
+    rather than real token throughput — that's the case where the source is
+    a whole-number percentage too coarse to resolve a slow window, so the
+    number deserves to look approximate."""
+    if forecast.status != "OK":
+        return "—"
+    suffix = "~" if forecast.burn_basis == "percent" else ""
+    return f"{forecast.burn_per_hour:+.2f}{suffix}"
+
+
+def _fmt_eta_band(forecast: Forecast, tz: tzinfo) -> str:
+    """P50 with the P90 tail when a simulation produced one, else the plain
+    point ETA. A band is the honest shape for bursty usage — "Thu 15:00" on
+    its own implies a precision the underlying data doesn't have."""
+    point = _fmt_dt(forecast.eta_p50 or forecast.eta_calendar, tz)
+    if forecast.eta_p90 is None or forecast.eta_p50 is None:
+        return point
+    return f"{point} → {_fmt_dt(forecast.eta_p90, tz)}"
+
+
+def _fmt_risk(forecast: Forecast) -> str:
+    """Probability of exhausting before the reset, when a model computes one.
+    Distinct from the ETA: a 40% chance of running out is worth seeing even
+    though the median future doesn't."""
+    if forecast.prob_exhaust_before_reset is None:
+        return "—"
+    return f"{forecast.prob_exhaust_before_reset * 100:.0f}%"
 
 
 def _fmt_overage(forecast: Forecast) -> str:
@@ -275,20 +315,19 @@ def _row_style(forecast: Forecast, cfg: Config, now: float) -> str | None:
     pace to exhaust before reset" signal the Status column already labels
     "burning," for a burn that isn't urgent enough to be red yet.
 
-    Full exhaustion is checked first and overrides everything below,
-    including the NO_DATA/IDLE exclusion: 100% used is the literal
-    last-known reading, not a predicted trend, so it stays true even once
-    the data has gone stale -- unlike the warn-threshold/burn checks further
-    down, there's no "the predictor didn't trust this" argument against it.
+    Full exhaustion is checked first and overrides everything below: 100%
+    used is the literal last-known reading, not a predicted trend.
 
-    NO_DATA/IDLE are otherwise excluded exactly like alerts.evaluate()
-    excludes them — a stale reading is data the predictor didn't trust
-    enough to alert on, so painting it red/yellow would flag a number
-    that's already been flagged as unreliable."""
+    The IDLE handling tracks alerts.evaluate() deliberately, including its
+    level-vs-rate split — a stale *rate* is untrustworthy, but a stale
+    *level* is just a level, so an idle window still paints red for being
+    over the warn threshold as long as its cycle hasn't turned over."""
     window = forecast.window
     if window.used_percent >= 100.0:
         return "red"
-    if forecast.status in ("NO_DATA", "IDLE"):
+    if forecast.status == "NO_DATA":
+        return None
+    if forecast.status == "IDLE" and not level_still_in_cycle(window, now):
         return None
     if window.used_percent >= cfg.thresholds.warn_percent:
         return "red"

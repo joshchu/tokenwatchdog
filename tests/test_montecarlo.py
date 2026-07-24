@@ -102,7 +102,7 @@ def test_simulation_is_capped_at_an_imminent_reset(cfg):
 
 def test_idle_short_circuits_before_simulating(cfg):
     now = 1_000_000.0
-    stale_ts = now - cfg.thresholds.stale_after_minutes * 60 - 60
+    stale_ts = now - cfg.thresholds.stale_after_minutes_w5h * 60 - 60
     window = _window(WindowKind.W5H, 50.0, stale_ts)
     forecast = MonteCarloPredictor().forecast(window, [], [], cfg, now)
     assert forecast.status == "IDLE"
@@ -169,3 +169,75 @@ def test_selectable_via_config(tmp_path):
     config_path.write_text('[predictor]\nmodel = "montecarlo"\n')
     cfg = load_config(config_path)
     assert select_predictor(cfg).name == "montecarlo"
+
+
+def test_confidence_is_capped_by_hour_of_week_coverage(cfg):
+    """Observation COUNT alone overstates confidence badly. History packed
+    into a couple of days can hold hundreds of observations while leaving
+    most of a week unlearned — and every unlearned hour of the simulated
+    horizon gets drawn from the all-hours pool instead. Measured on real
+    data: 896 observations covering 94 of 168 buckets, rated "high"."""
+    now = 1_000_000.0
+    # Two days of dense history: plenty of observations, ~48/168 coverage.
+    history = []
+    ts = now - 2 * 24 * 3600
+    percent = 0.0
+    while ts <= now:
+        history.append(_sample(ts, percent))
+        percent = min(percent + 0.1, 60.0)
+        ts += 600.0
+    assert len(history) > 100  # volume alone would say "high"
+
+    # A full week of horizon, most of which has no bucket of its own.
+    weekly = _window(WindowKind.WEEKLY, 60.0, now, resets_at=now + 7 * 24 * 3600)
+    forecast = MonteCarloPredictor().forecast(weekly, history, [], cfg, now)
+
+    assert forecast.n_samples > 100
+    assert forecast.confidence in ("low", "medium")
+
+
+def test_simulation_resolves_exhaustion_inside_the_current_hour(cfg):
+    """The simulation walks in whole hours, so without interpolating the
+    hour it runs out in, it could not express any ETA sooner than 60 minutes
+    away — and a window resetting sooner than that had every outcome
+    censored past its horizon, silencing the band exactly when it mattered
+    most."""
+    now = 1_000_000.0
+    # 99% used with a steady, brisk burn and only 40 minutes to the reset.
+    history = []
+    ts = now - 6 * 3600
+    percent = 60.0
+    while ts <= now:
+        history.append(_sample(ts, min(percent, 99.0)))
+        percent += 1.0
+        ts += 600.0
+    window = _window(WindowKind.W5H, 99.0, now, resets_at=now + 2400.0)
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.eta_p50 is not None
+    minutes_out = (forecast.eta_p50.timestamp() - now) / 60.0
+    assert 0.0 < minutes_out < 40.0
+
+
+def test_risk_is_reported_even_when_the_median_future_does_not_exhaust(cfg):
+    """The censored-P50 path. "The median future is fine, but some aren't"
+    is the entire reason to simulate rather than extrapolate, so dropping
+    the probability here threw away the model's most distinctive output."""
+    now = 1_000_000.0
+    # A slow, noisy burn against a near reset: most simulated futures won't
+    # exhaust in time, so there's no point ETA -- but the tail is real.
+    history = []
+    ts = now - 4 * 24 * 3600
+    percent = 0.0
+    while ts <= now:
+        history.append(_sample(ts, percent))
+        percent = min(percent + 0.05, 80.0)
+        ts += 600.0
+    window = _window(WindowKind.WEEKLY, 80.0, now, resets_at=now + 8 * 3600)
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.eta_p50 is None  # median future survives to the reset
+    assert forecast.prob_exhaust_before_reset is not None
+    assert 0.0 <= forecast.prob_exhaust_before_reset <= 1.0
