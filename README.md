@@ -37,13 +37,16 @@ enough that it will run out before the window naturally resets.
   default, or an opt-in Monte Carlo model that learns your hour-of-week usage
   rhythm and simulates a P50/P90 exhaustion band instead of one point guess
 - Working-hours-aware calendar projection alongside the plain 24/7 ETA
-- 90%-usage alert and a separate "burning too fast" alert, both native macOS
-  notifications (default sound: a spoken "Woof! Woof!" — any system sound
-  name works too), each de-duplicated so you get at most one ping per window
+- 90%-usage alert and a separate "burning too fast" alert, both native
+  notifications with a cute spoken "Woof! Woof!" by default (any system
+  sound name works too, or turn notifications off entirely with
+  `notifications.enabled = false` in `config.toml`), each de-duplicated so
+  you get at most one ping per window
 - Persists history locally (SQLite) so the Monte Carlo model has real data
   to learn from, from the very first run
-- Terminal dashboard UI, with a `--headless` mode for running as a background
-  agent
+- Terminal dashboard UI — rows highlight red for an active alert or yellow
+  for usage trending toward exhaustion — with a `--headless` mode for
+  running as a background agent
 - Works with either provider alone or both at once; gracefully shows "no
   data" instead of guessing when a provider doesn't expose a window
 
@@ -58,7 +61,8 @@ uv sync
 uv run python -m tokenwatchdog
 ```
 
-That opens a live terminal dashboard. Useful variants:
+That opens a live terminal dashboard — press space to refresh immediately
+instead of waiting out the poll interval, Ctrl-C to quit. Useful variants:
 
 ```bash
 uv run python -m tokenwatchdog --once       # one reading, then exit
@@ -113,10 +117,13 @@ steps but aren't built yet.
   `predictor.history_retention_weeks`), and Desktop mode reads everything
   `plan-usage-history.json` still retains (~5 days). Either way, a period
   with the tool off isn't a gap once it's running again.
-- **Only tested on macOS so far.** Notifications (`terminal-notifier` /
-  `osascript` / the spoken bark via `say`) are macOS-specific. The core
-  polling/prediction logic is plain Python and *should* run elsewhere, but
-  it hasn't been run or verified on Linux or Windows.
+- **Only tested on macOS so far.** The visual notification banner
+  (`terminal-notifier` / `osascript`) and the spacebar-refresh keybinding
+  are POSIX/macOS-specific. The audible "woof" cue falls back to a plain
+  system beep on Windows instead of doing nothing, but that fallback is
+  untested on a real Windows machine. The core polling/prediction logic is
+  plain Python and *should* run elsewhere, but it hasn't been run or
+  verified on Linux or Windows.
 - Claude's weekly and 5-hour reset times are derived from an actually
   observed reset in your own history (not assumed), but there's no reset to
   learn from until one has happened at least once since the tool started
