@@ -14,7 +14,7 @@ import random
 import pytest
 
 from tokenwatchdog.models import Provider, Window, WindowKind
-from tokenwatchdog.predictor import MonteCarloPredictor
+from tokenwatchdog.predictor import MonteCarloPredictor, _percentile_within_horizon
 from tokenwatchdog.store import SampleRow
 
 
@@ -109,6 +109,31 @@ def test_flat_zero_burn_has_no_exhaustion_but_still_ok(cfg):
     assert forecast.status == "OK"
     assert forecast.burn_per_hour == pytest.approx(0.0)
     assert forecast.eta_p50 is None  # no simulation ever exhausted -> no band
+
+
+def test_percentile_within_horizon_is_censored_not_conditional():
+    """Regression: percentiles must be computed over ALL simulated
+    outcomes (non-exhausting runs counted as right-censored at the
+    horizon), not just the subset that happened to exhaust — otherwise a
+    "P50" computed from a small exhausting minority reads as an early,
+    confident ETA when the true unconditional median never exhausts at
+    all within the horizon.
+    """
+    horizon = 100.0
+    # 3 of 10 simulated futures exhaust; 7 run out the clock (censored).
+    outcomes = sorted([10.0, 20.0, 30.0] + [horizon] * 7)
+
+    # Most futures don't exhaust within the horizon -> no median ETA to
+    # report, not the median of the exhausting minority (30.0 or lower).
+    assert _percentile_within_horizon(outcomes, 0.5, horizon) is None
+    # The fast tail (bottom 10%) is still knowable even though P50 isn't.
+    assert _percentile_within_horizon(outcomes, 0.1, horizon) == 20.0
+
+
+def test_percentile_within_horizon_returns_a_value_when_most_exhaust():
+    horizon = 100.0
+    outcomes = sorted([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0] + [horizon] * 3)
+    assert _percentile_within_horizon(outcomes, 0.5, horizon) == 60.0
 
 
 def test_selectable_via_config(tmp_path):

@@ -135,8 +135,8 @@ class Store:
         source_file: str,
     ) -> bool:
         """INSERT OR IGNORE — a static (unchanged) reading is a silent no-op
-        because (provider, window_kind, source_ts, resets_at) is UNIQUE.
-        Returns True if a new row was actually written."""
+        because (provider, window_kind, source_ts) is UNIQUE. Returns True
+        if a new row was actually written."""
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO samples "
             "(captured_at, provider, window_kind, source_ts, used_percent, "

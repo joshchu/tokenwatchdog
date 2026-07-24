@@ -171,9 +171,9 @@ class MonteCarloPredictor:
                 resets_at=resets_at,
             )
 
-        buckets = _build_burn_buckets(history, tz)
-        all_burns = [v for values in buckets.values() for v in values]
-        if not all_burns:
+        raw_buckets = _build_burn_buckets(history, tz)
+        n_observations = sum(len(entries) for entries in raw_buckets.values())
+        if n_observations == 0:
             return _status_only_forecast(
                 window,
                 self.name,
@@ -182,6 +182,17 @@ class MonteCarloPredictor:
                 now=now,
                 resets_at=resets_at,
             )
+
+        halflife_days = cfg.predictor.bucket_decay_halflife_days
+        buckets = {
+            bucket: _weighted_pool(entries, now, halflife_days)
+            for bucket, entries in raw_buckets.items()
+        }
+        fallback_pool = (
+            [v for values, _ in buckets.values() for v in values],
+            [w for _, weights in buckets.values() for w in weights],
+        )
+        mean_burn = sum(fallback_pool[0]) / len(fallback_pool[0])
 
         now_dt = datetime.fromtimestamp(now, tz=tz)
         time_to_reset_h = (resets_at - now) / 3600.0 if resets_at is not None else None
@@ -193,45 +204,46 @@ class MonteCarloPredictor:
         )
 
         mc_runs = max(cfg.predictor.mc_runs, 1)
-        exhaustion_hours = [
-            hours
-            for hours in (
-                _simulate_exhaustion_hours(
-                    window.used_percent, now, buckets, all_burns, tz, horizon_h
-                )
-                for _ in range(mc_runs)
+        # Every run contributes exactly one outcome, exhausted or not — a
+        # run that never reaches 100% is censored AT the horizon, not
+        # dropped. Percentiles below are computed over all `mc_runs`
+        # outcomes: dropping non-exhausting runs first would make "P50"
+        # the median of whichever minority actually exhausted, which is
+        # a materially earlier (and wrong) number whenever most simulated
+        # futures don't exhaust within the horizon at all.
+        outcomes = [
+            _simulate_exhaustion_hours(
+                window.used_percent, now, buckets, fallback_pool, tz, horizon_h
             )
-            if hours is not None
+            or horizon_h
+            for _ in range(mc_runs)
         ]
-        mean_burn = sum(all_burns) / len(all_burns)
+        outcomes.sort()
+        prob_before_reset = (
+            sum(1 for h in outcomes if h < time_to_reset_h) / mc_runs
+            if time_to_reset_h is not None
+            else None
+        )
 
-        if not exhaustion_hours:
-            # Every simulation ran out the clock without reaching 100% —
-            # burn is too low/negative on average to say anything sharper
-            # than the plain mean, so fall back to the same projection
-            # linear uses.
+        p50_h = _percentile_within_horizon(outcomes, 0.5, horizon_h)
+        p90_h = _percentile_within_horizon(outcomes, 0.9, horizon_h)
+        if p50_h is None:
+            # More than half the simulated futures never exhausted within
+            # the horizon — there's no meaningful point ETA, so this is
+            # the same "OK, no ETA" shape linear reports for burn <= 0.
             return _project_forecast(
                 window=window,
                 burn_per_hour=mean_burn,
                 resets_at=resets_at,
-                n_samples=len(all_burns),
+                n_samples=n_observations,
                 cfg=cfg,
                 now=now,
                 tz=tz,
                 model_name=self.name,
             )
 
-        exhaustion_hours.sort()
-        p50_h = _percentile(exhaustion_hours, 0.5)
-        p90_h = _percentile(exhaustion_hours, 0.9)
-        prob_before_reset = (
-            sum(1 for h in exhaustion_hours if h < time_to_reset_h) / mc_runs
-            if time_to_reset_h is not None
-            else None
-        )
-
         eta_p50 = now_dt + timedelta(hours=p50_h)
-        eta_p90 = now_dt + timedelta(hours=p90_h)
+        eta_p90 = now_dt + timedelta(hours=p90_h) if p90_h is not None else None
         exhausts_before_reset = (
             False if time_to_reset_h is None else p50_h < time_to_reset_h
         )
@@ -249,9 +261,9 @@ class MonteCarloPredictor:
             eta_p50=eta_p50,
             eta_p90=eta_p90,
             prob_exhaust_before_reset=prob_before_reset,
-            confidence=_confidence(len(all_burns)),
+            confidence=_confidence(n_observations),
             exhausts_before_reset=exhausts_before_reset,
-            n_samples=len(all_burns),
+            n_samples=n_observations,
         )
 
 
@@ -288,21 +300,33 @@ class _BlockView:
 
 
 _RESET_DROP_PERCENT = 5.0
+_RESET_NEAR_ZERO_PERCENT = 10.0
 
 
 def _is_reset(prev: SampleRow, curr: SampleRow) -> bool:
-    """A drop has to clear `_RESET_DROP_PERCENT`, not just be negative:
+    """A drop has to clear `_RESET_DROP_PERCENT`, not just be negative —
+    and for `is_estimated` samples, land near zero too.
+
     Claude's token-compute samples are a trailing rolling-window sum (see
     providers/claude.py Source B), so used_percent drifts down on its own
-    as old events age out of the window even with no real reset. A true
-    reset is a cliff (toward 0%); aging-out is a slow drift. This is an
-    imperfect heuristic, not a real block-boundary signal for that source.
+    as old events age out of the window even with no real reset, and a
+    single old burst aging out can produce a large drop, not just a small
+    drift. A magnitude threshold alone still false-positives on that. A
+    true reset always lands near zero; a big rolling-window swing only
+    coincidentally would, so requiring both cuts most false positives
+    without needing to model the rolling window itself. Non-estimated
+    sources (Codex, Claude Desktop) report an authoritative percentage —
+    any real drop there is trustworthy on its own.
     """
-    return curr.used_percent < prev.used_percent - _RESET_DROP_PERCENT or (
-        prev.resets_at is not None
-        and curr.resets_at is not None
-        and curr.resets_at > prev.resets_at + 1.0
-    )
+    if curr.resets_at is not None and prev.resets_at is not None:
+        if curr.resets_at > prev.resets_at + 1.0:
+            return True
+    dropped = curr.used_percent < prev.used_percent - _RESET_DROP_PERCENT
+    if not dropped:
+        return False
+    if curr.is_estimated:
+        return curr.used_percent < _RESET_NEAR_ZERO_PERCENT
+    return True
 
 
 def _split_into_blocks(history: list[SampleRow]) -> list[list[SampleRow]]:
@@ -398,38 +422,64 @@ def _theil_sen_slope_per_hour(samples: list[SampleRow]) -> float:
 
 _HOUR_OF_WEEK_BUCKETS = 168  # 24 * 7
 
+# A pair of samples more than this far apart produces too coarse an average
+# to attribute to a single hour-of-week bucket meaningfully — e.g. "idle for
+# three days, then one burst" would otherwise teach the model a tiny,
+# misleading rate smeared across a bucket that was actually idle the whole
+# time. Observations that far apart are dropped rather than misattributed.
+_MAX_BUCKET_GAP_HOURS = 3.0
+
+WeightedPool = tuple[list[float], list[float]]  # (values, weights) for random.choices
+
 
 def _hour_of_week(ts: float, tz: tzinfo) -> int:
     dt = datetime.fromtimestamp(ts, tz=tz)
     return dt.weekday() * 24 + dt.hour
 
 
-def _build_burn_buckets(history: list[SampleRow], tz: tzinfo) -> dict[int, list[float]]:
-    """Empirical burn-%/h observations bucketed by hour-of-week, built from
-    consecutive same-block sample pairs across EVERY observed block, not
-    just the live one — this is what lets the model learn "nothing happens
-    on weekends" instead of assuming a flat 24/7 rate. Each bucket's list
-    is the raw observations, not a summary statistic, so the simulator can
-    resample from the real empirical distribution rather than a Gaussian
-    assumption that bursty usage doesn't actually follow."""
-    buckets: dict[int, list[float]] = {}
+def _build_burn_buckets(
+    history: list[SampleRow], tz: tzinfo
+) -> dict[int, list[tuple[float, float]]]:
+    """(source_ts, burn_%/h) observations bucketed by hour-of-week, built
+    from consecutive same-block sample pairs across EVERY observed block,
+    not just the live one — this is what lets the model learn "nothing
+    happens on weekends" instead of assuming a flat 24/7 rate. Keeping the
+    timestamp alongside each observation is what lets `_weighted_pool`
+    weigh recent weeks more than old ones."""
+    buckets: dict[int, list[tuple[float, float]]] = {}
     for block in _split_into_blocks(history):
         for i in range(1, len(block)):
             prev, curr = block[i - 1], block[i]
             dt_hours = (curr.source_ts - prev.source_ts) / 3600.0
-            if dt_hours <= 0:
+            if dt_hours <= 0 or dt_hours > _MAX_BUCKET_GAP_HOURS:
                 continue
             burn = (curr.used_percent - prev.used_percent) / dt_hours
             bucket = _hour_of_week(prev.source_ts, tz)
-            buckets.setdefault(bucket, []).append(burn)
+            buckets.setdefault(bucket, []).append((prev.source_ts, burn))
     return buckets
+
+
+def _weighted_pool(
+    entries: list[tuple[float, float]], now: float, halflife_days: float
+) -> WeightedPool:
+    """(values, weights) for `random.choices`, per
+    `predictor.bucket_decay_halflife_days` — an observation from one
+    halflife ago carries half the weight of one from today, so a rhythm
+    change (e.g. a vacation, a new project) ages out instead of
+    permanently anchoring the profile to old behavior."""
+    values = [burn for _, burn in entries]
+    if halflife_days <= 0:
+        return values, [1.0] * len(values)
+    halflife_seconds = halflife_days * 24 * 3600
+    weights = [0.5 ** ((now - ts) / halflife_seconds) for ts, _ in entries]
+    return values, weights
 
 
 def _simulate_exhaustion_hours(
     used_percent: float,
     start_ts: float,
-    buckets: dict[int, list[float]],
-    fallback_values: list[float],
+    buckets: dict[int, WeightedPool],
+    fallback_pool: WeightedPool,
     tz: tzinfo,
     horizon_hours: float,
 ) -> float | None:
@@ -438,7 +488,8 @@ def _simulate_exhaustion_hours(
     (falling back to the all-buckets pool if that specific hour has no
     history yet), accumulating usage until it would hit 100%. Returns None
     if it doesn't exhaust within `horizon_hours` — "didn't run out," not
-    an error."""
+    an error; the caller treats that as right-censored AT the horizon
+    rather than discarding the run."""
     remaining = 100.0 - used_percent
     if remaining <= 0:
         return 0.0
@@ -446,8 +497,10 @@ def _simulate_exhaustion_hours(
     cursor_ts = start_ts
     while elapsed < horizon_hours:
         bucket = _hour_of_week(cursor_ts, tz)
-        values = buckets.get(bucket) or fallback_values
-        burn = max(random.choice(values), 0.0)
+        values, weights = buckets.get(bucket, ([], []))
+        if not values:
+            values, weights = fallback_pool
+        burn = max(random.choices(values, weights=weights, k=1)[0], 0.0)
         remaining -= burn
         elapsed += 1.0
         cursor_ts += 3600.0
@@ -456,11 +509,20 @@ def _simulate_exhaustion_hours(
     return None
 
 
-def _percentile(sorted_values: list[float], quantile: float) -> float:
+def _percentile_within_horizon(
+    sorted_values: list[float], quantile: float, horizon_hours: float
+) -> float | None:
+    """The `quantile`-th value of an ALREADY-SORTED list that mixes real
+    exhaustion hours with `horizon_hours`-censored non-exhausting runs.
+    Returns None if that percentile lands on a censored run — i.e. fewer
+    than `quantile` of all simulated futures exhausted within the horizon
+    at all, so there is no meaningful point estimate to report, not just
+    an imprecise one."""
     if not sorted_values:
-        return 0.0
+        return None
     index = min(int(quantile * len(sorted_values)), len(sorted_values) - 1)
-    return sorted_values[index]
+    value = sorted_values[index]
+    return None if value >= horizon_hours else value
 
 
 def _confidence(n_samples: int) -> Confidence:

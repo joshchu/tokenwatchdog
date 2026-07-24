@@ -11,19 +11,23 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from tokenwatchdog.models import Provider, Window, WindowKind
-from tokenwatchdog.predictor import LinearPredictor, project_workhours_exhaustion
+from tokenwatchdog.predictor import (
+    LinearPredictor,
+    _is_reset,
+    project_workhours_exhaustion,
+)
 from tokenwatchdog.store import SampleRow
 
 UTC = ZoneInfo("UTC")
 
 
-def _sample(source_ts, used_percent, resets_at=None):
+def _sample(source_ts, used_percent, resets_at=None, is_estimated=False):
     return SampleRow(
         captured_at=source_ts,
         source_ts=source_ts,
         used_percent=used_percent,
         resets_at=resets_at,
-        is_estimated=False,
+        is_estimated=is_estimated,
     )
 
 
@@ -79,6 +83,27 @@ def test_negative_delta_is_reset_pending(cfg):
     forecast = LinearPredictor().forecast(window, history, [], cfg, now)
     assert forecast.status == "RESET_PENDING"
     assert forecast.burn_per_hour == 0.0
+
+
+def test_large_drop_on_authoritative_source_is_always_a_reset(cfg):
+    # Codex/Desktop percentages are authoritative -- any real drop counts.
+    prev = _sample(0.0, 60.0, is_estimated=False)
+    curr = _sample(60.0, 40.0, is_estimated=False)  # drop of 20, lands at 40
+    assert _is_reset(prev, curr) is True
+
+
+def test_large_drop_on_estimated_source_needs_to_land_near_zero(cfg):
+    """Regression: Claude's token-compute percentage is a trailing
+    rolling-window sum, so a single old burst aging out can produce a
+    large drop that isn't a real reset. A magnitude threshold alone
+    false-positives on that; requiring the landing point to also be near
+    zero (what a true reset always looks like) cuts most of those."""
+    prev = _sample(0.0, 60.0, is_estimated=True)
+    curr = _sample(60.0, 40.0, is_estimated=True)  # big drop, but lands at 40
+    assert _is_reset(prev, curr) is False
+
+    curr_near_zero = _sample(60.0, 3.0, is_estimated=True)  # big drop, lands near 0
+    assert _is_reset(prev, curr_near_zero) is True
 
 
 def test_100_percent_used_exhausts_immediately(cfg):
