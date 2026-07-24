@@ -125,6 +125,18 @@ def test_row_style_is_none_for_stale_idle_even_over_threshold(cfg):
     assert _row_style(forecast, cfg, now=1000.0) is None
 
 
+def test_row_style_is_red_at_full_exhaustion_even_when_idle(cfg):
+    """Regression: 100% used is the literal last-known reading, not a
+    predicted trend -- it stays true even once the window has gone stale,
+    unlike the 95%-idle case above where the number could plausibly have
+    already dropped. A window that hit its limit and then stopped being
+    polled must not read as merely "idle" on the dashboard."""
+    forecast = dataclasses.replace(
+        _forecast(_window(used_percent=100.0)), status="IDLE"
+    )
+    assert _row_style(forecast, cfg, now=1000.0) == "red"
+
+
 def test_spacebar_pressed_falls_back_to_plain_sleep_when_not_a_tty(monkeypatch):
     sleeps = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))

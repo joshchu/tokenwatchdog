@@ -252,13 +252,21 @@ def _row_style(forecast: Forecast, cfg: Config, now: float) -> str | None:
     pace to exhaust before reset" signal the Status column already labels
     "burning," for a burn that isn't urgent enough to be red yet.
 
-    NO_DATA/IDLE are excluded exactly like alerts.evaluate() excludes them —
-    a stale reading is data the predictor didn't trust enough to alert on,
-    so painting it red/yellow would flag a number that's already been
-    flagged as unreliable."""
+    Full exhaustion is checked first and overrides everything below,
+    including the NO_DATA/IDLE exclusion: 100% used is the literal
+    last-known reading, not a predicted trend, so it stays true even once
+    the data has gone stale -- unlike the warn-threshold/burn checks further
+    down, there's no "the predictor didn't trust this" argument against it.
+
+    NO_DATA/IDLE are otherwise excluded exactly like alerts.evaluate()
+    excludes them — a stale reading is data the predictor didn't trust
+    enough to alert on, so painting it red/yellow would flag a number
+    that's already been flagged as unreliable."""
+    window = forecast.window
+    if window.used_percent >= 100.0:
+        return "red"
     if forecast.status in ("NO_DATA", "IDLE"):
         return None
-    window = forecast.window
     if window.used_percent >= cfg.thresholds.warn_percent:
         return "red"
     if forecast.status != "OK" or not forecast.exhausts_before_reset:
