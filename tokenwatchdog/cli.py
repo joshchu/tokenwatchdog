@@ -108,14 +108,17 @@ def _render(state: MonitorState, cfg: Config, alert_log: Sequence[Alert]) -> Gro
     for forecast in sorted(
         state.forecasts, key=lambda f: (f.window.provider.value, f.window.kind.value)
     ):
-        table.add_row(*_row(forecast, tz))
+        table.add_row(*_row(forecast, tz), style=_row_style(forecast, cfg, state.now))
 
-    mascot = _mascot_glyph(state.forecasts)
+    mascot = _mascot_glyph(state.forecasts, cfg)
     updated = datetime.fromtimestamp(state.now, tz=tz).strftime("%Y-%m-%d %H:%M:%S %Z")
     panel = Panel(
         table,
         title=f"{mascot} TokenWatchDog — updated {updated}",
-        subtitle="* = estimated (token-based limit is a guess, not an official cap)",
+        subtitle=(
+            "* = estimated (token-based limit is a guess, not an official cap)"
+            " · red = alert · yellow = trending toward exhaustion"
+        ),
         border_style="blue",
     )
     if not alert_log:
@@ -171,10 +174,38 @@ def _fmt_dt(dt: datetime | None, tz: tzinfo) -> str:
     return dt.astimezone(tz).strftime("%a %H:%M")
 
 
-def _mascot_glyph(forecasts: tuple[Forecast, ...]) -> str:
+def _row_style(forecast: Forecast, cfg: Config, now: float) -> str | None:
+    """Red mirrors the exact condition alerts.py fires on — current state,
+    not the armed/fired history, so the highlight doesn't vanish the tick
+    after a one-shot notification already fired. Yellow is the weaker "on
+    pace to exhaust before reset" signal the Status column already labels
+    "burning," for a burn that isn't urgent enough to be red yet.
+
+    NO_DATA/IDLE are excluded exactly like alerts.evaluate() excludes them —
+    a stale reading is data the predictor didn't trust enough to alert on,
+    so painting it red/yellow would flag a number that's already been
+    flagged as unreliable."""
+    if forecast.status in ("NO_DATA", "IDLE"):
+        return None
+    window = forecast.window
+    if window.used_percent >= cfg.thresholds.warn_percent:
+        return "red"
+    if forecast.status != "OK" or not forecast.exhausts_before_reset:
+        return None
+    if (
+        window.used_percent >= cfg.thresholds.burn_min_percent
+        and forecast.eta_calendar is not None
+        and (forecast.eta_calendar.timestamp() - now) / 3600.0
+        <= cfg.thresholds.burn_alert_within_hours
+    ):
+        return "red"
+    return "yellow"
+
+
+def _mascot_glyph(forecasts: tuple[Forecast, ...], cfg: Config) -> str:
     if any(f.status == "OK" and f.exhausts_before_reset for f in forecasts):
         return _BURN_EMOJI
-    if any(f.window.used_percent >= 90.0 for f in forecasts):
+    if any(f.window.used_percent >= cfg.thresholds.warn_percent for f in forecasts):
         return _ALERT_EMOJI
     return _CALM_EMOJI
 

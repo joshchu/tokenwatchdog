@@ -3,9 +3,12 @@ alert log only appears when there's something to show."""
 
 from __future__ import annotations
 
+import dataclasses
+from datetime import datetime, timezone
+
 from rich.console import Console
 
-from tokenwatchdog.cli import _render
+from tokenwatchdog.cli import _render, _row_style
 from tokenwatchdog.models import (
     Alert,
     Forecast,
@@ -78,3 +81,40 @@ def test_render_with_alerts_shows_the_alert_panel_and_message(cfg):
     text = _render_to_text(_render(state, cfg, [alert]))
     assert "Recent alerts" in text
     assert "codex weekly: 95% used" in text
+
+
+def test_row_style_is_red_over_the_warn_threshold(cfg):
+    forecast = _forecast(_window(used_percent=95.0))
+    assert _row_style(forecast, cfg, now=1000.0) == "red"
+
+
+def test_row_style_is_yellow_when_burning_but_not_yet_urgent(cfg):
+    forecast = dataclasses.replace(
+        _forecast(_window(used_percent=50.0)),
+        exhausts_before_reset=True,
+        eta_calendar=datetime.fromtimestamp(1000.0 + 10 * 3600, tz=timezone.utc),
+    )
+    assert _row_style(forecast, cfg, now=1000.0) == "yellow"
+
+
+def test_row_style_is_red_when_burn_is_imminent(cfg):
+    forecast = dataclasses.replace(
+        _forecast(_window(used_percent=50.0)),
+        exhausts_before_reset=True,
+        eta_calendar=datetime.fromtimestamp(1000.0 + 0.1 * 3600, tz=timezone.utc),
+    )
+    assert _row_style(forecast, cfg, now=1000.0) == "red"
+
+
+def test_row_style_is_none_when_not_exhausting(cfg):
+    forecast = _forecast(_window(used_percent=50.0))
+    assert _row_style(forecast, cfg, now=1000.0) is None
+
+
+def test_row_style_is_none_for_stale_idle_even_over_threshold(cfg):
+    """Regression: alerts.py already treats IDLE the same as NO_DATA -- a
+    stale snapshot it doesn't trust enough to alert on. Highlighting an
+    idle 95% reading red would flag data that's already been flagged as
+    unreliable."""
+    forecast = dataclasses.replace(_forecast(_window(used_percent=95.0)), status="IDLE")
+    assert _row_style(forecast, cfg, now=1000.0) is None
