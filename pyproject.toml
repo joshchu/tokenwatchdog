@@ -1,0 +1,82 @@
+[project]
+name = "tokenwatchdog"
+version = "0.1.0"
+description = "Local watchdog for Codex CLI + Claude Code usage quota — polls, predicts exhaustion, and alerts (working-hours-aware)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+
+# Runtime deps kept deliberately tiny. Everything else the tool needs is
+# stdlib: sqlite3, tomllib, zoneinfo, subprocess, datetime, json, glob, shutil.
+dependencies = [
+    "rich>=13.7.0",                     # terminal dashboard
+]
+
+[project.optional-dependencies]
+# Optional front-end / model extras — NOT installed by default.
+menubar = ["rumps>=0.4.0"]              # macOS menu-bar app (not yet built)
+forecasting = ["statsmodels>=0.14.0"]   # only for the optional holtwinters model
+
+[project.scripts]
+tokenwatchdog = "tokenwatchdog.cli:main"
+# tokenwatchdog-menubar will be added once tokenwatchdog/menubar.py exists —
+# a script entry pointing at a module that doesn't exist yet is a broken
+# command for anyone who installs this today.
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.15",
+    "mypy>=1.8.0",
+]
+test = [
+    "pytest>=8.0.0",
+    "freezegun>=1.4.0",                 # deterministic time for predictor/alert tests
+]
+package = [
+    "pyinstaller>=6.6.0",               # freeze to a standalone binary
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ============================================================================
+# Ruff (line-length 88, py313, E/F/W/I)
+# ============================================================================
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+extend-exclude = [".venv", "env"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E203", "E501"]               # formatter owns line width
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "F403"]        # re-export pattern
+
+[tool.ruff.lint.isort]
+known-first-party = ["tokenwatchdog"]
+
+# ============================================================================
+# Pytest / type checking
+# ============================================================================
+[tool.pytest.ini_options]
+python_files = ["test_*.py"]
+addopts = "--strict-markers"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.13"
+check_untyped_defs = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+
+[tool.pyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+reportMissingImports = "none"

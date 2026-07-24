@@ -1,0 +1,168 @@
+"""Alerting — 90% threshold + burn-too-fast, with a persisted re-arm state
+machine so each condition fires at most once per window period.
+"""
+
+from __future__ import annotations
+
+from tokenwatchdog.config import Config
+from tokenwatchdog.models import (
+    Alert,
+    AlertKind,
+    Forecast,
+    Provider,
+    Window,
+    WindowKind,
+)
+from tokenwatchdog.store import AlertStateRow, Store
+
+
+def alert_key(provider: Provider, kind: WindowKind, alert_kind: AlertKind) -> str:
+    return f"{provider.value}:{kind.value}:{alert_kind}"
+
+
+def evaluate(forecast: Forecast, cfg: Config, store: Store, now: float) -> list[Alert]:
+    """Check both alert kinds for one Forecast. Persists any state change
+    (fire, or re-arm) as it goes — called once per watched window per tick.
+
+    Skips IDLE the same as NO_DATA: an idle reading is explicitly a stale
+    snapshot the predictor didn't trust enough to compute a burn rate from,
+    so confidently notifying on its raw percentage would be acting on data
+    we've already flagged as unreliable — e.g. a daemon started fresh
+    against a 3-day-old 95%-used reading has no business firing "you're at
+    95%!" for a number that stopped being current three days ago."""
+    if forecast.status in ("NO_DATA", "IDLE"):
+        return []
+    fired = [
+        alert
+        for alert in (
+            _evaluate_threshold(forecast, cfg, store, now),
+            _evaluate_burn(forecast, cfg, store, now),
+        )
+        if alert is not None
+    ]
+    return fired
+
+
+def _evaluate_threshold(
+    forecast: Forecast, cfg: Config, store: Store, now: float
+) -> Alert | None:
+    window = forecast.window
+    condition = window.used_percent >= cfg.thresholds.warn_percent
+    message = (
+        f"{window.provider.value} {window.kind.value}: {window.used_percent:.0f}% "
+        f"used (warns at {cfg.thresholds.warn_percent:.0f}%)"
+    )
+    return _evaluate(
+        forecast,
+        cfg,
+        store,
+        now,
+        alert_kind="threshold",
+        condition=condition,
+        message=message,
+    )
+
+
+def _evaluate_burn(
+    forecast: Forecast, cfg: Config, store: Store, now: float
+) -> Alert | None:
+    window = forecast.window
+    if (
+        forecast.status != "OK"
+        or not forecast.exhausts_before_reset
+        or window.used_percent < cfg.thresholds.burn_min_percent
+        or forecast.eta_calendar is None
+        or forecast.time_to_reset_h is None
+    ):
+        condition = False
+    else:
+        hours_to_exhaust = (forecast.eta_calendar.timestamp() - now) / 3600.0
+        margin_h = forecast.time_to_reset_h - hours_to_exhaust
+        condition = margin_h >= cfg.thresholds.burn_margin_hours
+
+    message = (
+        f"{window.provider.value} {window.kind.value} is burning too fast: "
+        f"{window.used_percent:.0f}% used and on pace to exhaust before its "
+        f"next reset"
+    )
+    return _evaluate(
+        forecast,
+        cfg,
+        store,
+        now,
+        alert_kind="burn",
+        condition=condition,
+        message=message,
+    )
+
+
+def _evaluate(
+    forecast: Forecast,
+    cfg: Config,
+    store: Store,
+    now: float,
+    *,
+    alert_kind: AlertKind,
+    condition: bool,
+    message: str,
+) -> Alert | None:
+    window = forecast.window
+    key = alert_key(window.provider, window.kind, alert_kind)
+    state = store.get_alert_state(key)
+    armed = _rearm_if_needed(key, state, window, cfg, store, alert_kind=alert_kind)
+
+    if not (armed and condition):
+        return None
+
+    store.set_alert_state(
+        key, armed=False, last_fired_at=now, reset_epoch_at_fire=window.resets_at
+    )
+    return Alert(
+        key=key,
+        provider=window.provider,
+        kind=window.kind,
+        alert_kind=alert_kind,
+        message=message,
+        fired_at=now,
+    )
+
+
+def _rearm_if_needed(
+    key: str,
+    state: AlertStateRow | None,
+    window: Window,
+    cfg: Config,
+    store: Store,
+    *,
+    alert_kind: AlertKind,
+) -> bool:
+    """Whether the alert is armed right now, re-arming (and persisting the
+    re-arm) first if warranted.
+
+    Re-arm triggers: `resets_at` has advanced since the last fire — robust
+    even while idle, since it's a fact about the world, not something we
+    have to catch changing in real time. The threshold alert additionally
+    re-arms on a hysteresis drop (used_percent falls back below
+    `warn_percent - threshold_hysteresis`), so the same block can re-warn if
+    usage dips and climbs again.
+    """
+    if state is None or state.armed:
+        return True
+    reset_advanced = (
+        window.resets_at is not None
+        and state.reset_epoch_at_fire is not None
+        and window.resets_at > state.reset_epoch_at_fire + 1.0
+    )
+    hysteresis_cleared = alert_kind == "threshold" and (
+        window.used_percent
+        < cfg.thresholds.warn_percent - cfg.thresholds.threshold_hysteresis
+    )
+    if not (reset_advanced or hysteresis_cleared):
+        return False
+    store.set_alert_state(
+        key,
+        armed=True,
+        last_fired_at=state.last_fired_at,
+        reset_epoch_at_fire=state.reset_epoch_at_fire,
+    )
+    return True

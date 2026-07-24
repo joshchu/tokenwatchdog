@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+env/
+venv/
+
+# Local runtime state (the tool's own history + config live in ~/.tokenwatchdog)
+history.db
+*.sqlite
+*.sqlite3
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
