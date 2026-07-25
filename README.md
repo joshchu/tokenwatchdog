@@ -82,9 +82,10 @@ enough that it will run out before the window naturally resets.
 - Works with either provider alone or both at once; gracefully shows "no
   data" instead of guessing when a provider doesn't expose a window
 - Once either provider's own reported percentage pins at 100%, burn rate
-  alone goes blind — the "Past cap" column keeps tracking real tokens spent
-  past that point (from the same session/token logs), and shows a `$`
-  estimate instead of a raw token count once you set your plan's real
+  alone goes blind — so the usage cell keeps counting real tokens spent past
+  that point (from the same session/token logs) in parentheses, as
+  `100% (+7.5M)`, and shows a `$` estimate instead of a raw token count
+  once you set your plan's real
   overage rate: `codex.input_price_per_million_usd` /
   `output_price_per_million_usd` for Codex, or the same plus
   `cache_write_price_per_million_usd` / `cache_read_price_per_million_usd`
@@ -127,8 +128,7 @@ time is never misread as UTC.
 | Column | What it means |
 |---|---|
 | **Provider** / **Window** | `codex` or `claude`, and which cap: `w5h` (5-hour) or `weekly` (7-day). |
-| **Used %** | How much of the window is gone. Whole numbers, because that's the resolution both providers report. A trailing `*` means the number is not a percentage the provider stated: either it was computed from token counts against an unpublished limit (Claude's `tokens` source), or the row is `no_data` and the `0%` is a placeholder standing in for a reading that doesn't exist. |
-| **Past cap** | Blank until **Used %** actually pins at 100 for this cycle; then it's the tokens really spent since that moment, or a `$` figure once you've configured your plan's overage rates. Stays blank even at 100% for a source with no per-request token history (Claude Desktop), since there'd be nothing to sum. It exists because a percentage can't climb past 100, so continued spending becomes invisible to **Burn %/h** at exactly the point it stops being free. |
+| **Used %** | How much of the window is gone. Whole numbers, because that's the resolution both providers report. A trailing `*` means the number is not a percentage the provider stated: either it was computed from token counts against an unpublished limit (Claude's `tokens` source), or the row is `no_data` and the `0%` is a placeholder standing in for a reading that doesn't exist. Once the percentage pins at 100, what you've spent *past* the cap follows in parentheses — `100% (+7.5M)` for 7.5M tokens beyond it, or `100% (+$12.34)` once your plan's overage rates are configured. A percentage can't climb past 100, so that figure is the only thing still moving at the moment spending stops being free. It's absent for a source with no per-request token history (Claude Desktop), since there'd be nothing to sum. |
 | **Status** | `ok` — live, and not on pace to exhaust. `🔥 burning` — on pace to hit 100% before the reset. `idle` — the newest reading is older than this window's staleness threshold (10 min for 5-hour, 3 h for weekly, both configurable), so no *rate* can be measured; the **Used %** level still counts. `reset_pending` — the window just turned over and there's only one reading in the new cycle. `no_data` — the provider isn't reporting this window at all (today, Codex's 5-hour). |
 | **Burn %/h** | Percent of *this window's* quota consumed per hour at the currently measured rate — not tokens per hour, and not a share of anything else, so it divides straight into the percent remaining. Normally measured from real token throughput and converted by the percent-per-token calibration; a trailing `~` means it fell back to the slope of the reported percentage itself, which is quantized to whole numbers and therefore coarse. `—` on any row that isn't live (`idle`, `no_data`, `reset_pending`), because a rate is the one thing a stale reading can't support. |
 | **ETA trend** | When the window runs out projected around the clock, from whichever model is authoritative — the recent-pace question under the default `linear`, or the median simulated future if `montecarlo` is selected. Either way it's the urgent, right-now reading, and the one the "burning too fast" alert fires from. |
@@ -168,38 +168,33 @@ hours, cycles, and token events it had to work with) and one row per model:
 | **bias h** | Mean *signed* error. Positive means the ETAs ran late (predicting exhaustion after it happened); negative means early and alarmist. Tracked separately because the two directions aren't equally costly, and because a change can meaningfully cut bias while leaving MAE inside the noise. |
 | **P90 hit** | Calibration of the band: how often the truth actually landed at or before the model's P90. A well-calibrated P90 sits near 90% — much higher means the band is wider than it needs to be, much lower means it's overconfident. Blank for models that don't produce a band. |
 
-**A known defect: most of these numbers currently measure the sample cadence,
-not forecasting skill.** Read them with suspicion until it's fixed.
+An episode has to *start* below the cap and cross it. A moment already at
+100% is not one: every model trivially answers "exhausted now," so scoring it
+measured the gap to the next stored sample — the ~5-minute cadence of the
+underlying data — and called that forecast error. That inflated MAE into
+something flattering (0.1h without forecasting anything), made `P90 hit`
+read 0% for arithmetic rather than calibration reasons (a P90 of 0.0h cannot
+contain a positive truth), and, worst, let a saturated stretch mint one
+scorable episode per tick for whichever model still answers at the cap —
+about 120 in two hours for the simulating model against 9 for the default,
+enough to clear the graduation bar and promote the *worse* model. Excluding
+at-cap origins fixes all three.
 
-Most scored episodes — all of the Monte Carlo ones in a typical run — are
-moments when the window was *already* at 100%. There the model correctly
-answers "exhausted now," with P50 and P90 both at 0.0h, while the truth
-function scans forward to the next stored sample reading 100%. That's one
-sample later: about five minutes, which is the cadence of the underlying data
-rather than the 60-second poll interval. Three consequences:
+Two things to still keep in mind when reading the table:
 
-- The averaged "error" is roughly that gap, which **flatters MAE** — a model
-  can post 0.1h without having forecast anything.
-- **`P90 hit` reads 0% for arithmetic reasons, not calibration ones.** With
-  P90 at 0.0h and truth above it, containment is impossible. Note also that
-  the metric only counts episodes that produced a band *and* then exhausted,
-  so it isn't a full unconditional calibration check either way.
 - **`scored` counts forecast moments, not distinct events.** Many correlated
   forecasts made while climbing toward one exhaustion each count separately —
-  on this history, 28 below-cap episodes point at just 2 real crossings. And
-  degenerate episodes count toward the 30 that `auto` needs, so the threshold
-  does not protect against them; it guards against a small sample, not a
-  corrupt one.
+  on this history, 14 episodes point at just 2 real crossings. So 30 is a
+  floor on evidence, not on independent events.
+- **`P90 hit` is conditional**, on an episode both producing a band and then
+  exhausting, so it isn't a full unconditional calibration check. It prints
+  `—` while no genuine episode has carried an uncensored P90.
 
-Scored honestly — counting only episodes that *start* below the cap — the
-ranking on this history inverts, with Monte Carlo markedly worse than the
-linear default rather than better. That reversal is the reason to distrust the
-table above rather than tune anything against it.
-
-The footer states whether the sample proves anything at all, rather than
-inviting a comparison of MAE differences that a handful of episodes can't
-support. Treat its "enough episodes" verdict as describing the replay only:
-it and the runtime `auto` gate share a definition but not their inputs
+Expect the honest numbers to be sparse and to stay that way: on ~6.5 days of
+real history the count is 14 for the default model and 3 for the simulating
+one, so `auto` reports "not enough" and stays put. That is the design working.
+The footer says so explicitly, but treat its verdict as describing the replay
+only — it and the runtime `auto` gate share a definition but not their inputs
 (replayed forecasts versus stored ones).
 
 ## How it works

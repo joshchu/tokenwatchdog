@@ -196,7 +196,6 @@ def _render(
         "Provider",
         "Window",
         "Used %",
-        "Past cap",
         "Status",
         "Burn %/h",
         f"ETA trend ({tz_label})",
@@ -264,7 +263,6 @@ def _row(
     show_risk: bool = False,
 ) -> tuple[str, ...]:
     window = forecast.window
-    used = f"{window.used_percent:.0f}%" + ("*" if window.is_estimated else "")
     burn = _fmt_burn(forecast)
     resets_dt = (
         datetime.fromtimestamp(window.resets_at, tz=tz) if window.resets_at else None
@@ -272,8 +270,7 @@ def _row(
     return (
         window.provider.value,
         window.kind.value,
-        used,
-        _fmt_overage(forecast),
+        _fmt_used(forecast),
         _status_label(forecast),
         burn,
         _fmt_dt(forecast.eta_calendar, tz),
@@ -324,25 +321,36 @@ def _fmt_risk(forecast: Forecast) -> str:
     return f"{forecast.prob_exhaust_before_reset * 100:.0f}%"
 
 
-def _fmt_overage(forecast: Forecast) -> str:
-    """The most informative thing we know about usage since the window
-    pinned at 100% -- a priced $ estimate when configured (see
-    predictor.overage_cost_usd), else the raw token count, else nothing.
-    used_percent alone reads as "0 burn" here (see _row for why); this is
-    what actually moves once it does."""
+def _fmt_used(forecast: Forecast) -> str:
+    """Used percent, with what's been spent PAST the cap in parentheses once
+    the percentage pins at 100 -- e.g. `100% (+7.5M)`.
+
+    Overage lives here rather than in a column of its own because it is
+    meaningful for exactly one value of this cell: below 100% it is always
+    blank, so a dedicated column spent the whole table's width to say nothing
+    on almost every row. Attached to the number it qualifies, it reads as
+    "100%, and 7.5M tokens beyond that."
+
+    A priced estimate wins over a raw count when rates are configured (see
+    predictor.overage_cost_usd); with neither, the percentage stands alone."""
+    used = f"{forecast.window.used_percent:.0f}%"
+    if forecast.window.is_estimated:
+        used += "*"
     if forecast.cost_burned_past_quota_usd is not None:
-        return f"${forecast.cost_burned_past_quota_usd:,.2f}"
+        return f"{used} (+${forecast.cost_burned_past_quota_usd:,.2f})"
     if forecast.tokens_burned_past_quota is not None:
-        return _fmt_tokens(forecast.tokens_burned_past_quota)
-    return "—"
+        return f"{used} (+{_fmt_tokens(forecast.tokens_burned_past_quota)})"
+    return used
 
 
 def _fmt_tokens(n: int) -> str:
+    """Bare magnitude — the `(+…)` it renders inside supplies the unit, and a
+    `$` prefix is what distinguishes a priced overage from a token count."""
     if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M tok"
+        return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
-        return f"{n / 1_000:.0f}K tok"
-    return f"{n} tok"
+        return f"{n / 1_000:.0f}K"
+    return str(n)
 
 
 def _status_label(forecast: Forecast) -> str:

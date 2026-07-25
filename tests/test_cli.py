@@ -138,6 +138,8 @@ def test_row_style_is_red_at_full_exhaustion_even_when_idle(cfg):
 
 
 def test_row_shows_tokens_burned_past_quota_when_set(cfg):
+    """Overage rides in the Used % cell, attached to the 100% it qualifies,
+    rather than in a column of its own that is blank on every other row."""
     forecast = dataclasses.replace(
         _forecast(_window(used_percent=100.0)), tokens_burned_past_quota=530_000
     )
@@ -145,7 +147,19 @@ def test_row_shows_tokens_burned_past_quota_when_set(cfg):
         now=1000.0, windows=(forecast.window,), forecasts=(forecast,), alerts=()
     )
     text = _render_to_text(_render(state, cfg, []))
-    assert "530K tok" in text
+    assert "100% (+530K)" in text
+
+
+def test_a_window_below_the_cap_shows_a_bare_percentage(cfg):
+    """No empty parentheses on the ordinary row — overage is meaningful for
+    exactly one value of this cell."""
+    forecast = _forecast(_window(used_percent=62.0))
+    state = MonitorState(
+        now=1000.0, windows=(forecast.window,), forecasts=(forecast,), alerts=()
+    )
+    text = _render_to_text(_render(state, cfg, []))
+    assert "62%" in text
+    assert "(+" not in text
 
 
 def test_row_shows_dollar_cost_over_token_count_when_both_are_set(cfg):
@@ -160,8 +174,8 @@ def test_row_shows_dollar_cost_over_token_count_when_both_are_set(cfg):
         now=1000.0, windows=(forecast.window,), forecasts=(forecast,), alerts=()
     )
     text = _render_to_text(_render(state, cfg, []))
-    assert "$12.34" in text
-    assert "530K tok" not in text
+    assert "100% (+$12.34)" in text
+    assert "530K" not in text
 
 
 def test_spacebar_pressed_falls_back_to_plain_sleep_when_not_a_tty(monkeypatch):

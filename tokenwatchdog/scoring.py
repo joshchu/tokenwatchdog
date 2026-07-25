@@ -28,12 +28,19 @@ from tokenwatchdog.store import ForecastRow, SampleRow
 _EXHAUSTED_PERCENT = 100.0
 
 # Scored episodes a challenger needs before it may displace the default.
-# An "episode" is a moment whose window genuinely did hit 100% later in the
-# same cycle, so an error is computable -- and those are RARE: a weekly
+# An "episode" is a moment that was BELOW 100% and whose window then hit it
+# in the same cycle, so an error is computable -- and those are RARE: a weekly
 # window supplies at most a couple a week no matter how long the tool runs.
-# Measured on this repo's first ~6 days of history: 4-15 episodes for a
-# 5-hour window and 0 for a weekly one. Tuning anything on that is fitting
-# noise, which is exactly what this threshold exists to prevent.
+# Measured over this repo's first ~6.5 days: 14 episodes for linear and 3 for
+# montecarlo on the 5-hour window, 0 on either weekly one. Tuning anything on
+# that is fitting noise, which is what this threshold exists to prevent.
+#
+# Counting caveat, unfixed: this counts forecast MOMENTS, and many correlated
+# forecasts made while climbing toward one exhaustion each count separately --
+# those 14 point at just 2 real crossings. So 30 is a floor on evidence, not
+# on independent events. Grouping by cycle (or a denser, properly independent
+# metric) is what would make `auto` genuinely decidable; until then it is
+# expected to keep reporting "not enough" and staying on the default.
 MIN_EPISODES_TO_GRADUATE = 30
 
 # And it has to win by a real margin, not a rounding difference.
@@ -64,12 +71,30 @@ def realized_exhaustion_hours(
     event the forecast was about, and counting it would reward a wildly
     pessimistic model for eventually being right about a different week.
 
+    A moment already AT the cap is not an episode at all: there is nothing
+    left to forecast, every model trivially answers "exhausted now," and the
+    scan below -- which starts at index + 1 -- would score that against the
+    NEXT sample reading 100%, one sample cadence away. That turned the whole
+    metric into a measurement of poll cadence: a Monte Carlo MAE of 0.1h that
+    reflected no forecasting skill, a P90 that could never contain a truth
+    strictly greater than its own 0.0, and, worst of all, a saturated stretch
+    quietly minting one scorable "episode" per tick for whichever model still
+    answers at the cap. Two hours of sitting at 100% produced 120 such
+    episodes for montecarlo against 9 for linear (whose slope goes flat once
+    its lookback clears the climb), enough to clear
+    MIN_EPISODES_TO_GRADUATE and promote the model that is markedly WORSE on
+    real episodes. An episode has to start below the cap and cross it.
+
     `is_reset` is injected rather than imported to keep this module free of
     a circular dependency on predictor.py. It must be the same predicate the
     predictors use -- a threshold of its own here read a 5-hour window as
     taking 54 hours to exhaust, because a cycle starting at 1% drops by only
     1 point when it turns over and the scan sailed straight past it.
     """
+    # `>=`, matching the predicates everywhere else: the token-compute
+    # percentage is unclamped and can read above 100.
+    if samples[index].used_percent >= _EXHAUSTED_PERCENT:
+        return None
     for offset in range(index + 1, len(samples)):
         if is_reset(samples[offset - 1], samples[offset]):
             return None
@@ -90,10 +115,10 @@ def score_model(
     episodes are the scarce resource: split per window, none of them ever
     reaches a decidable sample size.
 
-    Each forecast is matched to the sample nearest in time to when it was
-    made — a forecast is built from the newest sample available at the time,
-    so its `source_ts` lags `made_at` by up to a poll interval, and matching
-    exactly would drop every row to a timestamp mismatch.
+    Each forecast is matched to the newest sample that existed when it was
+    made (see `_origin_sample_index`), and errors are computed between two
+    absolute instants rather than two durations, so nothing inherits the lag
+    between `made_at` and the reading it was built from.
     """
     errors: list[float] = []
     moments = 0
@@ -113,13 +138,19 @@ def score_model(
             if row.eta_calendar is None:
                 continue
             with_eta += 1
-            index = _nearest_sample_index(samples, source_times, row.made_at)
+            index = _origin_sample_index(source_times, row.made_at)
             if index is None:
                 continue
             truth_h = realized_exhaustion_hours(samples, index, is_reset)
             if truth_h is None:
                 continue
-            errors.append((row.eta_calendar - row.made_at) / 3600.0 - truth_h)
+            # Both sides as absolute instants. Measuring the forecast's
+            # horizon from `made_at` while measuring truth from the origin
+            # sample's `source_ts` folded the gap between them into every
+            # error, which is a lag in when we polled, not a forecasting
+            # mistake.
+            actual = samples[index].source_ts + truth_h * 3600.0
+            errors.append((row.eta_calendar - actual) / 3600.0)
     return ModelScore(
         model_name=model_name,
         moments=moments,
@@ -130,13 +161,15 @@ def score_model(
     )
 
 
-def _nearest_sample_index(
-    samples: list[SampleRow], source_times: list[float], made_at: float
-) -> int | None:
-    """Index of the sample closest to `made_at`. A forecast is made from the
-    newest sample available at the time, so its `source_ts` can lag
-    `made_at` by up to a poll interval -- matching on nearest rather than
-    exact avoids dropping every row to a timestamp mismatch.
+def _origin_sample_index(source_times: list[float], made_at: float) -> int | None:
+    """Index of the newest sample at or before `made_at` -- the reading the
+    forecast was actually built from -- or None if the forecast predates
+    every stored sample.
+
+    Deliberately not "nearest": a forecast made a few seconds before the next
+    sample arrived is nearest to a reading it had never seen, which grades it
+    against information from its own future. The lag runs one way, so the
+    sample at or before `made_at` is the honest origin.
 
     Binary search, over `source_times` extracted once by the caller. This ran
     at Engine construction across every stored forecast x every stored
@@ -145,15 +178,8 @@ def _nearest_sample_index(
     period, where the linear version measured 133s for a single window --
     minutes of startup to conclude "not enough history to compare models."
     """
-    if not samples:
-        return None
-    position = bisect.bisect_left(source_times, made_at)
-    if position == 0:
-        return 0
-    if position == len(source_times):
-        return len(source_times) - 1
-    before, after = source_times[position - 1], source_times[position]
-    return position - 1 if made_at - before <= after - made_at else position
+    position = bisect.bisect_right(source_times, made_at)
+    return position - 1 if position else None
 
 
 def better_model(default: str, scores: dict[str, ModelScore]) -> tuple[str, str]:
