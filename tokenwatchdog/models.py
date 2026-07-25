@@ -22,6 +22,18 @@ class WindowKind(StrEnum):
     WEEKLY = "weekly"
 
 
+_W5H_SECONDS = 5 * 3600
+_WEEKLY_SECONDS = 7 * 24 * 3600
+
+
+def window_duration_seconds(kind: WindowKind) -> float:
+    """How long one cycle of this window lasts. A plain fact about the
+    window, which is why it lives here rather than in the predictor: both
+    the predictor (bounding an ETA) and alerts (deciding whether a reading's
+    cycle is still the live one) need it."""
+    return _W5H_SECONDS if kind is WindowKind.W5H else _WEEKLY_SECONDS
+
+
 ForecastStatus = Literal["OK", "IDLE", "NO_DATA", "RESET_PENDING"]
 Confidence = Literal["low", "medium", "high"]
 AlertKind = Literal["threshold", "burn"]

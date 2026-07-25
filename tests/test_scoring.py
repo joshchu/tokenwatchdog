@@ -46,13 +46,12 @@ def _sample(ts, used_percent):
     )
 
 
-def _row(made_at, model_name, eta_calendar):
+def _row(made_at, model_name, eta_calendar, status="OK"):
     return ForecastRow(
         made_at=made_at,
         model_name=model_name,
-        used_percent=50.0,
         eta_calendar=eta_calendar,
-        status="OK",
+        status=status,
     )
 
 
@@ -168,3 +167,23 @@ def test_auto_grades_real_stored_rows(tmp_path, store):
     predictor, reason = select_predictor(cfg, store)
     assert predictor.name == "linear"
     assert "not enough" in reason or "no stored forecasts" in reason
+
+
+def test_a_deliberately_withheld_forecast_is_not_a_coverage_miss():
+    """A forecast the predictor declined to make (no live reading to
+    extrapolate from) isn't the same as one it got wrong — counting IDLE and
+    NO_DATA rows as moments-without-an-ETA would penalize a model for
+    correctly staying quiet."""
+    now = 1_000_000.0
+    samples = [_sample(now, 50.0), _sample(now + HOUR, 100.0)]
+    rows = [
+        _row(now, "linear", None, status="IDLE"),
+        _row(now, "linear", None, status="NO_DATA"),
+        _row(now, "linear", now + 2 * HOUR, status="OK"),
+    ]
+
+    score = score_model("linear", [(rows, samples)], _is_reset)
+
+    assert score.moments == 1  # only the OK row counts
+    assert score.with_eta == 1
+    assert score.coverage == 1.0

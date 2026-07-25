@@ -13,6 +13,7 @@ import time as time_mod
 
 from tokenwatchdog.config import load_config
 from tokenwatchdog.models import Provider, WindowKind
+from tokenwatchdog.providers import codex as codex_provider
 from tokenwatchdog.providers.codex import CodexProvider
 from tokenwatchdog.timeutil import parse_iso_to_epoch
 
@@ -346,3 +347,85 @@ def test_newest_by_mtime_is_selected(tmp_path, store):
     windows = CodexProvider().read(cfg, store)
     assert len(windows) == 1
     assert windows[0].used_percent == 99.0
+
+
+def test_no_cursor_is_recorded_when_the_sessions_dir_is_absent(tmp_path, store):
+    """Recording a cursor for a directory that wasn't there marks a retention
+    backfill "done" against nothing — so sessions appearing later with honest
+    older mtimes (a restore, a sync, an install-then-import) would never be
+    read at all."""
+    missing = tmp_path / "not-yet"
+    cfg = _cfg_for(tmp_path, missing)
+
+    codex_provider._ingest_token_events(cfg, missing, store, 1_000_000.0)
+    assert store.get_ingest_cursor(f"codex:{missing}") is None
+
+    # Now it shows up, with an mtime well before that first attempt.
+    sessions = missing / "sessions" / "2026" / "07" / "20"
+    sessions.mkdir(parents=True)
+    rollout = sessions / "rollout-old.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-07-20T10:00:00.000Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 500, "output_tokens": 50}
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+    os.utime(rollout, (900_000.0, 900_000.0))
+
+    codex_provider._ingest_token_events(cfg, missing, store, 1_000_100.0)
+    events = store.recent_token_events(Provider.CODEX, 0.0)
+    assert [e.input_tokens for e in events] == [500]
+
+
+def test_the_cursor_is_scoped_to_its_source_directory(tmp_path, store):
+    """Keyed by provider alone, pointing codex.home at another directory —
+    a second profile, a moved home — would skip everything already in it
+    forever, since its files' honest mtimes predate the old cursor."""
+    first, second = tmp_path / "home-a", tmp_path / "home-b"
+    # Distinct filenames, as real rollouts have (they carry a session uuid) --
+    # the dedup key is the file stem plus the event timestamp.
+    for home, tokens, name in (
+        (first, 111, "rollout-aaa"),
+        (second, 222, "rollout-bbb"),
+    ):
+        sessions = home / "sessions" / "2026" / "07" / "20"
+        sessions.mkdir(parents=True)
+        path = sessions / f"{name}.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-07-20T10:00:00.000Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": tokens,
+                                "output_tokens": 0,
+                            }
+                        },
+                    },
+                }
+            )
+            + "\n"
+        )
+        os.utime(path, (999_000.0, 999_000.0))
+
+    cfg_a = _cfg_for(tmp_path, first)
+    codex_provider._ingest_token_events(cfg_a, first, store, 1_000_000.0)
+
+    # Same provider, different directory, older mtime than the first cursor.
+    cfg_b = _cfg_for(tmp_path, second)
+    codex_provider._ingest_token_events(cfg_b, second, store, 1_000_100.0)
+
+    assert {e.input_tokens for e in store.recent_token_events(Provider.CODEX, 0.0)} == {
+        111,
+        222,
+    }

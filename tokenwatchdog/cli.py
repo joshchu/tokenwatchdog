@@ -54,7 +54,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.once:
             state = engine.tick()
             alert_log: deque[Alert] = deque(state.alerts, maxlen=_ALERT_LOG_SIZE)
-            Console().print(_render(state, cfg, alert_log))
+            Console().print(
+                _render(
+                    state,
+                    cfg,
+                    alert_log,
+                    model_choice_reason=engine.model_choice_reason,
+                )
+            )
             return 0
         if args.headless:
             return _run_headless(engine, cfg)
@@ -87,13 +94,24 @@ def _run_live(engine: Engine, cfg: Config) -> int:
             while True:
                 state = engine.tick()
                 alert_log.extend(state.alerts)
-                live.update(_render(state, cfg, alert_log), refresh=True)
+                reason = engine.model_choice_reason
+                live.update(
+                    _render(state, cfg, alert_log, model_choice_reason=reason),
+                    refresh=True,
+                )
                 if _spacebar_pressed(cfg.poll_interval_seconds):
                     # Immediate feedback that the keypress registered -- the
                     # next tick can still take a moment (reading Codex/Claude
                     # logs), so without this the display just looks frozen.
                     live.update(
-                        _render(state, cfg, alert_log, refreshing=True), refresh=True
+                        _render(
+                            state,
+                            cfg,
+                            alert_log,
+                            refreshing=True,
+                            model_choice_reason=reason,
+                        ),
+                        refresh=True,
                     )
     except KeyboardInterrupt:
         pass
@@ -160,6 +178,7 @@ def _render(
     alert_log: Sequence[Alert],
     *,
     refreshing: bool = False,
+    model_choice_reason: str = "",
 ) -> Group:
     tz = resolve_timezone(cfg)
     # All wall-clock columns below are already tz-converted (see _row/_fmt_dt)
@@ -202,6 +221,10 @@ def _render(
         )
 
     mascot = _mascot_glyph(state.forecasts, cfg)
+    # Which model is authoritative and why -- shown because `auto` can change
+    # it from what config literally says, and an unexplained switch is worse
+    # than no switch.
+    model_note = f"model {model_choice_reason}" if model_choice_reason else ""
     updated = datetime.fromtimestamp(state.now, tz=tz).strftime("%Y-%m-%d %H:%M:%S %Z")
     status_suffix = " — refreshing…" if refreshing else ""
     panel = Panel(
@@ -210,6 +233,7 @@ def _render(
         subtitle=(
             "* = estimated (token-based limit is a guess, not an official cap)"
             " · red = alert · yellow = trending toward exhaustion"
+            + (f" · {model_note}" if model_note else "")
         ),
         border_style="blue",
     )

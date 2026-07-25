@@ -66,12 +66,15 @@ CREATE TABLE IF NOT EXISTS alert_state (
   reset_epoch_at_fire REAL
 );
 
--- Every tick's forecast, so scripts/backtest.py can score models against
--- what actually happened. Everything a backtest needs to answer "was this
--- forecast any good, and why" lives here: the working-hours ETA (the
--- headline number), the rate and which signal it came from, and the status
--- (without it there is no way to tell a missing ETA that was correctly
--- withheld from one that was silently broken).
+-- Every tick's forecast from every model, so a past prediction can be graded
+-- against what actually happened. scoring.py (which decides what
+-- predictor.model = "auto" trusts) reads made_at, model_name, eta_calendar
+-- and status -- status being what separates an ETA the predictor correctly
+-- withheld from one that was silently broken. The remaining columns aren't
+-- read by any code path: they are the record of what each forecast said, for
+-- inspecting a past run by hand. scripts/backtest.py deliberately re-runs the
+-- predictors instead of reading these, since its job is to score code that
+-- hasn't shipped yet.
 CREATE TABLE IF NOT EXISTS forecasts (
   id INTEGER PRIMARY KEY,
   made_at        REAL NOT NULL,
@@ -140,11 +143,12 @@ class TokenEventRow:
 
 @dataclass(frozen=True)
 class ForecastRow:
-    """A past forecast, read back to grade it (see scoring.py)."""
+    """A past forecast, read back to grade it (see scoring.py). Only the
+    columns scoring actually reads — the table records more per forecast, but
+    a field here with no reader is just something else to keep true."""
 
     made_at: float
     model_name: str
-    used_percent: float
     eta_calendar: float | None
     status: str | None
 
@@ -322,24 +326,30 @@ class Store:
 
     # -- ingest_cursor ------------------------------------------------------
 
-    def get_ingest_cursor(self, provider: Provider) -> float | None:
-        """Modification time through which this provider's logs are already
-        ingested, or None on a first run (where the caller should fall back
-        to scanning the whole retention window as a backfill)."""
+    def get_ingest_cursor(self, source_key: str) -> float | None:
+        """Modification time through which this log directory is already
+        ingested, or None for one never scanned (where the caller should fall
+        back to the whole retention window as a backfill).
+
+        Keyed by provider AND directory. Keyed by provider alone, pointing
+        `claude.config_dir` / `codex.home` at a different directory —
+        a second profile, a moved home — would skip everything already in it
+        forever, since its files' honest mtimes predate a cursor built from
+        the old directory."""
         row = self._conn.execute(
             "SELECT scanned_through FROM ingest_cursor WHERE source = ?",
-            (provider.value,),
+            (source_key,),
         ).fetchone()
         return row["scanned_through"] if row else None
 
-    def set_ingest_cursor(self, provider: Provider, scanned_through: float) -> None:
+    def set_ingest_cursor(self, source_key: str, scanned_through: float) -> None:
         """Record the moment a scan STARTED, not when it finished — a file
         appended to mid-scan then has an mtime past the cursor and gets
         re-read next time, instead of being silently skipped."""
         self._conn.execute(
             "INSERT INTO ingest_cursor (source, scanned_through) VALUES (?, ?) "
             "ON CONFLICT(source) DO UPDATE SET scanned_through=excluded.scanned_through",
-            (provider.value, scanned_through),
+            (source_key, scanned_through),
         )
 
     # -- alert_state --------------------------------------------------------
@@ -410,7 +420,7 @@ class Store:
         grades. Rows written before the schema gained `status` have NULL
         there; that's a genuine "not recorded," not a value to invent."""
         rows = self._conn.execute(
-            "SELECT made_at, model_name, used_percent, eta_calendar, status "
+            "SELECT made_at, model_name, eta_calendar, status "
             "FROM forecasts WHERE provider = ? AND window_kind = ? AND made_at >= ? "
             "ORDER BY made_at ASC",
             (provider.value, kind.value, since_ts),
@@ -419,7 +429,6 @@ class Store:
             ForecastRow(
                 made_at=row["made_at"],
                 model_name=row["model_name"],
-                used_percent=row["used_percent"],
                 eta_calendar=row["eta_calendar"],
                 status=row["status"],
             )

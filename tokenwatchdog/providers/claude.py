@@ -195,8 +195,9 @@ def _ingest_token_events(cfg: Config, store: Store, now: float) -> None:
     """
     projects_dir = _claude_config_dir(cfg) / "projects"
     if not projects_dir.is_dir():
-        return
-    cursor = store.get_ingest_cursor(Provider.CLAUDE)
+        return  # nothing scanned, so no cursor is recorded either
+    source_key = f"{Provider.CLAUDE.value}:{projects_dir}"
+    cursor = store.get_ingest_cursor(source_key)
     since_mtime = cursor if cursor is not None else now - _lookback_seconds(cfg)
     for path in projects_dir.glob("**/*.jsonl"):
         try:
@@ -209,7 +210,7 @@ def _ingest_token_events(cfg: Config, store: Store, now: float) -> None:
             if event is None:
                 continue
             store.upsert_token_event(provider=Provider.CLAUDE, **event)
-    store.set_ingest_cursor(Provider.CLAUDE, now)
+    store.set_ingest_cursor(source_key, now)
 
 
 def _iter_assistant_usage_lines(path: Path) -> Iterator[dict[str, Any]]:

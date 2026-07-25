@@ -12,6 +12,7 @@ from tokenwatchdog.models import (
     Provider,
     Window,
     WindowKind,
+    window_duration_seconds,
 )
 from tokenwatchdog.store import AlertStateRow, Store
 
@@ -30,10 +31,19 @@ def level_still_in_cycle(window: Window, now: float) -> bool:
     reset has happened since, and inventing that certainty is what this
     check exists to avoid.
 
-    (This is the distinction that used to be missing: an authoritative 100%
-    reading was going unalerted purely because the process that wrote it had
-    been quiet for longer than the staleness threshold.)"""
-    return window.resets_at is not None and now < window.resets_at
+    Both halves are load-bearing. `now < resets_at` alone is not enough,
+    because a derived `resets_at` is advanced by whole cycles when its
+    projection has already elapsed (see `predictor._derive_resets_at`) — so
+    the very passage of a reset boundary manufactures a *future* reset time,
+    and a long-dead reading would read as "still in cycle" on the strength
+    of it. A 26-hour-old 95% reading of a FIVE-hour window did exactly that,
+    firing a threshold alert and then re-firing every five hours as the
+    phantom reset advanced again. The reading must also fall inside the
+    cycle that ends at `resets_at`."""
+    if window.resets_at is None or now >= window.resets_at:
+        return False
+    cycle_started_at = window.resets_at - window_duration_seconds(window.kind)
+    return window.source_ts >= cycle_started_at
 
 
 def evaluate(forecast: Forecast, cfg: Config, store: Store, now: float) -> list[Alert]:

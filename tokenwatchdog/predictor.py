@@ -40,16 +40,10 @@ from tokenwatchdog.models import (
     Provider,
     Window,
     WindowKind,
+    window_duration_seconds,
 )
 from tokenwatchdog.scoring import better_model, score_model
 from tokenwatchdog.store import SampleRow, Store, TokenEventRow
-
-_FIVE_HOURS_SECONDS = 5 * 3600
-_SEVEN_DAYS_SECONDS = 7 * 24 * 3600
-
-
-def window_duration_seconds(kind: WindowKind) -> float:
-    return _FIVE_HOURS_SECONDS if kind is WindowKind.W5H else _SEVEN_DAYS_SECONDS
 
 
 class Predictor(Protocol):
@@ -261,13 +255,17 @@ class MonteCarloPredictor:
         # the median of whichever minority actually exhausted, which is
         # a materially earlier (and wrong) number whenever most simulated
         # futures don't exhaust within the horizon at all.
-        outcomes = [
+        # `is None` rather than `or`: an already-exhausted window simulates to
+        # 0.0 hours, which is falsy, so `or horizon_h` rewrote every run as
+        # censored and reported a 0% chance of exhausting on a window that is
+        # ALREADY exhausted -- rendered as "Risk 0%" on a red 100% row.
+        simulated = (
             _simulate_exhaustion_hours(
                 window.used_percent, now, buckets, fallback_pool, tz, horizon_h
             )
-            or horizon_h
             for _ in range(mc_runs)
-        ]
+        )
+        outcomes = [horizon_h if hours is None else hours for hours in simulated]
         outcomes.sort()
         # Because the horizon IS the reset (when known), a non-censored
         # outcome already means "exhausted before the reset" -- there's
@@ -285,24 +283,36 @@ class MonteCarloPredictor:
             coverage=_horizon_bucket_coverage(now, horizon_h, buckets, tz),
         )
         if p50_h is None:
-            # More than half the simulated futures never exhausted within
-            # the horizon — there's no meaningful point ETA, so this is
-            # the same "OK, no ETA" shape linear reports for burn <= 0.
-            # The probability still is meaningful, and this is precisely
-            # when it carries the most information: "the median future is
-            # fine, but 1 in 5 isn't" is the whole reason to simulate.
-            return _project_forecast(
+            # More than half the simulated futures never exhausted within the
+            # horizon, so there is no point ETA to report -- and, critically,
+            # none is synthesized. Falling back to `remaining / mean_burn`
+            # here (as this did) contradicts the simulation that just ran:
+            # mean_burn is an average over the whole week including the idle
+            # hours, so for burn concentrated OUTSIDE the hours before the
+            # reset it yields a confident ETA and exhausts_before_reset=True
+            # at a simulated 0% risk -- a "🔥 burning" row the model itself
+            # disagrees with, and a prediction that then gets graded as
+            # though the model had made it.
+            #
+            # The rate and the probability are still reported. This is
+            # precisely where the probability carries the most information:
+            # "the median future is fine, but one in five isn't" is the whole
+            # reason to simulate rather than extrapolate.
+            return Forecast(
                 window=window,
-                burn_per_hour=mean_burn,
-                resets_at=resets_at,
-                n_samples=n_observations,
-                cfg=cfg,
-                now=now,
-                tz=tz,
+                status="OK",
                 model_name=self.name,
-                burn_basis=basis,
-                confidence=confidence,
+                burn_per_hour=mean_burn,
+                time_to_reset_h=time_to_reset_h,
+                eta_calendar=None,
+                eta_workhours=None,
+                eta_p50=None,
+                eta_p90=None,
                 prob_exhaust_before_reset=prob_before_reset,
+                confidence=confidence,
+                exhausts_before_reset=False,
+                n_samples=n_observations,
+                burn_basis=basis,
             )
 
         horizon = _eta_horizon(window, resets_at, now_dt, tz)
@@ -697,10 +707,16 @@ def _derive_resets_at(
     past.
     """
     duration = window_duration_seconds(window.kind)
-    if window.kind is WindowKind.W5H:
+    if window.kind is WindowKind.W5H and token_events:
+        # Authoritative when there's an activity log to read: an anchor gives
+        # the real reset, and no anchor means the block has already expired
+        # -- the window is empty and the next one doesn't exist until the
+        # next request. Falling through to (2) there would advance a stale
+        # anchor into the future and invent a reset for a block that isn't
+        # running, which is how a 26-hour-old reading of a 5-hour window came
+        # to look like live state (see alerts.level_still_in_cycle).
         anchor = block_anchor([e.ts for e in token_events], duration, now)
-        if anchor is not None:
-            return anchor + duration
+        return anchor + duration if anchor is not None else None
     if block.block_started_at is None:
         return None
     resets_at = block.block_started_at + duration

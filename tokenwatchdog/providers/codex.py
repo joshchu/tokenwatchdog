@@ -145,7 +145,14 @@ def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> N
     only rollouts modified since the last pass are read, since re-parsing
     unchanged ones cost 2.2s per tick to learn nothing. First run has no
     cursor and scans the retention window as a backfill."""
-    cursor = store.get_ingest_cursor(Provider.CODEX)
+    if not home.is_dir():
+        # No cursor is recorded for a directory that wasn't there. Recording
+        # one anyway would mark a retention backfill as "done" against
+        # nothing, so sessions appearing later with honest older mtimes -- a
+        # restore, a sync, an install-then-import -- would never be read.
+        return
+    source_key = f"{Provider.CODEX.value}:{home}"
+    cursor = store.get_ingest_cursor(source_key)
     since_mtime = cursor if cursor is not None else now - _lookback_seconds(cfg)
     for path in _rollout_files_newest_first(home):
         try:
@@ -158,7 +165,7 @@ def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> N
             if event is None:
                 continue
             store.upsert_token_event(provider=Provider.CODEX, **event)
-    store.set_ingest_cursor(Provider.CODEX, now)
+    store.set_ingest_cursor(source_key, now)
 
 
 def _token_event_from_line(line: dict[str, Any], path: Path) -> dict[str, Any] | None:

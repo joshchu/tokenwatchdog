@@ -19,6 +19,7 @@ by a hair, and not on a handful.
 
 from __future__ import annotations
 
+import bisect
 import statistics
 from dataclasses import dataclass
 
@@ -98,13 +99,21 @@ def score_model(
     moments = 0
     with_eta = 0
     for rows, samples in pairs:
+        # Extracted once per window, not per row -- the whole point of the
+        # binary search below.
+        source_times = [sample.source_ts for sample in samples]
         own = [row for row in rows if row.model_name == model_name]
+        # A forecast the predictor deliberately withheld (no live reading to
+        # extrapolate from) is not a coverage failure, so it isn't counted as
+        # a moment at all. Rows written before `status` existed are NULL and
+        # stay counted, since we genuinely don't know which they were.
+        own = [row for row in own if row.status not in ("IDLE", "NO_DATA")]
         moments += len(own)
         for row in own:
             if row.eta_calendar is None:
                 continue
             with_eta += 1
-            index = _nearest_sample_index(samples, row.made_at)
+            index = _nearest_sample_index(samples, source_times, row.made_at)
             if index is None:
                 continue
             truth_h = realized_exhaustion_hours(samples, index, is_reset)
@@ -121,19 +130,30 @@ def score_model(
     )
 
 
-def _nearest_sample_index(samples: list[SampleRow], made_at: float) -> int | None:
+def _nearest_sample_index(
+    samples: list[SampleRow], source_times: list[float], made_at: float
+) -> int | None:
     """Index of the sample closest to `made_at`. A forecast is made from the
     newest sample available at the time, so its `source_ts` can lag
     `made_at` by up to a poll interval -- matching on nearest rather than
-    exact avoids dropping every row to a timestamp mismatch."""
+    exact avoids dropping every row to a timestamp mismatch.
+
+    Binary search, over `source_times` extracted once by the caller. This ran
+    at Engine construction across every stored forecast x every stored
+    sample: fine at 0.02s on six days of history, but two models writing a
+    forecast per window per minute reaches ~161k rows in one retention
+    period, where the linear version measured 133s for a single window --
+    minutes of startup to conclude "not enough history to compare models."
+    """
     if not samples:
         return None
-    best_index, best_gap = 0, abs(samples[0].source_ts - made_at)
-    for index, sample in enumerate(samples[1:], start=1):
-        gap = abs(sample.source_ts - made_at)
-        if gap < best_gap:
-            best_index, best_gap = index, gap
-    return best_index
+    position = bisect.bisect_left(source_times, made_at)
+    if position == 0:
+        return 0
+    if position == len(source_times):
+        return len(source_times) - 1
+    before, after = source_times[position - 1], source_times[position]
+    return position - 1 if made_at - before <= after - made_at else position
 
 
 def better_model(default: str, scores: dict[str, ModelScore]) -> tuple[str, str]:

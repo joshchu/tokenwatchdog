@@ -18,8 +18,8 @@
 
 ## Why
 
-Codex and Claude Code both cap usage on a 5-hour and a weekly rolling window,
-and it's easy to blow through either one mid-task. TokenWatchDog polls your
+Codex and Claude Code both cap usage on a 5-hour and a weekly window, and
+it's easy to blow through either one mid-task. TokenWatchDog polls your
 local usage data every minute and answers two questions existing usage
 trackers don't:
 
@@ -158,19 +158,24 @@ rhythm one: usage happening right now doesn't pause because it's 9pm.
 
 ## Status
 
-The core (both providers, both predictors, alerting, terminal dashboard) is
-implemented and tested. A packaged standalone binary, a menu-bar front-end,
-and automatic graduation from the default model to Monte Carlo once enough
-history accumulates (today it's an explicit config choice) are natural next
-steps but aren't built yet.
+The core (both providers, both predictors, alerting, terminal dashboard,
+measured model selection) is implemented and tested. A packaged standalone
+binary and a menu-bar front-end are natural next steps but aren't built yet.
+
+Model selection is wired up but has not yet fired on real data: grading needs
+windows that actually reached 100%, and a weekly window supplies at most a
+couple of those a week, so `auto` currently reports "not enough scored
+history" and stays on the trend model. That's the intended behavior, not a
+gap — run `scripts/backtest.py` to see where your own history stands.
 
 ## Limitations
 
-- **Codex history requires the tool to be running.** Codex's own session
-  logs only ever contain the *current* snapshot, not a time series — there's
-  nothing to backfill from once the tool starts back up. If TokenWatchDog
-  isn't running, that stretch of Codex usage is genuinely unrecoverable; this
-  isn't a bug, it's a property of what Codex exposes locally.
+- **Codex's usage *percentage* can't be backfilled.** Its session logs carry
+  only the current rate-limit snapshot, not a time series, so a stretch with
+  the tool off leaves a real gap in the percentage history — a property of
+  what Codex exposes, not a bug. Its per-request *token* counts are a time
+  series and are backfilled, which is why burn rate survives downtime better
+  than the percentage does.
 - **Claude history can be backfilled.** Both Claude sources keep their own
   history independent of whether TokenWatchDog is running — token-compute
   re-scans Claude Code's own transcripts (bounded by
@@ -199,8 +204,13 @@ steps but aren't built yet.
   burn the same account quota without writing a transcript here. The
   percent-per-token calibration absorbs a steady share of that, and the tool
   falls back to the reported percentage's own slope whenever the percentage
-  is moving while the local log is silent — but an abrupt shift in that mix
-  will briefly under-read.
+  is moving while the local log is silent. An abrupt shift in that mix skews
+  it either way, though, and over-reading is the more consequential
+  direction: if the calibration cycle's usage was mostly invisible, the ratio
+  is inflated by that share, and a later CLI-only burst gets multiplied by it
+  — an overstated rate, which is the direction that fires the burn alert.
+  The rhythm model is skewed the other way, recording an hour burned only via
+  Desktop as a genuine zero.
 
 ## Development
 
