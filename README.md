@@ -50,10 +50,19 @@ enough that it will run out before the window naturally resets.
   default, or an opt-in Monte Carlo model that learns your hour-of-week usage
   rhythm from token history and simulates a P50/P90 exhaustion band plus a
   probability of running out before the reset, instead of one point guess
-- Working-hours-aware calendar projection alongside the plain 24/7 ETA, each
-  capped independently against the next reset — an ETA past the reset
-  describes an event that can't happen, and no window is ever projected to
-  take longer to exhaust than its own duration
+- **Two ETAs side by side, because they answer different questions.** *Trend*
+  is the recent pace projected around the clock; *rhythm* is the same budget
+  spread over how you actually use it across a week — learned from your token
+  history as a P50 → P90 band, or from your configured working hours while
+  that profile is thin. Both models run every tick, so their disagreement is
+  visible rather than hidden behind a config switch
+- Each ETA is capped independently against the next reset — an ETA past the
+  reset describes an event that can't happen, and no window is ever projected
+  to take longer to exhaust than its own duration
+- `predictor.model = "auto"` grades every model against **your** stored
+  forecasts and keeps the default unless a challenger wins by a real margin
+  across enough scored episodes; it reports which it chose and why, and
+  declines rather than switching on a sample too small to mean anything
 - Staleness applies to the burn *rate*, not the used-% *level*: quota doesn't
   un-consume while you're away, so a 100%-used reading still alerts once its
   cycle is confirmed live, while nothing extrapolates from a stale rate
@@ -125,22 +134,27 @@ over that same span — and uses that ratio to turn recent tokens/hour into
 points, or one that ends pinned at 100%, and falls back to the percentage's
 own slope in those cases.
 
-By default, exhaustion is predicted from a robust (outlier-resistant) fit of
-that rate, projected forward to when usage would hit 100% — capped at the
-window's own reset, or at its duration when no reset time has been derived
-yet. Set `predictor.model = "montecarlo"` in config to switch to the learned
-model instead: it buckets historical burn by hour-of-week and simulates
-thousands of random futures to produce a P50/P90 band and a probability of
-exhausting before the reset, rather than one linear guess. Because that
-bucketing is built from token history, an hour with no requests contributes a
-real zero rather than no data at all — which is what lets it learn that you
-don't burn quota overnight, instead of filling those hours in from your
-daytime average.
+Two models run each tick. The **trend** model is a robust (outlier-resistant)
+fit of that rate, projected forward to when usage would hit 100% — capped at
+the window's own reset, or at its duration when no reset time has been derived
+yet. The **rhythm** model buckets historical burn by hour-of-week and
+simulates thousands of random futures to produce a P50/P90 band and a
+probability of exhausting before the reset. Because that bucketing is built
+from token history, an hour with no requests contributes a real zero rather
+than no data at all — which is what lets it learn that you don't burn quota
+overnight, instead of filling those hours in from your daytime average. While
+the profile is still thin, the rhythm column falls back to the working hours
+you declared in config: the burn budget run through only those intervals
+instead of treating every hour as billable.
 
-The working-hours projection (either model) runs the burn budget through only
-your configured working intervals instead of treating every hour as billable.
-The "burning too fast" alert deliberately uses the 24/7 projection, not that
-one: usage happening right now doesn't pause because it's 9pm.
+`predictor.model` picks which of the two is *authoritative* — the one alerts
+fire from. `"auto"` decides that by grading both against your own stored
+forecasts, and stays on the trend model unless the other wins by a real
+margin over enough scored episodes. It says which and why rather than
+switching silently.
+
+The "burning too fast" alert deliberately uses the trend projection, not the
+rhythm one: usage happening right now doesn't pause because it's 9pm.
 
 ## Status
 

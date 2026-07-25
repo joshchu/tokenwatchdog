@@ -141,13 +141,15 @@ def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> N
     Dedup key is the session file + the event's own timestamp (Codex has
     no message/request id of its own), so re-scanning an already-seen
     line is a harmless no-op re-upsert of identical values -- mirrors
-    providers/claude.py's own token-log ingestion, including the same
-    mtime-bounded file scan (older files can't affect a current-window
-    computation)."""
-    since_mtime = now - _lookback_seconds(cfg)
+    providers/claude.py's own token-log ingestion, including its cursor:
+    only rollouts modified since the last pass are read, since re-parsing
+    unchanged ones cost 2.2s per tick to learn nothing. First run has no
+    cursor and scans the retention window as a backfill."""
+    cursor = store.get_ingest_cursor(Provider.CODEX)
+    since_mtime = cursor if cursor is not None else now - _lookback_seconds(cfg)
     for path in _rollout_files_newest_first(home):
         try:
-            if path.stat().st_mtime < since_mtime:
+            if path.stat().st_mtime <= since_mtime:
                 continue
         except OSError:
             continue
@@ -156,6 +158,7 @@ def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> N
             if event is None:
                 continue
             store.upsert_token_event(provider=Provider.CODEX, **event)
+    store.set_ingest_cursor(Provider.CODEX, now)
 
 
 def _token_event_from_line(line: dict[str, Any], path: Path) -> dict[str, Any] | None:

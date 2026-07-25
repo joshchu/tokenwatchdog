@@ -42,6 +42,10 @@ _BURN_EMOJI = "🔥"
 # the dashboard keeps a short, visible trail of what actually fired and why.
 _ALERT_LOG_SIZE = 10
 
+# Which model answers the "rhythm" question (see _fmt_rhythm). The other
+# column is whichever model is authoritative, answering the trend question.
+_RHYTHM_MODEL = "montecarlo"
+
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
@@ -162,10 +166,12 @@ def _render(
     # — label them with the actual abbreviation so a local time is never
     # mistaken for UTC at a glance, matching the "updated ... EDT" header.
     tz_label = datetime.fromtimestamp(state.now, tz=tz).strftime("%Z")
-    # Only the simulating model produces a probability; under the default one
-    # the column would be an always-empty stripe of width, which on a narrow
-    # terminal costs every other column real characters.
-    show_risk = any(f.prob_exhaust_before_reset is not None for f in state.forecasts)
+    # Only the simulating model produces a probability; without it the column
+    # would be an always-empty stripe of width, which on a narrow terminal
+    # costs every other column real characters.
+    show_risk = any(
+        f.prob_exhaust_before_reset is not None for f in state.all_forecasts
+    )
     table = Table(expand=True)
     for column in (
         "Provider",
@@ -174,8 +180,8 @@ def _render(
         "Past cap",
         "Status",
         "Burn %/h",
-        f"ETA (calendar, {tz_label})",
-        f"ETA (working hrs, {tz_label})",
+        f"ETA trend ({tz_label})",
+        f"ETA rhythm ({tz_label})",
         f"Resets ({tz_label})",
         *(("Risk",) if show_risk else ()),
         "Conf.",
@@ -186,7 +192,12 @@ def _render(
         state.forecasts, key=lambda f: (f.window.provider.value, f.window.kind.value)
     ):
         table.add_row(
-            *_row(forecast, tz, show_risk=show_risk),
+            *_row(
+                forecast,
+                tz,
+                rhythm=state.forecast_from(_RHYTHM_MODEL, forecast.window),
+                show_risk=show_risk,
+            ),
             style=_row_style(forecast, cfg, state.now),
         )
 
@@ -221,7 +232,13 @@ def _render_alert_log(alert_log: Sequence[Alert], tz: tzinfo) -> Panel:
     return Panel(table, title="🔔 Recent alerts", border_style="yellow")
 
 
-def _row(forecast: Forecast, tz: tzinfo, *, show_risk: bool = False) -> tuple[str, ...]:
+def _row(
+    forecast: Forecast,
+    tz: tzinfo,
+    *,
+    rhythm: Forecast | None = None,
+    show_risk: bool = False,
+) -> tuple[str, ...]:
     window = forecast.window
     used = f"{window.used_percent:.0f}%" + ("*" if window.is_estimated else "")
     burn = _fmt_burn(forecast)
@@ -235,10 +252,10 @@ def _row(forecast: Forecast, tz: tzinfo, *, show_risk: bool = False) -> tuple[st
         _fmt_overage(forecast),
         _status_label(forecast),
         burn,
-        _fmt_eta_band(forecast, tz),
-        _fmt_dt(forecast.eta_workhours, tz),
+        _fmt_dt(forecast.eta_calendar, tz),
+        _fmt_rhythm(forecast, rhythm, tz),
         _fmt_dt(resets_dt, tz),
-        *((_fmt_risk(forecast),) if show_risk else ()),
+        *((_fmt_risk(rhythm or forecast),) if show_risk else ()),
         forecast.confidence or "—",
     )
 
@@ -254,14 +271,24 @@ def _fmt_burn(forecast: Forecast) -> str:
     return f"{forecast.burn_per_hour:+.2f}{suffix}"
 
 
-def _fmt_eta_band(forecast: Forecast, tz: tzinfo) -> str:
-    """P50 with the P90 tail when a simulation produced one, else the plain
-    point ETA. A band is the honest shape for bursty usage — "Thu 15:00" on
-    its own implies a precision the underlying data doesn't have."""
-    point = _fmt_dt(forecast.eta_p50 or forecast.eta_calendar, tz)
-    if forecast.eta_p90 is None or forecast.eta_p50 is None:
-        return point
-    return f"{point} → {_fmt_dt(forecast.eta_p90, tz)}"
+def _fmt_rhythm(forecast: Forecast, rhythm: Forecast | None, tz: tzinfo) -> str:
+    """ "Given how you actually use this across a week, when do you run out."
+
+    Two ways to answer that, and the better one wins when it's available:
+    the simulated hour-of-week profile LEARNED from your token history
+    (shown as a P50 → P90 band, because a band is the honest shape for
+    bursty usage — a bare "Thu 15:00" implies precision the data doesn't
+    have), or, while that profile is still thin, the working hours you
+    DECLARED in config. The presence of a band is what distinguishes them.
+
+    This is deliberately a different question from the trend column beside
+    it, which asks "at the pace of the last few hours, projected around the
+    clock." Both were already being computed; only one was ever shown."""
+    if rhythm is not None and rhythm.eta_p50 is not None:
+        if rhythm.eta_p90 is None:
+            return _fmt_dt(rhythm.eta_p50, tz)
+        return f"{_fmt_dt(rhythm.eta_p50, tz)} → {_fmt_dt(rhythm.eta_p90, tz)}"
+    return _fmt_dt(forecast.eta_workhours, tz)
 
 
 def _fmt_risk(forecast: Forecast) -> str:

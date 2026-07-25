@@ -104,14 +104,24 @@ class ThresholdsConfig:
 
 @dataclass(frozen=True)
 class BurnConfig:
-    # Six hours, not one: this doubles as the token-throughput averaging
-    # window, where it means "sustained working pace" rather than "typing
-    # right now," and as the fallback percent-slope lookback, where a
-    # whole-number weekly percentage needs hours of span to move at all
-    # (~0.6%/h evenly spread means a 60-minute window sees a change of 0
-    # or 1 and nothing in between).
+    # Both of these double as the token-throughput averaging window (where
+    # they mean "sustained pace" rather than "typing right now") and as the
+    # fallback percent-slope lookback. Both were widened on measurement --
+    # see scripts/backtest.py, scored on one-step-ahead rate error against
+    # 750+ real moments per window:
+    #
+    #   weekly 60m -> 360m: rate MAE 1.52 -> 1.36, stdev 2.67 -> 1.80, and
+    #     readings reporting a flat zero 47% -> 15%. A whole-number weekly
+    #     percentage needs hours of span to move at all (~0.6%/h evenly
+    #     spread means a 60-minute window sees a change of 0 or 1 and
+    #     nothing between). 720m was no better than noise and costs twice
+    #     the responsiveness.
+    #   w5h 15m -> 60m: MAE is FLAT here (8.8-9.0, inside noise), but bias
+    #     +1.92 -> +0.57 -- 15 minutes is about one request, so the estimate
+    #     was systematically over-reading the rate by ~2%/h -- and flat-zero
+    #     readings 59% -> 52%. Chosen on bias, not on accuracy.
     lookback_weekly_minutes: float = 360.0
-    lookback_w5h_minutes: float = 15.0
+    lookback_w5h_minutes: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -368,8 +378,8 @@ stale_after_minutes_weekly = 180     # is stale (the used-% level never goes sta
 threshold_hysteresis = 10.0
 
 [burn]
-lookback_weekly_minutes = 360        # doubles as the token-throughput averaging window
-lookback_w5h_minutes = 15
+lookback_weekly_minutes = 360        # doubles as the token-throughput averaging
+lookback_w5h_minutes = 60            # window; both widened on measured rate error
 
 [predictor]
 model = "auto"                       # auto | linear | seasonal_profile | montecarlo | holtwinters

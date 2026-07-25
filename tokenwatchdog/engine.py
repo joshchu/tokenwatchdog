@@ -22,8 +22,9 @@ from tokenwatchdog.models import (
 )
 from tokenwatchdog.notify import notify
 from tokenwatchdog.predictor import (
-    Predictor,
+    all_predictor_names,
     overage_cost_usd,
+    predictor_named,
     select_predictor,
     tokens_burned_past_quota,
 )
@@ -45,7 +46,9 @@ class Engine:
         self._providers = (
             providers if providers is not None else self._build_providers()
         )
-        self._predictor: Predictor = select_predictor(self.cfg)
+        self._predictor, self.model_choice_reason = select_predictor(
+            self.cfg, self.store
+        )
         self._pruned = False
 
     def _build_providers(self) -> list[QuotaProvider]:
@@ -86,14 +89,29 @@ class Engine:
                 )
 
         forecasts: list[Forecast] = []
+        all_forecasts: list[Forecast] = []
         alerts: list[Alert] = []
         for provider_enum, kind in self._watched_pairs():
             matched_window = windows_by_key.get((provider_enum, kind))
             if matched_window is None:
                 forecast = _no_data_forecast(provider_enum, kind, now)
+                all_forecasts.append(forecast)
             else:
-                forecast = self._forecast_for(provider_enum, kind, matched_window, now)
-                self.store.insert_forecast(made_at=now, forecast=forecast)
+                # Every model, every tick. They answer different questions
+                # (see MonitorState.all_forecasts), the dashboard shows both,
+                # and storing both is what lets scoring.py compare them on
+                # identical moments later. Costs a few hundred ms against a
+                # ~60s poll interval.
+                produced = {
+                    name: self._forecast_for(
+                        name, provider_enum, kind, matched_window, now
+                    )
+                    for name in all_predictor_names()
+                }
+                for candidate in produced.values():
+                    self.store.insert_forecast(made_at=now, forecast=candidate)
+                all_forecasts.extend(produced.values())
+                forecast = produced[self._predictor.name]
             forecasts.append(forecast)
 
             fired = evaluate_alerts(forecast, self.cfg, self.store, now)
@@ -106,10 +124,16 @@ class Engine:
             windows=tuple(windows_by_key.values()),
             forecasts=tuple(forecasts),
             alerts=tuple(alerts),
+            all_forecasts=tuple(all_forecasts),
         )
 
     def _forecast_for(
-        self, provider_enum: Provider, kind: WindowKind, window: Window, now: float
+        self,
+        model_name: str,
+        provider_enum: Provider,
+        kind: WindowKind,
+        window: Window,
+        now: float,
     ) -> Forecast:
         # The full retention window, not just one reset cycle: linear only
         # ever looks at a short recent tail regardless, but montecarlo needs
@@ -125,7 +149,7 @@ class Engine:
         token_events = self.store.recent_token_events(
             provider_enum, now - lookback_seconds
         )
-        forecast = self._predictor.forecast(
+        forecast = predictor_named(model_name).forecast(
             window, history, token_events, self.cfg, now
         )
         burned = tokens_burned_past_quota(window, history, token_events)

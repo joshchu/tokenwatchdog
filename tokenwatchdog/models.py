@@ -100,5 +100,25 @@ class MonitorState:
 
     now: float
     windows: tuple[Window, ...]
+    # The authoritative forecast per watched window — one per (provider,
+    # kind), from the model `predictor.model` selected. Alerts fire off
+    # these, and only these.
     forecasts: tuple[Forecast, ...]
     alerts: tuple[Alert, ...]
+    # Every model's forecast for every watched window, including the
+    # authoritative ones above. Two models answer genuinely different
+    # questions — "at the pace of the last few hours" versus "given how you
+    # use this across a week" — so the dashboard shows both, and their
+    # disagreement is itself information. Also what makes each model's
+    # accuracy measurable against the same moments (see scoring.py).
+    all_forecasts: tuple[Forecast, ...] = ()
+
+    def forecast_from(self, model_name: str, window: Window) -> Forecast | None:
+        for forecast in self.all_forecasts:
+            if (
+                forecast.model_name == model_name
+                and forecast.window.provider is window.provider
+                and forecast.window.kind is window.kind
+            ):
+                return forecast
+        return None

@@ -186,17 +186,21 @@ def _lookback_seconds(cfg: Config) -> float:
 def _ingest_token_events(cfg: Config, store: Store, now: float) -> None:
     """Upsert newly-observed assistant usage lines into token_events.
 
-    Bounded to files modified within the retention lookback: tokens outside
-    that window can never affect a current-window computation, so scanning
-    older files would cost real I/O for zero benefit.
+    Only files modified since the last pass are read. The bound used to be
+    the retention lookback alone, which skips almost nothing — practically
+    every transcript is inside 8 weeks — so each ~1-minute poll re-parsed
+    ~40k lines and re-upserted ~48k token events that were already stored,
+    measured at 10.4s of a 13.5s tick. On a first run there is no cursor and
+    the retention window is scanned in full, which is the backfill.
     """
     projects_dir = _claude_config_dir(cfg) / "projects"
     if not projects_dir.is_dir():
         return
-    since_mtime = now - _lookback_seconds(cfg)
+    cursor = store.get_ingest_cursor(Provider.CLAUDE)
+    since_mtime = cursor if cursor is not None else now - _lookback_seconds(cfg)
     for path in projects_dir.glob("**/*.jsonl"):
         try:
-            if path.stat().st_mtime < since_mtime:
+            if path.stat().st_mtime <= since_mtime:
                 continue
         except OSError:
             continue
@@ -205,6 +209,7 @@ def _ingest_token_events(cfg: Config, store: Store, now: float) -> None:
             if event is None:
                 continue
             store.upsert_token_event(provider=Provider.CLAUDE, **event)
+    store.set_ingest_cursor(Provider.CLAUDE, now)
 
 
 def _iter_assistant_usage_lines(path: Path) -> Iterator[dict[str, Any]]:

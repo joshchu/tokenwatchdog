@@ -42,9 +42,11 @@ from tokenwatchdog.predictor import (  # noqa: E402
     _is_reset,
     _split_into_blocks,
 )
+from tokenwatchdog.scoring import (  # noqa: E402
+    MIN_EPISODES_TO_GRADUATE,
+    realized_exhaustion_hours,
+)
 from tokenwatchdog.store import SampleRow, Store, TokenEventRow  # noqa: E402
-
-_EXHAUSTED_PERCENT = 100.0
 
 
 @dataclass
@@ -61,24 +63,10 @@ class Score:
 
 
 def _truth_hours(samples: list[SampleRow], index: int) -> float | None:
-    """Hours from `samples[index]` until this window actually hit 100%, or
-    None if it never did before the cycle turned over.
-
-    Scoped to the cycle on purpose: exhaustion in a *later* one is not the
-    event the forecast was about, and counting it would reward a wildly
-    pessimistic model for eventually being right about a different week.
-
-    Reset detection is `predictor._is_reset`, not a threshold of its own. A
-    hand-rolled one here read a 5-hour window as taking 54 hours to exhaust,
-    because a cycle starting at 1% drops by only 1 point when it turns over
-    — under any fixed threshold — so the scan sailed past the boundary into
-    the next cycle and scored the model against the wrong event."""
-    for offset in range(index + 1, len(samples)):
-        if _is_reset(samples[offset - 1], samples[offset]):
-            return None
-        if samples[offset].used_percent >= _EXHAUSTED_PERCENT:
-            return (samples[offset].source_ts - samples[index].source_ts) / 3600.0
-    return None
+    """What actually happened after `samples[index]` — the same definition
+    `predictor.select_predictor` grades against, so a change measured here
+    can't disagree with the choice made at runtime."""
+    return realized_exhaustion_hours(samples, index, _is_reset)
 
 
 def _window_at(provider: Provider, kind: WindowKind, sample: SampleRow) -> Window:
@@ -183,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             provider: store.recent_token_events(provider, 0.0) for provider in Provider
         }
         any_scored = False
+        total_episodes: dict[str, int] = dict.fromkeys(model_names, 0)
         for provider in Provider:
             for kind in WindowKind:
                 samples = store.recent_samples(provider, kind, 0.0)
@@ -199,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
                     model_names,
                     max(args.stride, 1),
                 )
+                for name, score in scores.items():
+                    total_episodes[name] += len(score.errors_h or [])
                 span_h = (samples[-1].source_ts - samples[0].source_ts) / 3600.0
                 _print_scores(
                     f"{provider.value}/{kind.value} — {len(samples)} samples over "
@@ -217,7 +208,32 @@ def main(argv: list[str] | None = None) -> int:
         "exhaustion earlier than it happened\nscored = moments where the window "
         "actually did exhaust later in the same cycle, so an error is computable"
     )
+    _print_verdict(total_episodes)
     return 0
+
+
+def _print_verdict(episodes_by_model: dict[str, int]) -> None:
+    """Whether any of this proves anything yet.
+
+    Printed because the honest answer is usually "no": scoring needs the
+    window to have actually reached 100% later in the same cycle, and a
+    weekly window supplies at most a couple of those a week however long
+    the tool runs. Without this line it's far too easy to read a
+    two-episode MAE difference as a result."""
+    best = max(episodes_by_model.values(), default=0)
+    if best >= MIN_EPISODES_TO_GRADUATE:
+        print(
+            f"\nEnough scored episodes ({best}) to compare models — "
+            f'predictor.model = "auto" will act on this.'
+        )
+        return
+    print(
+        f"\nNot enough scored episodes yet to choose between models: {best} of the "
+        f"{MIN_EPISODES_TO_GRADUATE} needed.\nMAE differences below that are as "
+        f"likely to be one person's luck as a real improvement, so "
+        f'predictor.model = "auto"\nstays on the default. Tuning a constant '
+        f"against this sample would be fitting noise."
+    )
 
 
 if __name__ == "__main__":

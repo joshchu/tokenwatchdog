@@ -41,7 +41,8 @@ from tokenwatchdog.models import (
     Window,
     WindowKind,
 )
-from tokenwatchdog.store import SampleRow, TokenEventRow
+from tokenwatchdog.scoring import better_model, score_model
+from tokenwatchdog.store import SampleRow, Store, TokenEventRow
 
 _FIVE_HOURS_SECONDS = 5 * 3600
 _SEVEN_DAYS_SECONDS = 7 * 24 * 3600
@@ -342,21 +343,58 @@ _PREDICTORS: dict[str, Predictor] = {
 }
 
 
-def select_predictor(cfg: Config) -> Predictor:
-    # "auto" doesn't yet graduate to montecarlo based on history volume —
-    # that graduation logic (and the seasonal_profile tier it was designed
-    # to sit alongside) isn't built. Pick montecarlo explicitly via
-    # predictor.model if you want it.
-    if cfg.predictor.model == "auto":
-        return _PREDICTORS["linear"]
-    predictor = _PREDICTORS.get(cfg.predictor.model)
-    if predictor is None:
-        raise ConfigError(
-            f"predictor.model={cfg.predictor.model!r} isn't implemented yet "
-            f"(available: {sorted(_PREDICTORS)}) — seasonal_profile/holtwinters "
-            f"are a planned future addition, not built yet"
-        )
-    return predictor
+_DEFAULT_MODEL = "linear"
+
+
+def all_predictor_names() -> list[str]:
+    return list(_PREDICTORS)
+
+
+def predictor_named(name: str) -> Predictor:
+    return _PREDICTORS[name]
+
+
+def select_predictor(cfg: Config, store: Store | None = None) -> tuple[Predictor, str]:
+    """(the authoritative predictor, why it was chosen).
+
+    `auto` grades each model against this machine's own stored forecasts and
+    picks the one that measured best — a real comparison on real usage, not
+    a history-volume threshold standing in for one. It keeps the default
+    unless a challenger clears both bars in scoring.py, because with a
+    single user's history the difference between "better model" and "lucky
+    fit" is exactly what a small sample can't show. The reason string is
+    returned rather than swallowed: a silently switched model is worse than
+    an unswitched one.
+    """
+    if cfg.predictor.model != "auto":
+        predictor = _PREDICTORS.get(cfg.predictor.model)
+        if predictor is None:
+            raise ConfigError(
+                f"predictor.model={cfg.predictor.model!r} isn't implemented yet "
+                f"(available: {sorted(_PREDICTORS)}) — seasonal_profile/holtwinters "
+                f"are a planned future addition, not built yet"
+            )
+        return predictor, f"{cfg.predictor.model}: set explicitly in config"
+    if store is None:
+        return _PREDICTORS[_DEFAULT_MODEL], f"{_DEFAULT_MODEL}: no history to grade"
+    chosen, reason = _grade_stored_models(cfg, store)
+    return _PREDICTORS[chosen], reason
+
+
+def _grade_stored_models(cfg: Config, store: Store) -> tuple[str, str]:
+    """Grade every model against this machine's own stored forecasts."""
+    del cfg  # retention already bounds what's in the table
+    pairs = []
+    for provider in Provider:
+        for kind in WindowKind:
+            samples = store.recent_samples(provider, kind, 0.0)
+            rows = store.recent_forecasts(provider, kind, 0.0)
+            if len(samples) >= 3 and rows:
+                pairs.append((rows, samples))
+    if not pairs:
+        return _DEFAULT_MODEL, f"{_DEFAULT_MODEL}: no stored forecasts to grade yet"
+    scores = {name: score_model(name, pairs, _is_reset) for name in _PREDICTORS}
+    return better_model(_DEFAULT_MODEL, scores)
 
 
 # -- shared preprocessing: the "clean burn series" ---------------------------

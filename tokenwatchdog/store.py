@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS token_events (
 );
 CREATE INDEX IF NOT EXISTS idx_token_ts ON token_events(provider, ts);
 
+-- How far each provider's log ingestion has already got, so a poll only
+-- reads files that changed since the last one. Without it every tick
+-- re-parsed every transcript inside the retention window and re-upserted
+-- every token event in them -- measured at 12.6s of a 13.5s tick, on files
+-- that had not changed.
+CREATE TABLE IF NOT EXISTS ingest_cursor (
+  source          TEXT PRIMARY KEY,  -- provider whose logs these are
+  scanned_through REAL NOT NULL      -- files modified at/before this are done
+);
+
 CREATE TABLE IF NOT EXISTS alert_state (
   alert_key           TEXT PRIMARY KEY,
   armed               INTEGER NOT NULL DEFAULT 1,
@@ -126,6 +136,17 @@ class TokenEventRow:
             + self.cache_creation
             + self.cache_read
         )
+
+
+@dataclass(frozen=True)
+class ForecastRow:
+    """A past forecast, read back to grade it (see scoring.py)."""
+
+    made_at: float
+    model_name: str
+    used_percent: float
+    eta_calendar: float | None
+    status: str | None
 
 
 @dataclass(frozen=True)
@@ -299,6 +320,28 @@ class Store:
             for row in rows
         ]
 
+    # -- ingest_cursor ------------------------------------------------------
+
+    def get_ingest_cursor(self, provider: Provider) -> float | None:
+        """Modification time through which this provider's logs are already
+        ingested, or None on a first run (where the caller should fall back
+        to scanning the whole retention window as a backfill)."""
+        row = self._conn.execute(
+            "SELECT scanned_through FROM ingest_cursor WHERE source = ?",
+            (provider.value,),
+        ).fetchone()
+        return row["scanned_through"] if row else None
+
+    def set_ingest_cursor(self, provider: Provider, scanned_through: float) -> None:
+        """Record the moment a scan STARTED, not when it finished — a file
+        appended to mid-scan then has an mtime past the cursor and gets
+        re-read next time, instead of being silently skipped."""
+        self._conn.execute(
+            "INSERT INTO ingest_cursor (source, scanned_through) VALUES (?, ?) "
+            "ON CONFLICT(source) DO UPDATE SET scanned_through=excluded.scanned_through",
+            (provider.value, scanned_through),
+        )
+
     # -- alert_state --------------------------------------------------------
 
     def get_alert_state(self, alert_key: str) -> AlertStateRow | None:
@@ -359,6 +402,29 @@ class Store:
                 int(forecast.exhausts_before_reset),
             ),
         )
+
+    def recent_forecasts(
+        self, provider: Provider, kind: WindowKind, since_ts: float
+    ) -> list[ForecastRow]:
+        """Past forecasts for one window, oldest first — what scoring.py
+        grades. Rows written before the schema gained `status` have NULL
+        there; that's a genuine "not recorded," not a value to invent."""
+        rows = self._conn.execute(
+            "SELECT made_at, model_name, used_percent, eta_calendar, status "
+            "FROM forecasts WHERE provider = ? AND window_kind = ? AND made_at >= ? "
+            "ORDER BY made_at ASC",
+            (provider.value, kind.value, since_ts),
+        ).fetchall()
+        return [
+            ForecastRow(
+                made_at=row["made_at"],
+                model_name=row["model_name"],
+                used_percent=row["used_percent"],
+                eta_calendar=row["eta_calendar"],
+                status=row["status"],
+            )
+            for row in rows
+        ]
 
     # -- retention --------------------------------------------------------
 

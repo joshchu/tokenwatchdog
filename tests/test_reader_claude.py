@@ -7,8 +7,11 @@ provider's, so those cases are covered by test_predictor.py instead of here.
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -389,3 +392,71 @@ def test_p90_limit_estimate_excludes_the_live_window(sandbox_home, tmp_path, sto
     windows = claude_provider.ClaudeProvider().read(cfg, store)
     w5h = next(w for w in windows if w.kind is WindowKind.W5H)
     assert w5h.used_percent > 90.0
+
+
+def test_unchanged_transcripts_are_not_re_read_every_poll(tmp_path, store):
+    """Regression, with a number: ingestion used to be bounded only by the
+    retention window, which excludes almost nothing — practically every
+    transcript is inside 8 weeks. So each ~1-minute poll re-parsed ~40k lines
+    and re-upserted ~48k already-stored token events, measured at 10.4s of a
+    13.5s tick. A cursor over file mtimes takes that to ~0.4s.
+
+    Counts file opens rather than elapsed time, so it can't go flaky on a
+    loaded machine."""
+    projects = tmp_path / "projects" / "proj"
+    projects.mkdir(parents=True)
+    transcript = projects / "session.jsonl"
+
+    def line(ts, request_id, message_id, input_tokens):
+        return json.dumps(
+            _assistant_line(
+                ts=ts,
+                request_id=request_id,
+                message_id=message_id,
+                input_tokens=input_tokens,
+            )
+        )
+
+    transcript.write_text(
+        line("2026-07-24T10:00:00.000Z", "req_1", "msg_1", 100) + "\n"
+    )
+    os.utime(transcript, (1_000_050.0, 1_000_050.0))
+    cfg = _write_config(tmp_path, f'[claude]\nconfig_dir = "{tmp_path}"\n')
+
+    real_open = Path.open
+
+    def ingest_counting_opens(now):
+        """Transcript opens performed by one ingest pass. Patched only around
+        the call, so the test's own file writing isn't counted."""
+        opens = 0
+
+        def counting_open(self, *args, **kwargs):
+            nonlocal opens
+            if self.suffix == ".jsonl":
+                opens += 1
+            return real_open(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", counting_open):
+            claude_provider._ingest_token_events(cfg, store, now)
+        return opens
+
+    backfill = ingest_counting_opens(1_000_100.0)
+    unchanged = ingest_counting_opens(1_000_200.0)  # nothing touched on disk
+    transcript.write_text(
+        transcript.read_text()
+        + line("2026-07-24T11:00:00.000Z", "req_2", "msg_2", 200)
+        + "\n"
+    )
+    os.utime(transcript, (1_000_250.0, 1_000_250.0))
+    appended = ingest_counting_opens(1_000_300.0)
+
+    assert backfill == 1  # first run reads it
+    assert unchanged == 0  # untouched -> never opened
+    assert appended == 1  # modified -> read again
+    # And the appended event really did land, so skipping isn't losing data.
+    assert {
+        e.input_tokens for e in store.recent_token_events(Provider.CLAUDE, 0.0)
+    } == {
+        100,
+        200,
+    }

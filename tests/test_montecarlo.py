@@ -168,7 +168,9 @@ def test_selectable_via_config(tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text('[predictor]\nmodel = "montecarlo"\n')
     cfg = load_config(config_path)
-    assert select_predictor(cfg).name == "montecarlo"
+    predictor, reason = select_predictor(cfg)
+    assert predictor.name == "montecarlo"
+    assert "config" in reason  # an explicit choice is never silently overridden
 
 
 def test_confidence_is_capped_by_hour_of_week_coverage(cfg):
