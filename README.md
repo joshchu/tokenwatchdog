@@ -109,12 +109,21 @@ instead of waiting out the poll interval, Ctrl-C to quit. Useful variants:
 ```bash
 uv run python -m tokenwatchdog --once       # one reading, then exit
 uv run python -m tokenwatchdog --headless   # poll loop, alerts only, no UI
+uv run python -m tokenwatchdog --reset-data # clear learned/saved data, then exit
 ```
 
 Config lives at `~/.tokenwatchdog/config.toml` (created with sane defaults on
 first run) — poll interval, working hours, alert thresholds, which
 providers/windows to watch, and notification settings all live there.
-History is stored in `~/.tokenwatchdog/history.db`; delete it to reset.
+History is stored in `~/.tokenwatchdog/history.db`. Use `--reset-data` to
+delete usage samples, token events, forecasts, alert state, and ingestion
+cursors while preserving configuration and the original Codex/Claude logs.
+The reset time is saved so rescanning those logs cannot silently restore
+pre-reset training history; only usage at or after the reset is learned.
+Stop any already-running TokenWatchDog process before resetting, then restart
+it so its in-memory model choice is refreshed too. Do not delete `history.db`
+manually: that would also delete the reset boundary and allow old logs to be
+imported again.
 
 ## The metrics
 
@@ -264,13 +273,21 @@ gap — run `scripts/backtest.py` to see where your own history stands.
   `predictor.history_retention_weeks`), and Desktop mode reads everything
   `plan-usage-history.json` still retains (~5 days). Either way, a period
   with the tool off isn't a gap once it's running again.
-- **Only tested on macOS so far.** The visual notification banner
-  (`terminal-notifier` / `osascript`) and the spacebar-refresh keybinding
-  are POSIX/macOS-specific. The audible "woof" cue falls back to a plain
-  system beep on Windows instead of doing nothing, but that fallback is
-  untested on a real Windows machine. The core polling/prediction logic is
-  plain Python and *should* run elsewhere, but it hasn't been run or
-  verified on Linux or Windows.
+- **Only tested on macOS so far.** The core polling/prediction logic is plain
+  Python, Windows installs receive the IANA timezone data needed for
+  DST-aware projections, and the spacebar refresh has a Windows `msvcrt`
+  implementation. Set `timezone` to an explicit IANA name such as
+  `"America/New_York"` there: the stdlib can apply that zone once installed,
+  but it cannot reliably translate the Windows system-zone name to IANA on
+  its own, so the empty/system-local fallback is only the current fixed
+  offset. The audible "woof" cue falls back to a plain system beep. However,
+  no real Windows runner has verified those paths yet, and Windows still has
+  no native visual notification banner: the current banner backends
+  (`terminal-notifier` / `osascript`) are macOS-only. Claude Desktop discovery
+  is also hard-coded to its macOS `~/Library/Application Support/...` path;
+  Windows therefore falls back to Claude Code transcripts rather than reading
+  the Desktop usage file. A Windows CI job plus a Task Scheduler/service smoke
+  test should be required before calling the platform supported.
 - **Claude's 5-hour reset is computed; its weekly reset still has to be
   observed.** Claude reports no reset time at all. The 5-hour window is a
   fixed block anchored at your first request after an idle gap, so its reset
@@ -313,7 +330,9 @@ uv run python scripts/backtest.py --stride 4
 
 It replays every stored sample, hides everything after it, runs each
 predictor as it would have run at that moment, and compares the answer to
-what the store already knows happened next. The scores it prints are
+what the store already knows happened next. Monte Carlo replay uses a fixed
+seed by default so the same code and history produce the same comparison
+(`--seed` overrides it). The scores it prints are
 described under [The metrics](#backtest-scores).
 
 ## License

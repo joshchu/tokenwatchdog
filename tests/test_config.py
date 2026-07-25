@@ -19,6 +19,17 @@ def test_defaults_load_with_no_file(tmp_path):
     assert cfg.thresholds.burn_alert_within_hours == 1.0
 
 
+def test_explicit_iana_timezone_is_validated_at_load_time(tmp_path):
+    cfg = load_config(_write(tmp_path, 'timezone = "America/New_York"\n'))
+    assert cfg.timezone == "America/New_York"
+
+
+def test_unknown_timezone_fails_with_an_actionable_config_error(tmp_path):
+    path = _write(tmp_path, 'timezone = "Not/A_Real_Zone"\n')
+    with pytest.raises(ConfigError, match="valid IANA name"):
+        load_config(path)
+
+
 def test_renamed_key_gets_an_actionable_hint_not_a_bare_unknown_key_error(tmp_path):
     """Regression: renaming a config field must not turn into an opaque
     crash for anyone with an existing config.toml — the error should say

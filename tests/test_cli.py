@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import pty
 import sys
 import time
-import tty
 from datetime import datetime, timezone
 
+import pytest
 from rich.console import Console
 
+import tokenwatchdog.cli as cli_module
 from tokenwatchdog.cli import _render, _row_style, _spacebar_pressed
 from tokenwatchdog.models import (
     Alert,
@@ -22,6 +22,13 @@ from tokenwatchdog.models import (
     Window,
     WindowKind,
 )
+
+try:
+    import pty
+    import tty
+except ImportError:  # Windows: these tests exercise the POSIX input path only
+    pty = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 
 def _window(used_percent=50.0, resets_at=None):
@@ -59,6 +66,40 @@ def _render_to_text(renderable) -> str:
     console = Console(width=120, record=True)
     console.print(renderable)
     return console.export_text()
+
+
+def test_reset_data_clears_store_without_loading_config(monkeypatch, capsys):
+    calls = []
+
+    class _FakeStore:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        def reset_history(self, reset_at):
+            calls.append(reset_at)
+            return 12
+
+    monkeypatch.setattr(cli_module, "Store", _FakeStore)
+    monkeypatch.setattr(cli_module.time, "time", lambda: 1234.5)
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda: pytest.fail("--reset-data must not load config or start the engine"),
+    )
+
+    assert cli_module.main(["--reset-data"]) == 0
+    assert calls == [1234.5]
+    output = capsys.readouterr().out
+    assert "removed 12 saved data row(s)" in output
+    assert "pre-reset history will not be relearned" in output
+
+
+def test_reset_data_cannot_be_combined_with_a_monitor_mode():
+    with pytest.raises(SystemExit):
+        cli_module._parse_args(["--reset-data", "--once"])
 
 
 def test_render_without_alerts_has_no_alert_panel(cfg):
@@ -181,6 +222,7 @@ def test_row_shows_dollar_cost_over_token_count_when_both_are_set(cfg):
 def test_spacebar_pressed_falls_back_to_plain_sleep_when_not_a_tty(monkeypatch):
     sleeps = []
     monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(cli_module, "msvcrt", None)
 
     class _NotATty:
         def isatty(self):
@@ -191,6 +233,28 @@ def test_spacebar_pressed_falls_back_to_plain_sleep_when_not_a_tty(monkeypatch):
     assert sleeps == [42.0]
 
 
+def test_spacebar_pressed_uses_the_windows_console_api(monkeypatch):
+    class _WindowsTty:
+        @staticmethod
+        def isatty():
+            return True
+
+    class _FakeMsvcrt:
+        @staticmethod
+        def kbhit():
+            return True
+
+        @staticmethod
+        def getwch():
+            return " "
+
+    monkeypatch.setattr(cli_module, "msvcrt", _FakeMsvcrt())
+    monkeypatch.setattr(sys, "stdin", _WindowsTty())
+
+    assert _spacebar_pressed(42.0) is True
+
+
+@pytest.mark.skipif(pty is None or tty is None, reason="POSIX pty API is unavailable")
 def test_spacebar_pressed_returns_true_on_a_real_keypress(monkeypatch):
     """A real pty, not a mock -- proves the select/read wiring actually
     reacts to a keypress instead of just asserting the fallback branch.
@@ -212,6 +276,7 @@ def test_spacebar_pressed_returns_true_on_a_real_keypress(monkeypatch):
         os.close(master_fd)
 
 
+@pytest.mark.skipif(pty is None or tty is None, reason="POSIX pty API is unavailable")
 def test_spacebar_pressed_returns_false_when_the_interval_elapses(monkeypatch):
     master_fd, slave_fd = pty.openpty()
     tty.setcbreak(slave_fd)

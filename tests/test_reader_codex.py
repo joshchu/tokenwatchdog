@@ -32,8 +32,10 @@ def _cfg_for(tmp_path, codex_home):
     return load_config(config_path)
 
 
-def _token_count_event(ts, rate_limits, last_token_usage=None):
+def _token_count_event(ts, rate_limits, last_token_usage=None, total_token_usage=None):
     info = {"last_token_usage": last_token_usage} if last_token_usage else {}
+    if total_token_usage is not None:
+        info["total_token_usage"] = total_token_usage
     return {
         "timestamp": ts,
         "type": "event_msg",
@@ -279,6 +281,76 @@ def test_token_event_ingestion_is_idempotent_on_rescan(tmp_path, store):
     assert len(store.recent_token_events(Provider.CODEX, 0.0)) == 1
 
 
+def test_repeated_cumulative_snapshot_is_not_counted_as_new_usage(tmp_path, store):
+    """Codex may repeat last_token_usage on a later token_count line even
+    though total_token_usage did not move. The repeated line is a status
+    snapshot, not another request delta. It must also be removed if an older
+    ingestion version had already stored it."""
+    codex_home = tmp_path / "codex_home"
+    rate_limits = {
+        "primary": {
+            "used_percent": 50.0,
+            "window_minutes": 10080,
+            "resets_at": 1.0,
+        },
+        "secondary": None,
+    }
+    repeated_ts = "2026-07-24T19:40:08.000Z"
+    path = _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-07-24T19:40:00.000Z",
+                rate_limits,
+                last_token_usage={
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                },
+                total_token_usage={"total_tokens": 15},
+            ),
+            _token_count_event(
+                "2026-07-24T19:40:04.000Z",
+                rate_limits,
+                last_token_usage={
+                    "input_tokens": 20,
+                    "output_tokens": 8,
+                    "total_tokens": 28,
+                },
+                total_token_usage={"total_tokens": 43},
+            ),
+            _token_count_event(
+                repeated_ts,
+                rate_limits,
+                last_token_usage={
+                    "input_tokens": 20,
+                    "output_tokens": 8,
+                    "total_tokens": 28,
+                },
+                total_token_usage={"total_tokens": 43},
+            ),
+        ],
+    )
+    # Simulate the row V1 would already have left in a real history.db.
+    store.upsert_token_event(
+        provider=Provider.CODEX,
+        request_id=path.stem,
+        message_id=repeated_ts,
+        ts=parse_iso_to_epoch(repeated_ts),
+        model="codex",
+        input_tokens=20,
+        output_tokens=8,
+        cache_creation=0,
+        cache_read=0,
+    )
+
+    CodexProvider().read(_cfg_for(tmp_path, codex_home), store)
+
+    events = store.recent_token_events(Provider.CODEX, 0.0)
+    assert len(events) == 2
+    assert sum(e.total_tokens for e in events) == 43
+
+
 def test_missing_last_token_usage_is_skipped_not_crashed(tmp_path, store):
     codex_home = tmp_path / "codex_home"
     _write_rollout(
@@ -358,7 +430,10 @@ def test_no_cursor_is_recorded_when_the_sessions_dir_is_absent(tmp_path, store):
     cfg = _cfg_for(tmp_path, missing)
 
     codex_provider._ingest_token_events(cfg, missing, store, 1_000_000.0)
-    assert store.get_ingest_cursor(f"codex:{missing}") is None
+    assert (
+        store.get_ingest_cursor(f"codex:v{codex_provider._INGEST_VERSION}:{missing}")
+        is None
+    )
 
     # Now it shows up, with an mtime well before that first attempt.
     sessions = missing / "sessions" / "2026" / "07" / "20"

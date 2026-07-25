@@ -516,7 +516,12 @@ def _percent_per_token(
     tokens = sum(
         e.total_tokens
         for e in token_events
-        if first.source_ts <= e.ts <= last.source_ts
+        # The percentage on `first` is the snapshot AFTER the token_count
+        # event at that timestamp, so those tokens are already present in the
+        # baseline level and cannot have caused `last - first`. The closing
+        # event is included for the symmetric reason: it is reflected in the
+        # closing percentage.
+        if first.source_ts < e.ts <= last.source_ts
     )
     if tokens <= 0:
         return None

@@ -3,7 +3,8 @@
 `samples` is the source of truth for burn-rate lookback; `token_events` is a
 finer-grained Claude signal for future predictors; `alert_state` survives
 restarts so alerts don't re-fire; every tick's `forecasts` are recorded so a
-later backtest can compare models.
+later backtest can compare models. `app_state` preserves the cutoff for an
+explicit reset so provider logs cannot silently reconstruct forgotten data.
 """
 
 from __future__ import annotations
@@ -49,6 +50,14 @@ CREATE TABLE IF NOT EXISTS token_events (
 );
 CREATE INDEX IF NOT EXISTS idx_token_ts ON token_events(provider, ts);
 
+-- Durable application metadata that must survive a history reset. In
+-- particular, providers can reconstruct old usage from their own logs, so
+-- deleting rows alone would just refill the database on the next poll.
+CREATE TABLE IF NOT EXISTS app_state (
+  key   TEXT PRIMARY KEY,
+  value REAL NOT NULL
+);
+
 -- How far each provider's log ingestion has already got, so a poll only
 -- reads files that changed since the last one. Without it every tick
 -- re-parsed every transcript inside the retention window and re-upserted
@@ -92,6 +101,29 @@ CREATE TABLE IF NOT EXISTS forecasts (
   time_to_reset_h REAL,
   exhausts_before_reset INTEGER
 );
+
+-- Keep a user-requested reset durable across provider rescans. These live in
+-- SQLite rather than provider-specific readers so every present and future
+-- ingestion path observes the same boundary.
+CREATE TRIGGER IF NOT EXISTS reject_samples_before_history_floor
+BEFORE INSERT ON samples
+WHEN NEW.source_ts < COALESCE(
+  (SELECT value FROM app_state WHERE key = 'history_floor'),
+  0
+)
+BEGIN
+  SELECT RAISE(IGNORE);
+END;
+
+CREATE TRIGGER IF NOT EXISTS reject_token_events_before_history_floor
+BEFORE INSERT ON token_events
+WHEN NEW.ts < COALESCE(
+  (SELECT value FROM app_state WHERE key = 'history_floor'),
+  0
+)
+BEGIN
+  SELECT RAISE(IGNORE);
+END;
 """
 
 # Columns added to `forecasts` after the table first shipped. CREATE TABLE
@@ -324,6 +356,22 @@ class Store:
             for row in rows
         ]
 
+    def delete_token_event(
+        self, *, provider: Provider, request_id: str, message_id: str
+    ) -> None:
+        """Remove one provider event by its durable source identity.
+
+        This is intentionally narrow rather than a bulk-delete API. A provider
+        may discover on a later, versioned rescan that a previously ingested
+        source line was only a repeated cumulative snapshot; deleting that
+        exact line repairs the history without disturbing any real events.
+        """
+        self._conn.execute(
+            "DELETE FROM token_events "
+            "WHERE provider = ? AND request_id = ? AND message_id = ?",
+            (provider.value, request_id, message_id),
+        )
+
     # -- ingest_cursor ------------------------------------------------------
 
     def get_ingest_cursor(self, source_key: str) -> float | None:
@@ -444,6 +492,42 @@ class Store:
         self._conn.execute("DELETE FROM samples WHERE source_ts < ?", (cutoff_ts,))
         self._conn.execute("DELETE FROM token_events WHERE ts < ?", (cutoff_ts,))
         self._conn.execute("DELETE FROM forecasts WHERE made_at < ?", (cutoff_ts,))
+
+    def reset_history(self, reset_at: float) -> int:
+        """Forget learned/runtime data and reject provider history before now.
+
+        Codex and Claude keep their own append-only logs. Clearing our tables
+        without a durable floor would therefore appear to work, then silently
+        restore the old training history on the next provider scan.
+
+        Configuration is file-backed and intentionally outside this reset.
+        Returns the number of application rows removed.
+        """
+        tables = (
+            "samples",
+            "token_events",
+            "forecasts",
+            "alert_state",
+            "ingest_cursor",
+        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            removed = sum(
+                self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in tables
+            )
+            for table in tables:
+                self._conn.execute(f"DELETE FROM {table}")
+            self._conn.execute(
+                "INSERT INTO app_state (key, value) VALUES ('history_floor', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (reset_at,),
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        return removed
 
 
 def _to_epoch(dt: object) -> float | None:

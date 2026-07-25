@@ -258,6 +258,13 @@ def _parse_hhmm(value: str) -> dt_time:
 
 
 def _validate(cfg: Config) -> None:
+    if cfg.timezone:
+        try:
+            ZoneInfo(cfg.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ConfigError(
+                f"timezone must be a valid IANA name, got {cfg.timezone!r}"
+            ) from exc
     if not 0.0 <= cfg.thresholds.warn_percent <= 100.0:
         raise ConfigError("thresholds.warn_percent must be within [0, 100]")
     if not 0.0 <= cfg.thresholds.burn_min_percent <= 100.0:
@@ -343,7 +350,8 @@ _DEFAULT_TOML = """\
 # default (see tokenwatchdog/config.py for the full set of dataclasses).
 
 poll_interval_seconds = 60
-timezone = ""                        # "" -> system local
+timezone = ""                        # "" -> system local; on Windows, set an IANA
+                                     # name (e.g. "America/New_York") for DST
 
 [providers]
 codex = true

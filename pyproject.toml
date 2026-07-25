@@ -10,6 +10,10 @@ requires-python = ">=3.13"
 # stdlib: sqlite3, tomllib, zoneinfo, subprocess, datetime, json, glob, shutil.
 dependencies = [
     "rich>=13.7.0",                     # terminal dashboard
+    # Windows has no system IANA zoneinfo database. Without this, an explicit
+    # timezone such as America/New_York can fail and the system-zone fallback
+    # is only a fixed current offset (wrong across future DST transitions).
+    "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

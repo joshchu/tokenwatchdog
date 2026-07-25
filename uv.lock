@@ -603,6 +603,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "rich" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 
 [package.optional-dependencies]
@@ -631,6 +632,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.7.0" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
     { name = "statsmodels", marker = "extra == 'forecasting'", specifier = ">=0.14.0" },
+    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
 ]
 provides-extras = ["menubar", "forecasting"]
 

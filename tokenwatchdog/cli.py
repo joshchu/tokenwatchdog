@@ -25,6 +25,7 @@ from tokenwatchdog.alerts import level_still_in_cycle
 from tokenwatchdog.config import Config, load_config, resolve_timezone
 from tokenwatchdog.engine import Engine
 from tokenwatchdog.models import Alert, Forecast, MonitorState
+from tokenwatchdog.store import Store
 
 try:
     import termios
@@ -32,6 +33,11 @@ try:
 except ImportError:  # Windows has neither -- fall back to a plain sleep
     termios = None  # type: ignore[assignment]
     tty = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # Windows-only console input API
+    msvcrt = None  # type: ignore[assignment]
 
 _CALM_EMOJI = "🐶"
 _ALERT_EMOJI = "🐕"
@@ -49,6 +55,16 @@ _RHYTHM_MODEL = "montecarlo"
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.reset_data:
+        with Store() as store:
+            removed = store.reset_history(time.time())
+        Console().print(
+            f"Reset complete: removed {removed} saved data row(s). "
+            "Configuration and provider logs were preserved; their pre-reset "
+            "history will not be relearned. Restart any running monitor."
+        )
+        return 0
+
     cfg = load_config()
     with Engine(cfg=cfg) as engine:
         if args.once:
@@ -70,13 +86,20 @@ def main(argv: list[str] | None = None) -> int:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="tokenwatchdog")
-    parser.add_argument(
-        "--once", action="store_true", help="tick once, print, and exit"
-    )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="tick once, print, and exit")
+    mode.add_argument(
         "--headless",
         action="store_true",
-        help="run the poll loop with no display — alerts only (LaunchAgent mode)",
+        help="run the poll loop with no display — alerts only (background/service mode)",
+    )
+    mode.add_argument(
+        "--reset-data",
+        action="store_true",
+        help=(
+            "delete learned history and saved runtime state, prevent old "
+            "provider logs from refilling it, and exit"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -145,8 +168,26 @@ def _spacebar_pressed(seconds: float) -> bool:
     early (so the caller can trigger an immediate refresh) or False once
     the full interval elapses. Assumes stdin is already in cbreak mode
     (see _cbreak_stdin) — falls back to a plain sleep, always returning
-    False, when stdin isn't an interactive TTY or termios/tty aren't
-    available."""
+    False, when stdin isn't an interactive TTY. POSIX uses select() against a
+    cbreak terminal; Windows polls the stdlib msvcrt console API."""
+    if msvcrt is not None and sys.stdin.isatty():
+        deadline = time.monotonic() + seconds
+        while True:
+            # The stdlib stubs expose these only when type-checking on win32;
+            # on macOS/Linux mypy sees the importable module shape without its
+            # platform-gated members.
+            if msvcrt.kbhit():  # type: ignore[attr-defined]
+                key = msvcrt.getwch()  # type: ignore[attr-defined]
+                if key == " ":
+                    return True
+                if key == "\x03":
+                    raise KeyboardInterrupt
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # msvcrt has no timed wait. A short sleep keeps this responsive
+            # without turning the poll interval into a busy loop.
+            time.sleep(min(remaining, 0.05))
     if termios is None or tty is None or not sys.stdin.isatty():
         time.sleep(seconds)
         return False

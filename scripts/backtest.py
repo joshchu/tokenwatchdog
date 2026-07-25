@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import random
 import statistics
 import sys
 from dataclasses import dataclass
@@ -157,7 +158,14 @@ def main(argv: list[str] | None = None) -> int:
         default=",".join(_PREDICTORS),
         help=f"comma-separated subset of {','.join(_PREDICTORS)}",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Monte Carlo seed (default: 0, so comparisons are reproducible)",
+    )
     args = parser.parse_args(argv)
+    random.seed(args.seed)
 
     model_names = [name.strip() for name in args.models.split(",") if name.strip()]
     unknown = set(model_names) - set(_PREDICTORS)

@@ -155,12 +155,30 @@ def test_calibration_needs_real_percentage_movement(cfg):
     """One integer step of movement carries ±50% error, so it is refused
     rather than used to scale every future token into a confident rate."""
     now = 2_000_000.0
-    events = [_event(now - h * HOUR, 100_000) for h in range(10, 0, -1)]
+    # Ten events strictly after the origin sample through the closing sample:
+    # these are the events that can have caused the percentage delta.
+    events = [_event(now - h * HOUR, 100_000) for h in range(9, -1, -1)]
     barely_moved = [_sample(now - 10 * HOUR, 40.0), _sample(now, 41.0)]
     assert _percent_per_token(barely_moved, events) is None
 
     moved = [_sample(now - 10 * HOUR, 40.0), _sample(now, 50.0)]
     assert _percent_per_token(moved, events) == pytest.approx(10.0 / 1_000_000)
+
+
+def test_calibration_excludes_tokens_already_reflected_in_the_origin_level(cfg):
+    """The token_count event and its percentage snapshot share a timestamp.
+    Tokens on the origin line are already included in the origin percentage;
+    counting them again in the denominator understated percent-per-token and
+    every ETA derived from it."""
+    now = 2_000_000.0
+    origin = now - HOUR
+    history = [_sample(origin, 40.0), _sample(now, 50.0)]
+    events = [
+        _event(origin, 900_000),  # already reflected in the 40% baseline
+        _event(now, 100_000),  # caused the movement toward the 50% close
+    ]
+
+    assert _percent_per_token(history, events) == pytest.approx(10.0 / 100_000)
 
 
 def test_saturated_block_is_not_calibrated_from(cfg):

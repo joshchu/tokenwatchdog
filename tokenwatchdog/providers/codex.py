@@ -11,12 +11,14 @@ Two load-bearing rules, both learned the hard way from real rollout files:
 Malformed/missing data returns an empty list rather than a guessed value —
 never fabricate a reading.
 
-Every `token_count` event also carries `payload.info.last_token_usage` — the
-real per-step token delta for that turn, independent of `used_percent`
-(which clamps at 100 and goes blind to further usage). Ingested into
-`store.token_events` the same way providers/claude.py ingests its own token
-log, so `predictor.tokens_burned_past_quota` has real data once a window
-saturates.
+Every usage-bearing `token_count` event also carries
+`payload.info.last_token_usage` — the real per-step token delta for that turn,
+independent of `used_percent` (which clamps at 100 and goes blind to further
+usage). Codex can repeat that delta on a later status-only snapshot; the
+unchanged cumulative total distinguishes and removes those duplicates.
+The remaining events are ingested into `store.token_events` the same way
+providers/claude.py ingests its own token log, so
+`predictor.tokens_burned_past_quota` has real data once a window saturates.
 """
 
 from __future__ import annotations
@@ -43,6 +45,11 @@ _WEEKLY_MIN_MINUTES = 9000
 # still-valid reading (rate limits are account-wide, not per-session) sits
 # right there.
 _MAX_CANDIDATE_FILES = 5
+
+# Bump this when ingestion semantics change in a way that requires existing
+# rollout files to be revisited. V2 removes repeated cumulative snapshots that
+# V1 stored as if each one were new usage.
+_INGEST_VERSION = 2
 
 
 class CodexProvider:
@@ -135,7 +142,7 @@ def _lookback_seconds(cfg: Config) -> float:
 
 
 def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> None:
-    """Upserts every token_count event's real per-step token delta
+    """Upserts every usage-bearing token_count event's real per-step delta
     (`payload.info.last_token_usage`) into store.token_events -- the
     signal `used_percent` alone can't provide once it clamps at 100%.
     Dedup key is the session file + the event's own timestamp (Codex has
@@ -151,7 +158,7 @@ def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> N
         # nothing, so sessions appearing later with honest older mtimes -- a
         # restore, a sync, an install-then-import -- would never be read.
         return
-    source_key = f"{Provider.CODEX.value}:{home}"
+    source_key = f"{Provider.CODEX.value}:v{_INGEST_VERSION}:{home}"
     cursor = store.get_ingest_cursor(source_key)
     since_mtime = cursor if cursor is not None else now - _lookback_seconds(cfg)
     for path in _rollout_files_newest_first(home):
@@ -160,12 +167,41 @@ def _ingest_token_events(cfg: Config, home: Path, store: Store, now: float) -> N
                 continue
         except OSError:
             continue
+        previous_total: int | None = None
         for line in _iter_token_count_events(path):
+            cumulative_total = _cumulative_total_tokens(line)
+            if cumulative_total is not None and cumulative_total == previous_total:
+                # Codex sometimes emits the same total_token_usage snapshot
+                # again under a new timestamp. last_token_usage is repeated on
+                # that line too, but no new tokens were consumed: the
+                # cumulative total did not move. V1 ingested these timestamps
+                # as separate deltas, so delete the exact old identity as part
+                # of this versioned rescan as well as skipping it now.
+                timestamp = line.get("timestamp")
+                if isinstance(timestamp, str):
+                    store.delete_token_event(
+                        provider=Provider.CODEX,
+                        request_id=path.stem,
+                        message_id=timestamp,
+                    )
+                continue
+            if cumulative_total is not None:
+                previous_total = cumulative_total
             event = _token_event_from_line(line, path)
             if event is None:
                 continue
             store.upsert_token_event(provider=Provider.CODEX, **event)
     store.set_ingest_cursor(source_key, now)
+
+
+def _cumulative_total_tokens(line: dict[str, Any]) -> int | None:
+    """Codex's per-session running total, used only to recognize repeats."""
+    info = line["payload"].get("info")
+    total_usage = info.get("total_token_usage") if isinstance(info, dict) else None
+    total = total_usage.get("total_tokens") if isinstance(total_usage, dict) else None
+    if not isinstance(total, (int, float)):
+        return None
+    return int(total)
 
 
 def _token_event_from_line(line: dict[str, Any], path: Path) -> dict[str, Any] | None:
