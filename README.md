@@ -115,6 +115,67 @@ first run) — poll interval, working hours, alert thresholds, which
 providers/windows to watch, and notification settings all live there.
 History is stored in `~/.tokenwatchdog/history.db`; delete it to reset.
 
+## The metrics
+
+### Dashboard columns
+
+One row per quota — each provider's 5-hour and 7-day windows are independent
+caps and are predicted separately. All wall-clock columns are shown in
+`timezone` from your config, with the abbreviation in the header so a local
+time is never misread as UTC.
+
+| Column | What it means |
+|---|---|
+| **Provider** / **Window** | `codex` or `claude`, and which cap: `w5h` (5-hour) or `weekly` (7-day). |
+| **Used %** | How much of the window is gone. Whole numbers, because that's the resolution both providers report. A trailing `*` means the number is not a percentage the provider stated: either it was computed from token counts against an unpublished limit (Claude's `tokens` source), or the row is `no_data` and the `0%` is a placeholder standing in for a reading that doesn't exist. |
+| **Past cap** | Blank until **Used %** actually pins at 100 for this cycle; then it's the tokens really spent since that moment, or a `$` figure once you've configured your plan's overage rates. It exists because **Burn %/h** goes to a flat `+0.00` past 100% — a percentage can't climb higher — at exactly the point where continued spending stops being free. |
+| **Status** | `ok` — live, and not on pace to exhaust. `🔥 burning` — on pace to hit 100% before the reset. `idle` — the newest reading is older than this window's staleness threshold (10 min for 5-hour, 3 h for weekly, both configurable), so no *rate* can be measured; the **Used %** level still counts. `reset_pending` — the window just turned over and there's only one reading in the new cycle. `no_data` — the provider isn't reporting this window at all (today, Codex's 5-hour). |
+| **Burn %/h** | Percent of *this window's* quota consumed per hour at the currently measured rate — not tokens per hour, and not a share of anything else, so it divides straight into the percent remaining. Normally measured from real token throughput and converted by the percent-per-token calibration; a trailing `~` means it fell back to the slope of the reported percentage itself, which is quantized to whole numbers and therefore coarse. `—` on any row that isn't live (`idle`, `no_data`, `reset_pending`), because a rate is the one thing a stale reading can't support. |
+| **ETA trend** | When the window runs out *at the pace of the last few hours, projected around the clock*. The urgent, right-now question — and the one the "burning too fast" alert fires from. |
+| **ETA rhythm** | When it runs out *given how you actually use this across a week*. Shown as a `P50 → P90` band once the hour-of-week profile has learned your rhythm from token history, or as a single working-hours projection from your configured `working_hours` while that profile is thin. The band is the honest shape for bursty usage; a bare timestamp would imply precision the data doesn't have. |
+| **Resets** | When this window's quota refills. Reported directly by Codex; for Claude, computed from the 5-hour block anchor, or `—` for the weekly window until a reset is actually observed. |
+| **Risk** | Probability of exhausting before that reset — the share of simulated futures that reach 100% in time. Worth seeing separately from the ETA: a 40% chance of running out matters even when the median future doesn't. Only present while a simulating model is running, and the column is hidden entirely when no model produces one. |
+| **Conf.** | How much evidence is behind the estimate: `high` at 10+ observations, `medium` at 3+, else `low` — then downgraded by how much of the period being projected through the profile actually has data (below 50% coverage is `low` regardless). Coverage can only lower the rating, never raise it. |
+
+Both ETA columns render as weekday + time and are capped at the window's own
+reset — or at the window's duration when no reset is known yet — so an ETA is
+always strictly less than a week out and the weekday is never ambiguous. A
+blank ETA means exhaustion isn't reachable in this cycle, which is a real
+answer rather than a missing one.
+
+Row colors mirror the alert conditions exactly: **red** for something that
+fired or would fire (100% used, over the warn threshold, or burning with an
+imminent ETA), **yellow** for the weaker "on pace to exhaust before reset."
+The dog in the title agrees — 🐶 calm, 🐕 at the warn threshold, 🔥 burning.
+
+### Backtest scores
+
+`scripts/backtest.py` prints one block per window (with how many samples,
+hours, cycles, and token events it had to work with) and one row per model:
+
+| Score | What it means |
+|---|---|
+| **coverage** | Share of replayed moments where the model produced an ETA at all. Low isn't automatically bad — declining to guess from a signal too coarse to forecast is correct — but a model that's usually silent can't be graded on much. |
+| **scored** | Of those, how many belong to a cycle that genuinely did reach 100% later, so a real error is computable. These "episodes" are the scarce resource: a weekly window supplies at most a couple a week no matter how long the tool runs, which is why model selection needs 30 of them before it will switch. |
+| **MAE h** | Mean absolute error of the ETA, in hours. |
+| **bias h** | Mean *signed* error. Positive means the ETAs ran late (predicting exhaustion after it happened); negative means early and alarmist. Tracked separately because the two directions aren't equally costly, and because a change can meaningfully cut bias while leaving MAE inside the noise. |
+| **P90 hit** | Calibration of the band: how often the truth actually landed at or before the model's P90. A well-calibrated P90 sits near 90% — much higher means the band is wider than it needs to be, much lower means it's overconfident. Blank for models that don't produce a band. |
+
+**Read the current MAE and P90 numbers with suspicion.** On this repo's own
+history, every scored episode so far turned out to be a moment when the window
+was *already* at 100%. The model correctly answers "exhausted now" (a P50 and
+P90 both at 0.0h), while the truth function measures forward to the next stored
+sample reading 100% — one poll interval later. So the reported error is roughly
+the poll interval rather than a forecasting error, which flatters MAE, and P90
+containment is arithmetically impossible at the cap, which is why `P90 hit`
+reads 0%. Both numbers become meaningful once episodes exist that *start* below
+the cap and cross it. This is exactly the class of thing the 30-episode
+threshold exists to refuse to draw conclusions from.
+
+The footer states whether the sample proves anything at all, rather than
+inviting a comparison of MAE differences that a handful of episodes can't
+support.
+
 ## How it works
 
 TokenWatchDog reads quota data **only from local files already on your
@@ -231,7 +292,8 @@ uv run python scripts/backtest.py --stride 4
 
 It replays every stored sample, hides everything after it, runs each
 predictor as it would have run at that moment, and compares the answer to
-what the store already knows happened next.
+what the store already knows happened next. The scores it prints are
+described under [The metrics](#backtest-scores).
 
 ## License
 
