@@ -242,7 +242,7 @@ def _render(
         "Status",
         "Burn %/h",
         "ETA on burn %/h",
-        "Predicted ETA",
+        "Predicted ETA (P50 → P90)",
         f"Resets ({tz_label})",
         *(("Risk",) if show_risk else ()),
         "Conf.",

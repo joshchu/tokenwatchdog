@@ -120,6 +120,7 @@ def test_eta_headers_name_the_rate_and_prediction_questions(cfg):
 
     assert "ETA on burn %/h" in text
     assert "Predicted ETA" in text
+    assert "P50 → P90" in text
     assert "ETA trend" not in text
     assert "ETA rhythm" not in text
 

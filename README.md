@@ -52,11 +52,11 @@ enough that it will run out before the window naturally resets.
   probability of running out before the reset, instead of one point guess
 - **Two ETAs side by side, because they answer different questions.**
   **ETA on burn %/h** projects the displayed recent burn rate around the clock;
-  **Predicted ETA** spreads the same budget over how you actually use it
-  across a week — learned from your token history as a P50 → P90 band, or
-  from your configured working hours while that profile is thin. Both models
-  run every tick, so their disagreement is visible rather than hidden behind
-  a config switch
+  **Predicted ETA (P50 → P90)** spreads the same budget over how you actually
+  use it across a week — learned from your token history as a percentile
+  range, or from your configured working hours while that profile is thin.
+  Both models run every tick, so their disagreement is visible rather than
+  hidden behind a config switch
 - Each ETA is capped independently against the next reset — an ETA past the
   reset describes an event that can't happen, and no window is ever projected
   to take longer to exhaust than its own duration
@@ -143,7 +143,7 @@ time is never misread as UTC.
 | **Status** | `ok` — live, and not on pace to exhaust. `🔥 burning` — on pace to hit 100% before the reset. `idle` — the newest reading is older than this window's staleness threshold (10 min for 5-hour, 3 h for weekly, both configurable), so no *rate* can be measured; the **Used %** level still counts. `reset_pending` — the window just turned over and there's only one reading in the new cycle. `no_data` — the provider isn't reporting this window at all (today, Codex's 5-hour). |
 | **Burn %/h** | Percent of *this window's* quota consumed per hour at the currently measured rate — not tokens per hour, and not a share of anything else, so it divides straight into the percent remaining. Normally measured from real token throughput and converted by the percent-per-token calibration; a trailing `~` means it fell back to the slope of the reported percentage itself, which is quantized to whole numbers and therefore coarse. `—` on any row that isn't live (`idle`, `no_data`, `reset_pending`), because a rate is the one thing a stale reading can't support. |
 | **ETA on burn %/h** | When the window runs out if the displayed recent burn rate continues around the clock. It is the direct counterpart to **Burn %/h**: percent remaining divided by that rate, rendered as a weekday and time. |
-| **Predicted ETA** | When it runs out *given how you actually use this across a week*. Shown as a `P50 → P90` band once the hour-of-week profile has learned your pattern from token history, or as a single working-hours projection from your configured `working_hours` while that profile is thin. Unlike the burn-rate ETA, the learned band can remain while the row is `idle`, provided the last-used level can still be proven to belong to the current quota cycle. The band is the honest shape for bursty usage; a bare timestamp would imply precision the data doesn't have. |
+| **Predicted ETA (P50 → P90)** | When it runs out *given how you actually use this across a week*. A value such as `Sat 08:53 → Mon 19:46` is a range: the left timestamp is the median simulated exhaustion time (P50), and the right is the later 90th-percentile time (P90). While the hour-of-week profile is still thin, a lone timestamp is the working-hours projection from your configured `working_hours`, not a percentile band. Unlike the burn-rate ETA, the learned range can remain while the row is `idle`, provided the last-used level can still be proven to belong to the current quota cycle. |
 | **Resets** | When this window's quota refills. Reported directly by Codex; for Claude, computed from the 5-hour block anchor, or `—` for the weekly window until a reset is actually observed. |
 | **Risk** | Probability of exhausting before that reset — the share of simulated futures that reach 100% in time. Worth seeing separately from the ETA: a 40% chance of running out matters even when the median future doesn't. Only present while a simulating model is running, and the column is hidden entirely when no model produces one. |
 | **Conf.** | How much evidence is behind the estimate: `high` at 10+ observations, `medium` at 3+, else `low`. The hour-of-week models additionally downgrade it by how much of the period being projected actually has data (below 50% coverage is `low` regardless); coverage can only lower a rating, never raise it. Under the default `linear` there's no profile to cover, so what you see is the observation count alone. |
