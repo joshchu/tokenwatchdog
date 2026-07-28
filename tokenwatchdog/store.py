@@ -79,9 +79,10 @@ CREATE TABLE IF NOT EXISTS alert_state (
 -- against what actually happened. scoring.py (which decides what
 -- predictor.model = "auto" trusts) reads made_at, model_name, eta_calendar
 -- and status -- status being what separates an ETA the predictor correctly
--- withheld from one that was silently broken. The remaining columns aren't
--- read by any code path: they are the record of what each forecast said, for
--- inspecting a past run by hand. scripts/backtest.py deliberately re-runs the
+-- withheld from one that was silently broken. The idle dashboard also reads
+-- used_percent plus eta_p50/eta_p90 from the latest compatible non-idle row,
+-- but only as labeled display context. The other columns remain a record for
+-- inspecting a past run by hand. scripts/backtest.py deliberately re-runs
 -- predictors instead of reading these, since its job is to score code that
 -- hasn't shipped yet.
 CREATE TABLE IF NOT EXISTS forecasts (
@@ -101,6 +102,8 @@ CREATE TABLE IF NOT EXISTS forecasts (
   time_to_reset_h REAL,
   exhausts_before_reset INTEGER
 );
+CREATE INDEX IF NOT EXISTS idx_forecasts_key_made
+ON forecasts(provider, window_kind, model_name, made_at DESC);
 
 -- Keep a user-requested reset durable across provider rescans. These live in
 -- SQLite rather than provider-specific readers so every present and future
@@ -183,6 +186,22 @@ class ForecastRow:
     model_name: str
     eta_calendar: float | None
     status: str | None
+
+
+@dataclass(frozen=True)
+class ForecastSnapshotRow:
+    """The last non-idle model result used as a possible display fallback.
+
+    Unlike ForecastRow this exposes the saved percentile and usage level.
+    The engine still decides whether the row belongs to the current window
+    and is recent enough to show.
+    """
+
+    made_at: float
+    used_percent: float
+    eta_p50: float | None
+    eta_p90: float | None
+    status: str
 
 
 @dataclass(frozen=True)
@@ -482,6 +501,38 @@ class Store:
             )
             for row in rows
         ]
+
+    def latest_non_idle_forecast(
+        self,
+        provider: Provider,
+        kind: WindowKind,
+        model_name: str,
+        *,
+        at_or_before: float,
+    ) -> ForecastSnapshotRow | None:
+        """Latest result backed by a non-stale reading, including barriers.
+
+        RESET_PENDING is intentionally returned rather than skipped. If a
+        reset was observed after an older valid percentile, that newer row
+        must prevent the old cycle's prediction from resurfacing.
+        """
+        row = self._conn.execute(
+            "SELECT made_at, used_percent, eta_p50, eta_p90, status "
+            "FROM forecasts "
+            "WHERE provider = ? AND window_kind = ? AND model_name = ? "
+            "  AND made_at <= ? AND status <> 'IDLE' "
+            "ORDER BY made_at DESC, id DESC LIMIT 1",
+            (provider.value, kind.value, model_name, at_or_before),
+        ).fetchone()
+        if row is None:
+            return None
+        return ForecastSnapshotRow(
+            made_at=row["made_at"],
+            used_percent=row["used_percent"],
+            eta_p50=row["eta_p50"],
+            eta_p90=row["eta_p90"],
+            status=row["status"],
+        )
 
     # -- retention --------------------------------------------------------
 

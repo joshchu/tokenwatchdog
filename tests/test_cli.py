@@ -19,6 +19,7 @@ from tokenwatchdog.models import (
     Forecast,
     MonitorState,
     Provider,
+    RetainedPrediction,
     Window,
     WindowKind,
 )
@@ -111,6 +112,20 @@ def test_render_without_alerts_has_no_alert_panel(cfg):
     assert "Recent alerts" not in text
 
 
+def test_dashboard_uses_a_high_contrast_accent(cfg):
+    window = _window()
+    state = MonitorState(
+        now=1000.0, windows=(window,), forecasts=(_forecast(window),), alerts=()
+    )
+
+    rendered = _render(state, cfg, [])
+    panel = rendered.renderables[0]
+
+    assert isinstance(panel.title, cli_module.Text)
+    assert panel.title.style == "bold bright_cyan"
+    assert panel.border_style == "bright_cyan"
+
+
 def test_eta_headers_name_the_rate_and_prediction_questions(cfg):
     window = _window()
     state = MonitorState(
@@ -192,6 +207,83 @@ def test_predicted_eta_remains_visible_when_the_recent_rate_is_idle():
     assert row[4] == "—"
     assert row[5] == "—"
     assert row[6] == "Tue 12:00 → Wed 12:00"
+
+
+def test_single_predicted_percentile_is_labeled_p50():
+    window = _window()
+    predicted = dataclasses.replace(
+        _forecast(window),
+        model_name="montecarlo",
+        eta_calendar=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p50=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p90=None,
+    )
+
+    row = _row(
+        predicted,
+        timezone.utc,
+        burn_rate=_forecast(window),
+        predicted=predicted,
+    )
+
+    assert row[6] == "P50 Tue 12:00"
+
+
+def test_retained_prediction_is_labeled_saved(cfg):
+    window = _window()
+    idle = dataclasses.replace(
+        _forecast(window),
+        status="IDLE",
+        model_name="montecarlo",
+        eta_calendar=None,
+        eta_p50=None,
+        eta_p90=None,
+    )
+    retained = RetainedPrediction(
+        provider=window.provider,
+        kind=window.kind,
+        made_at=900.0,
+        used_percent=window.used_percent,
+        eta_p50=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p90=datetime(2026, 7, 29, 12, tzinfo=timezone.utc),
+    )
+
+    row = _row(
+        idle,
+        timezone.utc,
+        burn_rate=idle,
+        predicted=idle,
+        retained=retained,
+    )
+
+    assert row[6] == "saved Tue 12:00 → Wed 12:00"
+
+    state = MonitorState(
+        now=1000.0,
+        windows=(window,),
+        forecasts=(idle,),
+        alerts=(),
+        all_forecasts=(idle,),
+        retained_predictions=(retained,),
+    )
+    text = _render_to_text(_render(state, cfg, []), width=200)
+    assert "saved " in text
+
+
+def test_working_hours_fallback_is_labeled():
+    window = _window()
+    burn_rate = dataclasses.replace(
+        _forecast(window),
+        eta_workhours=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+    )
+
+    row = _row(
+        burn_rate,
+        timezone.utc,
+        burn_rate=burn_rate,
+    )
+
+    assert row[6] == "hours Tue 12:00"
 
 
 def test_render_with_alerts_shows_the_alert_panel_and_message(cfg):

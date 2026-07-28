@@ -20,10 +20,17 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from tokenwatchdog.config import Config, load_config, resolve_timezone
 from tokenwatchdog.engine import Engine
-from tokenwatchdog.models import Alert, Forecast, MonitorState, level_still_in_cycle
+from tokenwatchdog.models import (
+    Alert,
+    Forecast,
+    MonitorState,
+    RetainedPrediction,
+    level_still_in_cycle,
+)
 from tokenwatchdog.store import Store
 
 try:
@@ -261,6 +268,7 @@ def _render(
                 tz,
                 burn_rate=burn_rate,
                 predicted=state.forecast_from(_PREDICTED_ETA_MODEL, forecast.window),
+                retained=state.retained_prediction_for(forecast.window),
                 show_risk=show_risk,
             ),
             style=_row_style(forecast, cfg, state.now),
@@ -273,15 +281,16 @@ def _render(
     model_note = f"model {model_choice_reason}" if model_choice_reason else ""
     updated = datetime.fromtimestamp(state.now, tz=tz).strftime("%Y-%m-%d %H:%M:%S %Z")
     status_suffix = " — refreshing…" if refreshing else ""
+    title = f"{mascot} TokenWatchDog — updated {updated}{status_suffix}"
     panel = Panel(
         table,
-        title=f"{mascot} TokenWatchDog — updated {updated}{status_suffix}",
+        title=Text(title, style="bold bright_cyan"),
         subtitle=(
             "* = estimated (token-based limit is a guess, not an official cap)"
             " · red = alert · yellow = trending toward exhaustion"
             + (f" · {model_note}" if model_note else "")
         ),
-        border_style="blue",
+        border_style="bright_cyan",
     )
     if not alert_log:
         return Group(panel)
@@ -308,6 +317,7 @@ def _row(
     *,
     burn_rate: Forecast,
     predicted: Forecast | None = None,
+    retained: RetainedPrediction | None = None,
     show_risk: bool = False,
 ) -> tuple[str, ...]:
     window = forecast.window
@@ -322,7 +332,7 @@ def _row(
         _status_label(forecast),
         burn,
         _fmt_dt(burn_rate.eta_calendar, tz),
-        _fmt_predicted_eta(burn_rate, predicted, tz),
+        _fmt_predicted_eta(burn_rate, predicted, retained, tz),
         _fmt_dt(resets_dt, tz),
         *((_fmt_risk(predicted or forecast),) if show_risk else ()),
         forecast.confidence or "—",
@@ -341,24 +351,35 @@ def _fmt_burn(forecast: Forecast) -> str:
 
 
 def _fmt_predicted_eta(
-    burn_rate: Forecast, predicted: Forecast | None, tz: tzinfo
+    burn_rate: Forecast,
+    predicted: Forecast | None,
+    retained: RetainedPrediction | None,
+    tz: tzinfo,
 ) -> str:
     """ "Given how you actually use this across a week, when do you run out."
 
-    Two ways to answer that, and the better one wins when it's available:
+    Three ways to answer that, and the better one wins when it's available:
     the simulated hour-of-week profile LEARNED from your token history
     (shown as a P50 → P90 band, because a band is the honest shape for
     bursty usage — a bare "Thu 15:00" implies precision the data doesn't
-    have), or, while that profile is still thin, the working hours you
-    DECLARED in config. The presence of a band is what distinguishes them.
+    have), its latest compatible saved result when stale cycle metadata stops
+    a fresh simulation, or, while that profile is still thin, the working
+    hours you DECLARED in config. Labels distinguish the single-value cases.
 
     This is deliberately a different question from the burn-rate ETA beside
     it, which asks "at the measured rate, projected around the clock."""
     if predicted is not None and predicted.eta_p50 is not None:
         if predicted.eta_p90 is None:
-            return _fmt_dt(predicted.eta_p50, tz)
+            return f"P50 {_fmt_dt(predicted.eta_p50, tz)}"
         return f"{_fmt_dt(predicted.eta_p50, tz)} → {_fmt_dt(predicted.eta_p90, tz)}"
-    return _fmt_dt(burn_rate.eta_workhours, tz)
+    if retained is not None:
+        if retained.eta_p90 is None:
+            return f"saved P50 {_fmt_dt(retained.eta_p50, tz)}"
+        return (
+            f"saved {_fmt_dt(retained.eta_p50, tz)} → {_fmt_dt(retained.eta_p90, tz)}"
+        )
+    workhours = _fmt_dt(burn_rate.eta_workhours, tz)
+    return f"hours {workhours}" if workhours != "—" else workhours
 
 
 def _fmt_risk(forecast: Forecast) -> str:

@@ -3,6 +3,9 @@ events, alert_state round trip, and survival across a reopen."""
 
 from __future__ import annotations
 
+import dataclasses
+from datetime import datetime, timezone
+
 from tokenwatchdog.models import Forecast, Provider, Window, WindowKind
 from tokenwatchdog.store import Store
 
@@ -127,6 +130,73 @@ def test_prune_older_than_removes_old_rows(store):
     store.prune_older_than(500.0)
     rows = store.recent_samples(Provider.CODEX, WindowKind.WEEKLY, since_ts=0.0)
     assert [r.source_ts for r in rows] == [900.0]
+
+
+def test_latest_non_idle_forecast_survives_idle_rows_and_reopen(tmp_path):
+    db_path = tmp_path / "history.db"
+    store = Store(db_path)
+    saved = dataclasses.replace(
+        _forecast(),
+        model_name="montecarlo",
+        eta_calendar=datetime.fromtimestamp(1200.0, tz=timezone.utc),
+        eta_p50=datetime.fromtimestamp(1200.0, tz=timezone.utc),
+        eta_p90=datetime.fromtimestamp(1400.0, tz=timezone.utc),
+    )
+    store.insert_forecast(made_at=700.0, forecast=saved)
+    store.insert_forecast(
+        made_at=800.0,
+        forecast=dataclasses.replace(
+            saved,
+            status="IDLE",
+            eta_calendar=None,
+            eta_p50=None,
+            eta_p90=None,
+        ),
+    )
+    store.close()
+
+    reopened = Store(db_path)
+    row = reopened.latest_non_idle_forecast(
+        Provider.CODEX,
+        WindowKind.WEEKLY,
+        "montecarlo",
+        at_or_before=900.0,
+    )
+    assert row is not None
+    assert row.made_at == 700.0
+    assert row.used_percent == 42.0
+    assert row.eta_p50 == 1200.0
+    assert row.eta_p90 == 1400.0
+    reopened.close()
+
+
+def test_latest_non_idle_forecast_returns_a_reset_barrier(store):
+    saved = dataclasses.replace(
+        _forecast(),
+        model_name="montecarlo",
+        eta_calendar=datetime.fromtimestamp(1200.0, tz=timezone.utc),
+        eta_p50=datetime.fromtimestamp(1200.0, tz=timezone.utc),
+    )
+    store.insert_forecast(made_at=700.0, forecast=saved)
+    store.insert_forecast(
+        made_at=800.0,
+        forecast=dataclasses.replace(
+            saved,
+            status="RESET_PENDING",
+            eta_calendar=None,
+            eta_p50=None,
+        ),
+    )
+
+    row = store.latest_non_idle_forecast(
+        Provider.CODEX,
+        WindowKind.WEEKLY,
+        "montecarlo",
+        at_or_before=900.0,
+    )
+    assert row is not None
+    assert row.status == "RESET_PENDING"
+    assert row.eta_p50 is None
 
 
 def test_reset_history_clears_saved_data_and_durably_rejects_old_logs(tmp_path):

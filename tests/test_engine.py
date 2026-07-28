@@ -6,9 +6,12 @@ end-to-end without touching real Codex/Claude data on disk.
 
 from __future__ import annotations
 
+import dataclasses
+from datetime import datetime, timezone
+
 from tokenwatchdog.config import load_config
 from tokenwatchdog.engine import Engine
-from tokenwatchdog.models import Provider, Window, WindowKind
+from tokenwatchdog.models import Forecast, Provider, Window, WindowKind
 from tokenwatchdog.store import Store
 
 
@@ -125,3 +128,167 @@ def test_tick_fires_threshold_alert_once(tmp_path):
 
     second = engine.tick(now=1010.0)
     assert len(second.alerts) == 0
+
+
+def _saved_prediction(window: Window, *, status: str = "OK") -> Forecast:
+    eta_p50 = datetime.fromtimestamp(21_000.0, tz=timezone.utc)
+    return Forecast(
+        window=window,
+        status=status,
+        model_name="montecarlo",
+        burn_per_hour=1.0,
+        time_to_reset_h=None,
+        eta_calendar=eta_p50 if status == "OK" else None,
+        eta_workhours=None,
+        eta_p50=eta_p50 if status == "OK" else None,
+        eta_p90=(
+            datetime.fromtimestamp(22_000.0, tz=timezone.utc)
+            if status == "OK"
+            else None
+        ),
+        prob_exhaust_before_reset=None,
+        confidence="medium",
+        exhausts_before_reset=False,
+        n_samples=5,
+    )
+
+
+def test_idle_tick_recovers_saved_prediction_after_restart(tmp_path):
+    """The fallback comes from SQLite, not process memory, and repeated idle
+    ticks do not bury it under newer blank IDLE rows."""
+    db_path = tmp_path / "history.db"
+    current_window = Window(
+        provider=Provider.CLAUDE,
+        kind=WindowKind.W5H,
+        used_percent=73.0,
+        window_minutes=300,
+        resets_at=None,
+        source_ts=19_000.0,
+        is_estimated=False,
+        source_file="fake",
+    )
+    store = Store(db_path)
+    store.insert_forecast(made_at=19_500.0, forecast=_saved_prediction(current_window))
+    store.close()
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[windows]\nwatch = ["w5h"]\n')
+    engine = Engine(
+        cfg=load_config(config_path),
+        store=Store(db_path),
+        providers=[_FakeProvider([current_window])],
+    )
+
+    first = engine.tick(now=20_000.0)
+    current_mc = first.forecast_from("montecarlo", current_window)
+    assert current_mc is not None
+    assert current_mc.status == "IDLE"
+    assert current_mc.eta_p50 is None
+    retained = first.retained_prediction_for(current_window)
+    assert retained is not None
+    assert retained.used_percent == 73.0
+    assert retained.eta_p50.timestamp() == 21_000.0
+    assert retained.eta_p90 is not None
+    assert retained.eta_p90.timestamp() == 22_000.0
+
+    second = engine.tick(now=20_060.0)
+    assert second.retained_prediction_for(current_window) == retained
+
+
+def test_newer_reset_pending_result_blocks_an_old_saved_prediction(tmp_path):
+    db_path = tmp_path / "history.db"
+    current_window = Window(
+        provider=Provider.CLAUDE,
+        kind=WindowKind.W5H,
+        used_percent=73.0,
+        window_minutes=300,
+        resets_at=None,
+        source_ts=19_000.0,
+        is_estimated=False,
+        source_file="fake",
+    )
+    store = Store(db_path)
+    saved = _saved_prediction(current_window)
+    store.insert_forecast(made_at=19_400.0, forecast=saved)
+    store.insert_forecast(
+        made_at=19_500.0,
+        forecast=dataclasses.replace(
+            saved,
+            status="RESET_PENDING",
+            eta_calendar=None,
+            eta_p50=None,
+            eta_p90=None,
+        ),
+    )
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[windows]\nwatch = ["w5h"]\n')
+    engine = Engine(
+        cfg=load_config(config_path),
+        store=store,
+        providers=[_FakeProvider([current_window])],
+    )
+
+    state = engine.tick(now=20_000.0)
+    assert state.retained_prediction_for(current_window) is None
+
+
+def test_saved_prediction_requires_the_same_usage_level_and_a_future_p50(tmp_path):
+    db_path = tmp_path / "history.db"
+    saved_window = Window(
+        provider=Provider.CLAUDE,
+        kind=WindowKind.W5H,
+        used_percent=72.0,
+        window_minutes=300,
+        resets_at=None,
+        source_ts=19_000.0,
+        is_estimated=False,
+        source_file="fake",
+    )
+    current_window = dataclasses.replace(saved_window, used_percent=73.0)
+    store = Store(db_path)
+    store.insert_forecast(made_at=19_500.0, forecast=_saved_prediction(saved_window))
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[windows]\nwatch = ["w5h"]\n')
+    engine = Engine(
+        cfg=load_config(config_path),
+        store=store,
+        providers=[_FakeProvider([current_window])],
+    )
+
+    state = engine.tick(now=20_000.0)
+    assert state.retained_prediction_for(current_window) is None
+
+    matching_window = dataclasses.replace(current_window, used_percent=72.0)
+    engine._providers = [_FakeProvider([matching_window])]
+    after_eta = engine.tick(now=21_001.0)
+    assert after_eta.retained_prediction_for(matching_window) is None
+
+
+def test_current_censored_idle_result_beats_an_older_saved_band(tmp_path):
+    """A blank P50 from a simulation that actually ran means the median
+    future survives. It must not be replaced with yesterday's rosier band."""
+    window = Window(
+        provider=Provider.CLAUDE,
+        kind=WindowKind.W5H,
+        used_percent=73.0,
+        window_minutes=300,
+        resets_at=None,
+        source_ts=19_000.0,
+        is_estimated=False,
+        source_file="fake",
+    )
+    engine = _make_engine(tmp_path, windows=[window], watch=("w5h",))
+    engine.store.insert_forecast(made_at=19_500.0, forecast=_saved_prediction(window))
+    current = dataclasses.replace(
+        _saved_prediction(window),
+        status="IDLE",
+        eta_calendar=None,
+        eta_p50=None,
+        eta_p90=None,
+        confidence="medium",
+        prob_exhaust_before_reset=0.3,
+    )
+
+    assert engine._retained_prediction_for(current, now=20_000.0) is None

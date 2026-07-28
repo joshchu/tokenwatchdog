@@ -114,6 +114,23 @@ class Forecast:
 
 
 @dataclass(frozen=True)
+class RetainedPrediction:
+    """A saved percentile forecast shown when the current idle forecast
+    cannot safely recompute one.
+
+    This is deliberately separate from Forecast: it is presentation context,
+    not a new model result, and must never drive alerts or model scoring.
+    """
+
+    provider: Provider
+    kind: WindowKind
+    made_at: float
+    used_percent: float
+    eta_p50: datetime
+    eta_p90: datetime | None
+
+
+@dataclass(frozen=True)
 class Alert:
     """One fired notification for a (provider, window kind, alert kind)."""
 
@@ -143,6 +160,11 @@ class MonitorState:
     # disagreement is itself information. Also what makes each model's
     # accuracy measurable against the same moments (see scoring.py).
     all_forecasts: tuple[Forecast, ...] = ()
+    # The latest still-valid persisted Monte Carlo result for an idle window
+    # whose current forecast cannot produce a percentile. Kept out of
+    # all_forecasts so alerts and scoring never mistake a retained display
+    # value for a fresh model output.
+    retained_predictions: tuple[RetainedPrediction, ...] = ()
 
     def forecast_from(self, model_name: str, window: Window) -> Forecast | None:
         for forecast in self.all_forecasts:
@@ -152,4 +174,13 @@ class MonitorState:
                 and forecast.window.kind is window.kind
             ):
                 return forecast
+        return None
+
+    def retained_prediction_for(self, window: Window) -> RetainedPrediction | None:
+        for prediction in self.retained_predictions:
+            if (
+                prediction.provider is window.provider
+                and prediction.kind is window.kind
+            ):
+                return prediction
         return None

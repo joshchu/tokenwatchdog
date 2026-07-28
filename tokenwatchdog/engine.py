@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
+from datetime import datetime, timezone
 
 from tokenwatchdog.alerts import evaluate as evaluate_alerts
 from tokenwatchdog.config import Config, load_config
@@ -17,8 +18,10 @@ from tokenwatchdog.models import (
     Forecast,
     MonitorState,
     Provider,
+    RetainedPrediction,
     Window,
     WindowKind,
+    window_duration_seconds,
 )
 from tokenwatchdog.notify import notify
 from tokenwatchdog.predictor import (
@@ -90,6 +93,7 @@ class Engine:
 
         forecasts: list[Forecast] = []
         all_forecasts: list[Forecast] = []
+        retained_predictions: list[RetainedPrediction] = []
         alerts: list[Alert] = []
         for provider_enum, kind in self._watched_pairs():
             matched_window = windows_by_key.get((provider_enum, kind))
@@ -111,6 +115,11 @@ class Engine:
                 for candidate in produced.values():
                     self.store.insert_forecast(made_at=now, forecast=candidate)
                 all_forecasts.extend(produced.values())
+                retained = self._retained_prediction_for(
+                    produced.get("montecarlo"), now
+                )
+                if retained is not None:
+                    retained_predictions.append(retained)
                 forecast = produced[self._predictor.name]
             forecasts.append(forecast)
 
@@ -125,6 +134,66 @@ class Engine:
             forecasts=tuple(forecasts),
             alerts=tuple(alerts),
             all_forecasts=tuple(all_forecasts),
+            retained_predictions=tuple(retained_predictions),
+        )
+
+    def _retained_prediction_for(
+        self, current: Forecast | None, now: float
+    ) -> RetainedPrediction | None:
+        """Recover a still-useful saved band for an otherwise blank idle row.
+
+        The latest non-idle result is a barrier as well as a candidate: a
+        newer RESET_PENDING or OK-without-percentiles row invalidates any
+        older band. The saved usage level must exactly match the level still
+        displayed, and no snapshot survives longer than one quota window.
+        """
+        if (
+            current is None
+            or current.status != "IDLE"
+            or current.eta_p50 is not None
+            # A confidence rating means Monte Carlo actually ran. Its blank
+            # P50 is then a real censored result ("most futures survive"),
+            # which must win over an older saved band. The fallback is only
+            # for the status-only path where stale cycle state prevented a
+            # fresh simulation.
+            or current.confidence is not None
+        ):
+            return None
+
+        window = current.window
+        saved = self.store.latest_non_idle_forecast(
+            window.provider,
+            window.kind,
+            current.model_name,
+            at_or_before=now,
+        )
+        if (
+            saved is None
+            or saved.status != "OK"
+            or saved.eta_p50 is None
+            or saved.used_percent != window.used_percent
+        ):
+            return None
+
+        duration = window_duration_seconds(window.kind)
+        if saved.made_at < now - duration or saved.eta_p50 <= now:
+            return None
+        if window.resets_at is not None:
+            cycle_started_at = window.resets_at - duration
+            if now >= window.resets_at or saved.made_at < cycle_started_at:
+                return None
+
+        return RetainedPrediction(
+            provider=window.provider,
+            kind=window.kind,
+            made_at=saved.made_at,
+            used_percent=saved.used_percent,
+            eta_p50=datetime.fromtimestamp(saved.eta_p50, tz=timezone.utc),
+            eta_p90=(
+                datetime.fromtimestamp(saved.eta_p90, tz=timezone.utc)
+                if saved.eta_p90 is not None
+                else None
+            ),
         )
 
     def _forecast_for(
