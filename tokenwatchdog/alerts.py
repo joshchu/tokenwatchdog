@@ -12,38 +12,13 @@ from tokenwatchdog.models import (
     Provider,
     Window,
     WindowKind,
-    window_duration_seconds,
+    level_still_in_cycle,
 )
 from tokenwatchdog.store import AlertStateRow, Store
 
 
 def alert_key(provider: Provider, kind: WindowKind, alert_kind: AlertKind) -> str:
     return f"{provider.value}:{kind.value}:{alert_kind}"
-
-
-def level_still_in_cycle(window: Window, now: float) -> bool:
-    """Whether `window.used_percent` still describes the live cycle.
-
-    Staleness is a fact about a *rate*, not a *level*: quota does not
-    un-consume while you're away, so a reading of 100% taken six hours ago
-    against a window that resets in four days is still exactly 100% now.
-    Requires a known `resets_at` — without one we can't establish that no
-    reset has happened since, and inventing that certainty is what this
-    check exists to avoid.
-
-    Both halves are load-bearing. `now < resets_at` alone is not enough,
-    because a derived `resets_at` is advanced by whole cycles when its
-    projection has already elapsed (see `predictor._derive_resets_at`) — so
-    the very passage of a reset boundary manufactures a *future* reset time,
-    and a long-dead reading would read as "still in cycle" on the strength
-    of it. A 26-hour-old 95% reading of a FIVE-hour window did exactly that,
-    firing a threshold alert and then re-firing every five hours as the
-    phantom reset advanced again. The reading must also fall inside the
-    cycle that ends at `resets_at`."""
-    if window.resets_at is None or now >= window.resets_at:
-        return False
-    cycle_started_at = window.resets_at - window_duration_seconds(window.kind)
-    return window.source_ts >= cycle_started_at
 
 
 def evaluate(forecast: Forecast, cfg: Config, store: Store, now: float) -> list[Alert]:

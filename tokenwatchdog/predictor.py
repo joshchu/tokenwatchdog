@@ -40,6 +40,7 @@ from tokenwatchdog.models import (
     Provider,
     Window,
     WindowKind,
+    level_still_in_cycle,
     window_duration_seconds,
 )
 from tokenwatchdog.scoring import better_model, score_model
@@ -180,7 +181,12 @@ class MonteCarloPredictor:
             if resets_at is not None:
                 window = replace(window, resets_at=resets_at)
 
-        if _is_rate_stale(window, cfg, now):
+        rate_is_stale = _is_rate_stale(window, cfg, now)
+        if rate_is_stale and not level_still_in_cycle(window, now):
+            # A learned rhythm can outlive the recent burn rate, but it still
+            # needs a trustworthy starting level. If the last reading cannot
+            # be proved to belong to the current quota cycle, simulating from
+            # its used_percent would manufacture a prediction from stale state.
             return _status_only_forecast(
                 window,
                 self.name,
@@ -189,6 +195,7 @@ class MonteCarloPredictor:
                 now=now,
                 resets_at=resets_at,
             )
+        forecast_status: ForecastStatus = "IDLE" if rate_is_stale else "OK"
         if block.block_started_at is not None and len(block.samples) < 2:
             return _status_only_forecast(
                 window,
@@ -209,7 +216,7 @@ class MonteCarloPredictor:
             return _status_only_forecast(
                 window,
                 self.name,
-                status="OK",
+                status=forecast_status,
                 n_samples=len(block.samples),
                 now=now,
                 resets_at=resets_at,
@@ -300,7 +307,7 @@ class MonteCarloPredictor:
             # reason to simulate rather than extrapolate.
             return Forecast(
                 window=window,
-                status="OK",
+                status=forecast_status,
                 model_name=self.name,
                 burn_per_hour=mean_burn,
                 time_to_reset_h=time_to_reset_h,
@@ -329,7 +336,7 @@ class MonteCarloPredictor:
 
         return Forecast(
             window=window,
-            status="OK",
+            status=forecast_status,
             model_name=self.name,
             burn_per_hour=mean_burn,
             time_to_reset_h=time_to_reset_h,

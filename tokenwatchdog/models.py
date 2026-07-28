@@ -61,6 +61,25 @@ class Window:
     source_file: str
 
 
+def level_still_in_cycle(window: Window, now: float) -> bool:
+    """Whether `window.used_percent` still describes the live cycle.
+
+    Staleness is a fact about a *rate*, not a *level*: quota does not
+    un-consume while you're away, so a reading of 100% taken six hours ago
+    against a window that resets in four days is still exactly 100% now.
+    Requires a known `resets_at` — without one we can't establish that no
+    reset has happened since.
+
+    `now < resets_at` alone is not enough because a derived reset can advance
+    by whole cycles after its original boundary. The reading must also fall
+    inside the cycle that ends at `resets_at`.
+    """
+    if window.resets_at is None or now >= window.resets_at:
+        return False
+    cycle_started_at = window.resets_at - window_duration_seconds(window.kind)
+    return window.source_ts >= cycle_started_at
+
+
 @dataclass(frozen=True)
 class Forecast:
     """A predictor's exhaustion estimate for one Window, as of `now`."""

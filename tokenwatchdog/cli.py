@@ -21,10 +21,9 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-from tokenwatchdog.alerts import level_still_in_cycle
 from tokenwatchdog.config import Config, load_config, resolve_timezone
 from tokenwatchdog.engine import Engine
-from tokenwatchdog.models import Alert, Forecast, MonitorState
+from tokenwatchdog.models import Alert, Forecast, MonitorState, level_still_in_cycle
 from tokenwatchdog.store import Store
 
 try:

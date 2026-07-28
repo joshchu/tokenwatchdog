@@ -66,7 +66,8 @@ enough that it will run out before the window naturally resets.
   declines rather than switching on a sample too small to mean anything
 - Staleness applies to the burn *rate*, not the used-% *level*: quota doesn't
   un-consume while you're away, so a 100%-used reading still alerts once its
-  cycle is confirmed live, while nothing extrapolates from a stale rate
+  cycle is confirmed live. The burn-rate ETA disappears when that rate is
+  stale, while the learned prediction may continue from an in-cycle level
 - `scripts/backtest.py` replays your stored history to score each predictor
   (ETA coverage, mean error, bias, P90 calibration), so "which model is
   better" is a measurement rather than an argument
@@ -142,7 +143,7 @@ time is never misread as UTC.
 | **Status** | `ok` — live, and not on pace to exhaust. `🔥 burning` — on pace to hit 100% before the reset. `idle` — the newest reading is older than this window's staleness threshold (10 min for 5-hour, 3 h for weekly, both configurable), so no *rate* can be measured; the **Used %** level still counts. `reset_pending` — the window just turned over and there's only one reading in the new cycle. `no_data` — the provider isn't reporting this window at all (today, Codex's 5-hour). |
 | **Burn %/h** | Percent of *this window's* quota consumed per hour at the currently measured rate — not tokens per hour, and not a share of anything else, so it divides straight into the percent remaining. Normally measured from real token throughput and converted by the percent-per-token calibration; a trailing `~` means it fell back to the slope of the reported percentage itself, which is quantized to whole numbers and therefore coarse. `—` on any row that isn't live (`idle`, `no_data`, `reset_pending`), because a rate is the one thing a stale reading can't support. |
 | **ETA on burn %/h** | When the window runs out if the displayed recent burn rate continues around the clock. It is the direct counterpart to **Burn %/h**: percent remaining divided by that rate, rendered as a weekday and time. |
-| **Predicted ETA** | When it runs out *given how you actually use this across a week*. Shown as a `P50 → P90` band once the hour-of-week profile has learned your pattern from token history, or as a single working-hours projection from your configured `working_hours` while that profile is thin. The band is the honest shape for bursty usage; a bare timestamp would imply precision the data doesn't have. |
+| **Predicted ETA** | When it runs out *given how you actually use this across a week*. Shown as a `P50 → P90` band once the hour-of-week profile has learned your pattern from token history, or as a single working-hours projection from your configured `working_hours` while that profile is thin. Unlike the burn-rate ETA, the learned band can remain while the row is `idle`, provided the last-used level can still be proven to belong to the current quota cycle. The band is the honest shape for bursty usage; a bare timestamp would imply precision the data doesn't have. |
 | **Resets** | When this window's quota refills. Reported directly by Codex; for Claude, computed from the 5-hour block anchor, or `—` for the weekly window until a reset is actually observed. |
 | **Risk** | Probability of exhausting before that reset — the share of simulated futures that reach 100% in time. Worth seeing separately from the ETA: a 40% chance of running out matters even when the median future doesn't. Only present while a simulating model is running, and the column is hidden entirely when no model produces one. |
 | **Conf.** | How much evidence is behind the estimate: `high` at 10+ observations, `medium` at 3+, else `low`. The hour-of-week models additionally downgrade it by how much of the period being projected actually has data (below 50% coverage is `low` regardless); coverage can only lower a rating, never raise it. Under the default `linear` there's no profile to cover, so what you see is the observation count alone. |
@@ -152,10 +153,11 @@ reset — or at the window's duration when no reset is known yet — so an ETA i
 strictly less than a week out and the weekday is unambiguous (assuming a
 provider-reported reset really is the next one; nothing re-clamps it).
 
-A blank ETA is a real answer rather than a missing one, but it has more than
-one meaning: exhaustion isn't reachable before the reset, *or* there was no
-defensible forecast to make — an `idle`/`no_data`/`reset_pending` row, or too
-little history. The **Status** column is what distinguishes them.
+A blank ETA is a real answer rather than a missing one. **ETA on burn %/h**
+is blank on an `idle`, `no_data`, or `reset_pending` row because there is no
+live rate to extend. **Predicted ETA** may remain on an `idle` row; it is blank
+when the last-used level cannot be tied to the current cycle, the history is
+too thin, or most simulated futures survive until the reset.
 
 Row colors track the alert conditions closely: **red** for something that
 fired or would fire (over the warn threshold, or burning with an imminent
@@ -237,7 +239,10 @@ rather than no data at all — which is what lets it learn that you don't burn
 quota overnight, instead of filling those hours in from your daytime average.
 While the profile is still thin, **Predicted ETA** falls back to the working
 hours you declared in config: the burn budget run through only those intervals
-instead of treating every hour as billable.
+instead of treating every hour as billable. Once learned, the prediction keeps
+advancing through an idle period while the last-used percentage is known to
+remain in the current cycle. It does not revive an expired or unknown-cycle
+reading, and its `idle` status continues to suppress burn-rate alerts.
 
 `predictor.model` picks which of the two is *authoritative* — the one alerts
 fire from. `"auto"` decides that by grading both against your own stored

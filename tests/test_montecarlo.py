@@ -100,13 +100,41 @@ def test_simulation_is_capped_at_an_imminent_reset(cfg):
     assert forecast.exhausts_before_reset is False
 
 
-def test_idle_short_circuits_before_simulating(cfg):
+def test_idle_with_a_valid_current_level_still_predicts_from_learned_rhythm(cfg):
     now = 1_000_000.0
-    stale_ts = now - cfg.thresholds.stale_after_minutes_w5h * 60 - 60
-    window = _window(WindowKind.W5H, 50.0, stale_ts)
+    stale_ts = now - cfg.thresholds.stale_after_minutes_weekly * 60 - 60
+    resets_at = now + 60 * 3600
+    history = []
+    ts = stale_ts - 5 * 24 * 3600
+    percent = 0.0
+    while ts <= stale_ts:
+        history.append(_sample(ts, percent))
+        percent += 2.0
+        if percent >= 95.0:
+            percent = 0.0
+        ts += 3600
+    window = _window(WindowKind.WEEKLY, history[-1].used_percent, stale_ts, resets_at)
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.status == "IDLE"
+    assert forecast.eta_p50 is not None
+    assert forecast.eta_p90 is not None
+    assert forecast.prob_exhaust_before_reset is not None
+    assert forecast.confidence is not None
+
+
+def test_idle_with_a_level_from_an_old_cycle_still_short_circuits(cfg):
+    now = 1_000_000.0
+    resets_at = now + 60 * 3600
+    old_source_ts = now - 8 * 24 * 3600
+    window = _window(WindowKind.WEEKLY, 50.0, old_source_ts, resets_at)
+
     forecast = MonteCarloPredictor().forecast(window, [], [], cfg, now)
+
     assert forecast.status == "IDLE"
     assert forecast.eta_p50 is None
+    assert forecast.prob_exhaust_before_reset is None
 
 
 def test_reset_pending_short_circuits_before_simulating(cfg):

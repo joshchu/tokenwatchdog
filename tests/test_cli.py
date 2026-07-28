@@ -161,6 +161,38 @@ def test_burn_eta_stays_linear_when_predicted_model_is_authoritative(cfg):
     assert row[6] == "Tue 12:00 → Wed 12:00"
 
 
+def test_predicted_eta_remains_visible_when_the_recent_rate_is_idle():
+    window = _window()
+    idle_burn_rate = dataclasses.replace(
+        _forecast(window),
+        status="IDLE",
+        burn_per_hour=0.0,
+        eta_calendar=None,
+        eta_workhours=None,
+        confidence=None,
+    )
+    idle_prediction = dataclasses.replace(
+        _forecast(window),
+        status="IDLE",
+        model_name="montecarlo",
+        eta_calendar=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p50=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p90=datetime(2026, 7, 29, 12, tzinfo=timezone.utc),
+    )
+
+    row = _row(
+        idle_burn_rate,
+        timezone.utc,
+        burn_rate=idle_burn_rate,
+        predicted=idle_prediction,
+    )
+
+    assert row[3] == "idle"
+    assert row[4] == "—"
+    assert row[5] == "—"
+    assert row[6] == "Tue 12:00 → Wed 12:00"
+
+
 def test_render_with_alerts_shows_the_alert_panel_and_message(cfg):
     window = _window(used_percent=95.0)
     alert = Alert(
