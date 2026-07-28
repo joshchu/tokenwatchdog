@@ -13,7 +13,7 @@ import pytest
 from rich.console import Console
 
 import tokenwatchdog.cli as cli_module
-from tokenwatchdog.cli import _render, _row_style, _spacebar_pressed
+from tokenwatchdog.cli import _render, _row, _row_style, _spacebar_pressed
 from tokenwatchdog.models import (
     Alert,
     Forecast,
@@ -62,8 +62,8 @@ def _forecast(window):
     )
 
 
-def _render_to_text(renderable) -> str:
-    console = Console(width=120, record=True)
+def _render_to_text(renderable, *, width=120) -> str:
+    console = Console(width=width, record=True)
     console.print(renderable)
     return console.export_text()
 
@@ -109,6 +109,56 @@ def test_render_without_alerts_has_no_alert_panel(cfg):
     )
     text = _render_to_text(_render(state, cfg, []))
     assert "Recent alerts" not in text
+
+
+def test_eta_headers_name_the_rate_and_prediction_questions(cfg):
+    window = _window()
+    state = MonitorState(
+        now=1000.0, windows=(window,), forecasts=(_forecast(window),), alerts=()
+    )
+    text = _render_to_text(_render(state, cfg, []), width=200)
+
+    assert "ETA on burn %/h" in text
+    assert "Predicted ETA" in text
+    assert "ETA trend" not in text
+    assert "ETA rhythm" not in text
+
+
+def test_burn_eta_stays_linear_when_predicted_model_is_authoritative(cfg):
+    window = _window()
+    linear = dataclasses.replace(
+        _forecast(window),
+        burn_per_hour=2.0,
+        eta_calendar=datetime(2026, 7, 27, 10, tzinfo=timezone.utc),
+    )
+    predicted = dataclasses.replace(
+        _forecast(window),
+        model_name="montecarlo",
+        burn_per_hour=9.0,
+        eta_calendar=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p50=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p90=datetime(2026, 7, 29, 12, tzinfo=timezone.utc),
+    )
+    state = MonitorState(
+        now=1000.0,
+        windows=(window,),
+        forecasts=(predicted,),
+        alerts=(),
+        all_forecasts=(linear, predicted),
+    )
+
+    text = _render_to_text(_render(state, cfg, []), width=200)
+    assert "+2.00" in text
+    assert "+9.00" not in text
+
+    row = _row(
+        predicted,
+        timezone.utc,
+        burn_rate=linear,
+        predicted=predicted,
+    )
+    assert row[5] == "Mon 10:00"
+    assert row[6] == "Tue 12:00 → Wed 12:00"
 
 
 def test_render_with_alerts_shows_the_alert_panel_and_message(cfg):

@@ -50,12 +50,13 @@ enough that it will run out before the window naturally resets.
   default, or an opt-in Monte Carlo model that learns your hour-of-week usage
   rhythm from token history and simulates a P50/P90 exhaustion band plus a
   probability of running out before the reset, instead of one point guess
-- **Two ETAs side by side, because they answer different questions.** *Trend*
-  is the recent pace projected around the clock; *rhythm* is the same budget
-  spread over how you actually use it across a week — learned from your token
-  history as a P50 → P90 band, or from your configured working hours while
-  that profile is thin. Both models run every tick, so their disagreement is
-  visible rather than hidden behind a config switch
+- **Two ETAs side by side, because they answer different questions.**
+  **ETA on burn %/h** projects the displayed recent burn rate around the clock;
+  **Predicted ETA** spreads the same budget over how you actually use it
+  across a week — learned from your token history as a P50 → P90 band, or
+  from your configured working hours while that profile is thin. Both models
+  run every tick, so their disagreement is visible rather than hidden behind
+  a config switch
 - Each ETA is capped independently against the next reset — an ETA past the
   reset describes an event that can't happen, and no window is ever projected
   to take longer to exhaust than its own duration
@@ -140,8 +141,8 @@ time is never misread as UTC.
 | **Used %** | How much of the window is gone. Whole numbers, because that's the resolution both providers report. A trailing `*` means the number is not a percentage the provider stated: either it was computed from token counts against an unpublished limit (Claude's `tokens` source), or the row is `no_data` and the `0%` is a placeholder standing in for a reading that doesn't exist. Once the percentage pins at 100, what you've spent *past* the cap follows in parentheses — `100% (+7.5M)` for 7.5M tokens beyond it, or `100% (+$12.34)` once your plan's overage rates are configured. A percentage can't climb past 100, so that figure is the only thing still moving at the moment spending stops being free. It's absent for a source with no per-request token history (Claude Desktop), since there'd be nothing to sum. |
 | **Status** | `ok` — live, and not on pace to exhaust. `🔥 burning` — on pace to hit 100% before the reset. `idle` — the newest reading is older than this window's staleness threshold (10 min for 5-hour, 3 h for weekly, both configurable), so no *rate* can be measured; the **Used %** level still counts. `reset_pending` — the window just turned over and there's only one reading in the new cycle. `no_data` — the provider isn't reporting this window at all (today, Codex's 5-hour). |
 | **Burn %/h** | Percent of *this window's* quota consumed per hour at the currently measured rate — not tokens per hour, and not a share of anything else, so it divides straight into the percent remaining. Normally measured from real token throughput and converted by the percent-per-token calibration; a trailing `~` means it fell back to the slope of the reported percentage itself, which is quantized to whole numbers and therefore coarse. `—` on any row that isn't live (`idle`, `no_data`, `reset_pending`), because a rate is the one thing a stale reading can't support. |
-| **ETA trend** | When the window runs out projected around the clock, from whichever model is authoritative — the recent-pace question under the default `linear`, or the median simulated future if `montecarlo` is selected. Either way it's the urgent, right-now reading, and the one the "burning too fast" alert fires from. |
-| **ETA rhythm** | When it runs out *given how you actually use this across a week*. Shown as a `P50 → P90` band once the hour-of-week profile has learned your rhythm from token history, or as a single working-hours projection from your configured `working_hours` while that profile is thin. The band is the honest shape for bursty usage; a bare timestamp would imply precision the data doesn't have. |
+| **ETA on burn %/h** | When the window runs out if the displayed recent burn rate continues around the clock. It is the direct counterpart to **Burn %/h**: percent remaining divided by that rate, rendered as a weekday and time. |
+| **Predicted ETA** | When it runs out *given how you actually use this across a week*. Shown as a `P50 → P90` band once the hour-of-week profile has learned your pattern from token history, or as a single working-hours projection from your configured `working_hours` while that profile is thin. The band is the honest shape for bursty usage; a bare timestamp would imply precision the data doesn't have. |
 | **Resets** | When this window's quota refills. Reported directly by Codex; for Claude, computed from the 5-hour block anchor, or `—` for the weekly window until a reset is actually observed. |
 | **Risk** | Probability of exhausting before that reset — the share of simulated futures that reach 100% in time. Worth seeing separately from the ETA: a 40% chance of running out matters even when the median future doesn't. Only present while a simulating model is running, and the column is hidden entirely when no model produces one. |
 | **Conf.** | How much evidence is behind the estimate: `high` at 10+ observations, `medium` at 3+, else `low`. The hour-of-week models additionally downgrade it by how much of the period being projected actually has data (below 50% coverage is `low` regardless); coverage can only lower a rating, never raise it. Under the default `linear` there's no profile to cover, so what you see is the observation count alone. |
@@ -225,27 +226,30 @@ over that same span — and uses that ratio to turn recent tokens/hour into
 points, or one that ends pinned at 100%, and falls back to the percentage's
 own slope in those cases.
 
-Two models run each tick. The **trend** model is a robust (outlier-resistant)
-fit of that rate, projected forward to when usage would hit 100% — capped at
-the window's own reset, or at its duration when no reset time has been derived
-yet. The **rhythm** model buckets historical burn by hour-of-week and
-simulates thousands of random futures to produce a P50/P90 band and a
-probability of exhausting before the reset. Because that bucketing is built
-from token history, an hour with no requests contributes a real zero rather
-than no data at all — which is what lets it learn that you don't burn quota
-overnight, instead of filling those hours in from your daytime average. While
-the profile is still thin, the rhythm column falls back to the working hours
-you declared in config: the burn budget run through only those intervals
+Two models run each tick. **ETA on burn %/h** comes from a robust
+(outlier-resistant) fit of the recent rate, projected forward to when usage
+would hit 100% — capped at the window's own reset, or at its duration when no
+reset time has been derived yet. **Predicted ETA** buckets historical burn by
+hour-of-week and simulates thousands of random futures to produce a P50/P90
+band and a probability of exhausting before the reset. Because that bucketing
+is built from token history, an hour with no requests contributes a real zero
+rather than no data at all — which is what lets it learn that you don't burn
+quota overnight, instead of filling those hours in from your daytime average.
+While the profile is still thin, **Predicted ETA** falls back to the working
+hours you declared in config: the burn budget run through only those intervals
 instead of treating every hour as billable.
 
 `predictor.model` picks which of the two is *authoritative* — the one alerts
 fire from. `"auto"` decides that by grading both against your own stored
-forecasts, and stays on the trend model unless the other wins by a real
+forecasts, and stays on the burn-rate model unless the other wins by a real
 margin over enough scored episodes. It says which and why rather than
-switching silently.
+switching silently. That choice does not swap the dashboard columns: the
+burn-rate ETA remains beside **Burn %/h**, and the learned prediction remains
+under **Predicted ETA**.
 
-The "burning too fast" alert deliberately uses the trend projection, not the
-rhythm one: usage happening right now doesn't pause because it's 9pm.
+The "burning too fast" alert uses the authoritative model's ETA. With the
+default burn-rate model that is **ETA on burn %/h**; if the learned model
+eventually wins enough scored episodes, it becomes **Predicted ETA**.
 
 ## Status
 
@@ -256,8 +260,8 @@ binary and a menu-bar front-end are natural next steps but aren't built yet.
 Model selection is wired up but has not yet fired on real data: grading needs
 windows that actually reached 100%, and a weekly window supplies at most a
 couple of those a week, so `auto` currently reports "not enough scored
-history" and stays on the trend model. That's the intended behavior, not a
-gap — run `scripts/backtest.py` to see where your own history stands.
+history" and stays on the burn-rate model. That's the intended behavior, not
+a gap — run `scripts/backtest.py` to see where your own history stands.
 
 ## Limitations
 
@@ -308,8 +312,8 @@ gap — run `scripts/backtest.py` to see where your own history stands.
   direction: if the calibration cycle's usage was mostly invisible, the ratio
   is inflated by that share, and a later CLI-only burst gets multiplied by it
   — an overstated rate, which is the direction that fires the burn alert.
-  The rhythm model is skewed the other way, recording an hour burned only via
-  Desktop as a genuine zero.
+  The learned prediction is skewed the other way, recording an hour burned
+  only via Desktop as a genuine zero.
 
 ## Development
 

@@ -48,9 +48,11 @@ _BURN_EMOJI = "🔥"
 # the dashboard keeps a short, visible trail of what actually fired and why.
 _ALERT_LOG_SIZE = 10
 
-# Which model answers the "rhythm" question (see _fmt_rhythm). The other
-# column is whichever model is authoritative, answering the trend question.
-_RHYTHM_MODEL = "montecarlo"
+# Keep the two display questions stable even when `auto` changes which model
+# is authoritative for alerts: one is always the direct ETA implied by the
+# displayed burn rate, the other is always the learned-history prediction.
+_BURN_RATE_ETA_MODEL = "linear"
+_PREDICTED_ETA_MODEL = "montecarlo"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -222,9 +224,10 @@ def _render(
     model_choice_reason: str = "",
 ) -> Group:
     tz = resolve_timezone(cfg)
-    # All wall-clock columns below are already tz-converted (see _row/_fmt_dt)
-    # — label them with the actual abbreviation so a local time is never
-    # mistaken for UTC at a glance, matching the "updated ... EDT" header.
+    # All wall-clock values below are already tz-converted (see _row/_fmt_dt).
+    # The panel's "updated ... EDT" clock establishes their timezone, and the
+    # reset header repeats it; putting it on both ETA headers too costs scarce
+    # table width without adding another clock context.
     tz_label = datetime.fromtimestamp(state.now, tz=tz).strftime("%Z")
     # Only the simulating model produces a probability; without it the column
     # would be an always-empty stripe of width, which on a narrow terminal
@@ -239,8 +242,8 @@ def _render(
         "Used %",
         "Status",
         "Burn %/h",
-        f"ETA trend ({tz_label})",
-        f"ETA rhythm ({tz_label})",
+        "ETA on burn %/h",
+        "Predicted ETA",
         f"Resets ({tz_label})",
         *(("Risk",) if show_risk else ()),
         "Conf.",
@@ -250,11 +253,15 @@ def _render(
     for forecast in sorted(
         state.forecasts, key=lambda f: (f.window.provider.value, f.window.kind.value)
     ):
+        burn_rate = (
+            state.forecast_from(_BURN_RATE_ETA_MODEL, forecast.window) or forecast
+        )
         table.add_row(
             *_row(
                 forecast,
                 tz,
-                rhythm=state.forecast_from(_RHYTHM_MODEL, forecast.window),
+                burn_rate=burn_rate,
+                predicted=state.forecast_from(_PREDICTED_ETA_MODEL, forecast.window),
                 show_risk=show_risk,
             ),
             style=_row_style(forecast, cfg, state.now),
@@ -300,11 +307,12 @@ def _row(
     forecast: Forecast,
     tz: tzinfo,
     *,
-    rhythm: Forecast | None = None,
+    burn_rate: Forecast,
+    predicted: Forecast | None = None,
     show_risk: bool = False,
 ) -> tuple[str, ...]:
     window = forecast.window
-    burn = _fmt_burn(forecast)
+    burn = _fmt_burn(burn_rate)
     resets_dt = (
         datetime.fromtimestamp(window.resets_at, tz=tz) if window.resets_at else None
     )
@@ -314,10 +322,10 @@ def _row(
         _fmt_used(forecast),
         _status_label(forecast),
         burn,
-        _fmt_dt(forecast.eta_calendar, tz),
-        _fmt_rhythm(forecast, rhythm, tz),
+        _fmt_dt(burn_rate.eta_calendar, tz),
+        _fmt_predicted_eta(burn_rate, predicted, tz),
         _fmt_dt(resets_dt, tz),
-        *((_fmt_risk(rhythm or forecast),) if show_risk else ()),
+        *((_fmt_risk(predicted or forecast),) if show_risk else ()),
         forecast.confidence or "—",
     )
 
@@ -333,7 +341,9 @@ def _fmt_burn(forecast: Forecast) -> str:
     return f"{forecast.burn_per_hour:+.2f}{suffix}"
 
 
-def _fmt_rhythm(forecast: Forecast, rhythm: Forecast | None, tz: tzinfo) -> str:
+def _fmt_predicted_eta(
+    burn_rate: Forecast, predicted: Forecast | None, tz: tzinfo
+) -> str:
     """ "Given how you actually use this across a week, when do you run out."
 
     Two ways to answer that, and the better one wins when it's available:
@@ -343,14 +353,13 @@ def _fmt_rhythm(forecast: Forecast, rhythm: Forecast | None, tz: tzinfo) -> str:
     have), or, while that profile is still thin, the working hours you
     DECLARED in config. The presence of a band is what distinguishes them.
 
-    This is deliberately a different question from the trend column beside
-    it, which asks "at the pace of the last few hours, projected around the
-    clock." Both were already being computed; only one was ever shown."""
-    if rhythm is not None and rhythm.eta_p50 is not None:
-        if rhythm.eta_p90 is None:
-            return _fmt_dt(rhythm.eta_p50, tz)
-        return f"{_fmt_dt(rhythm.eta_p50, tz)} → {_fmt_dt(rhythm.eta_p90, tz)}"
-    return _fmt_dt(forecast.eta_workhours, tz)
+    This is deliberately a different question from the burn-rate ETA beside
+    it, which asks "at the measured rate, projected around the clock."""
+    if predicted is not None and predicted.eta_p50 is not None:
+        if predicted.eta_p90 is None:
+            return _fmt_dt(predicted.eta_p50, tz)
+        return f"{_fmt_dt(predicted.eta_p50, tz)} → {_fmt_dt(predicted.eta_p90, tz)}"
+    return _fmt_dt(burn_rate.eta_workhours, tz)
 
 
 def _fmt_risk(forecast: Forecast) -> str:
