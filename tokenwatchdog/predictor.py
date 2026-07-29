@@ -909,8 +909,8 @@ def _derive_resets_at(
        strongest evidence and INVALIDATES all older anchors — CLI activity
        can run continuously through an account boundary, leaving the
        token-log anchor pointing into the previous block. The anchor is the
-       earliest evidence at/after the boundary (first post-reset sample, or
-       an earlier token event if the CLI spoke first).
+       earliest positive-usage evidence at/after the boundary: a positive
+       first post-reset sample, a later 0→positive rise, or a token event.
     2. **Deterministic anchor** (5-hour window only, no fresh boundary).
        Two independent kinds of evidence bound where the block started: the
        last 0 → positive rise in the percentage series
@@ -952,16 +952,20 @@ def _derive_resets_at(
             # ran continuously through the boundary, so the token-log
             # anchor still said 09:24 and min() over it reported a reset
             # 2.6h early. The anchor is the earliest evidence AT/AFTER the
-            # boundary: the first post-reset sample, or an earlier token
-            # event if the CLI spoke first.
-            candidates = [boundary]
+            # boundary. The boundary sample itself is an anchor only when it
+            # already shows positive usage: a 100→0 drop proves the OLD block
+            # ended, but the next on-demand block does not exist until new
+            # activity starts it.
+            candidates = []
+            if block.samples and block.samples[0].used_percent > 0.0:
+                candidates.append(boundary)
             candidates.extend(
                 event.ts for event in token_events if event.ts >= boundary
             )
             rise = _sample_block_anchor(block.samples, duration, now)
             if rise is not None:
                 candidates.append(rise)  # block-scoped, so already >= boundary
-            return min(candidates) + duration
+            return min(candidates) + duration if candidates else None
         anchors = [_sample_block_anchor(block.samples, duration, now)]
         if token_events:
             anchors.append(block_anchor([e.ts for e in token_events], duration, now))
@@ -1289,7 +1293,7 @@ def _simulate_exhaustion_hours(
     remaining = 100.0 - used_percent
     checkpoint = (
         checkpoint_h
-        if checkpoint_h is not None and checkpoint_h <= horizon_hours
+        if checkpoint_h is not None and 0.0 <= checkpoint_h <= horizon_hours
         else None
     )
     if remaining <= 0:
@@ -1298,6 +1302,8 @@ def _simulate_exhaustion_hours(
     elapsed = 0.0
     cursor_ts = start_ts
     while elapsed < horizon_hours:
+        step_h = min(1.0, horizon_hours - elapsed)
+        step_end = elapsed + step_h
         bucket = _hour_of_week(cursor_ts, tz)
         values, cum_weights = buckets.get(bucket, ([], []))
         if not values:
@@ -1308,12 +1314,20 @@ def _simulate_exhaustion_hours(
             # slope, and simulating negative burn would un-consume quota.
             weight = 0.5 ** (elapsed / _LIVE_RATE_HALFLIFE_H)
             burn = weight * max(live_rate, 0.0) + (1.0 - weight) * burn
-        if checkpoint is not None and elapsed <= checkpoint < elapsed + 1.0:
+        if (
+            checkpoint is not None
+            and level_at_checkpoint is None
+            and elapsed <= checkpoint <= step_end
+        ):
             # Pro-rate the crossing hour so a fractional checkpoint reads
-            # the level mid-hour rather than a whole hour early.
+            # the level mid-hour rather than a whole hour early. The upper
+            # bound is inclusive: an integer checkpoint at the horizon is
+            # the end of this step, and there is no next iteration to capture
+            # it. Missing only the surviving runs there biased their mean
+            # toward the exhausted runs' 100%.
             partial = burn * (checkpoint - elapsed)
             level_at_checkpoint = min(100.0, 100.0 - remaining + partial)
-        if burn >= remaining:
+        if burn * step_h >= remaining:
             # Interpolate inside the hour it runs out in rather than
             # rounding up to the whole hour. Without this the simulation
             # can't express any exhaustion sooner than 60 minutes away --
@@ -1326,9 +1340,9 @@ def _simulate_exhaustion_hours(
             ):
                 level_at_checkpoint = 100.0
             return _SimulatedRun(exhausted_at, level_at_checkpoint)
-        remaining -= burn
-        elapsed += 1.0
-        cursor_ts += 3600.0
+        remaining -= burn * step_h
+        elapsed = step_end
+        cursor_ts += step_h * 3600.0
     return _SimulatedRun(None, level_at_checkpoint)
 
 

@@ -23,6 +23,7 @@ import bisect
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 from tokenwatchdog.models import WindowKind
 from tokenwatchdog.store import ForecastRow, SampleRow
@@ -275,6 +276,10 @@ def used_percent_at(
     well.
     """
     origin = samples[origin_index]
+    if target_ts < origin.source_ts:
+        return None
+    if target_ts == origin.source_ts:
+        return origin.used_percent
     if origin.resets_at is not None and target_ts > origin.resets_at:
         return None
     previous = origin
@@ -306,37 +311,74 @@ def score_dense(
 
     The prediction graded is the model's own `predicted_used_percent`
     (linear: the rate projection; the simulating model: its mean simulated
-    level — where the rhythm knowledge lives). Rows from before that
-    column existed fall back to used + burn·h, which was exact for linear
-    and approximate for the simulating model. This is the metric that
-    makes model selection decidable: exhaustion episodes arrive a couple
-    per week, dense moments arrive hundreds per day.
+    level — where the rhythm knowledge lives). A moment where EVERY model
+    predates that column falls back to used + burn·h, which was exact for
+    linear and approximate for the simulating model. A mixed real/NULL
+    moment is excluded: a current NULL can be a deliberate no-answer, and
+    inventing a fallback beside another model's real answer is not matched.
+    This is the metric that makes model selection decidable: exhaustion
+    episodes arrive a couple per week, dense moments arrive hundreds per day.
 
     Persistence (predicted = used% now) is computed on the same matched
     moments and carried in every result, so "beats persistence" is exact.
+
+    Duplicate rows from one model at the same made_at make the whole moment
+    ambiguous. There is no cohort id that can pair one restarted-tick row
+    with the other models, so the scorer drops it instead of dict-overwriting
+    an arbitrary answer and making model choice depend on query order.
     """
     errors: dict[str, list[float]] = {name: [] for name in model_names}
+    if not errors:
+        return {}
+    expected_names = set(errors)
     persistence_errors: list[float] = []
     for rows, samples, is_reset in pairs:
         source_times = [sample.source_ts for sample in samples]
-        by_moment: dict[float, dict[str, float]] = {}
+        by_moment: dict[float, dict[str, list[ForecastRow]]] = {}
         for row in rows:
-            if row.model_name not in errors or row.status != "OK":
+            if row.model_name not in errors:
                 continue
-            if row.used_percent >= _EXHAUSTED_PERCENT:
-                continue
-            prediction = row.predicted_used_percent
-            if prediction is None and row.burn_per_hour is not None:
-                prediction = min(
-                    100.0, max(0.0, row.used_percent + row.burn_per_hour * horizon_h)
-                )
-            if prediction is None:
-                continue
-            by_moment.setdefault(row.made_at, {})[row.model_name] = prediction
+            by_moment.setdefault(row.made_at, {}).setdefault(row.model_name, []).append(
+                row
+            )
         for made_at in sorted(by_moment):
-            predictions = by_moment[made_at]
-            if len(predictions) != len(model_names):
-                continue  # not every model answered here — unmatched
+            candidates = by_moment[made_at]
+            if set(candidates) != expected_names or any(
+                len(own_rows) != 1 for own_rows in candidates.values()
+            ):
+                continue
+            selected = {name: candidates[name][0] for name in expected_names}
+            if any(
+                row.status != "OK" or row.used_percent >= _EXHAUSTED_PERCENT
+                for row in selected.values()
+            ):
+                continue
+            recorded = [
+                row.predicted_used_percent is not None for row in selected.values()
+            ]
+            if any(recorded) and not all(recorded):
+                continue
+            if all(recorded):
+                predictions = {
+                    name: row.predicted_used_percent for name, row in selected.items()
+                }
+                assert all(
+                    prediction is not None for prediction in predictions.values()
+                )
+            else:
+                if any(row.burn_per_hour is None for row in selected.values()):
+                    continue
+                predictions = {
+                    name: min(
+                        100.0,
+                        max(
+                            0.0,
+                            row.used_percent
+                            + cast(float, row.burn_per_hour) * horizon_h,
+                        ),
+                    )
+                    for name, row in selected.items()
+                }
             index = _origin_sample_index(source_times, made_at)
             if index is None:
                 continue
@@ -346,6 +388,7 @@ def score_dense(
             if truth is None:
                 continue
             for name, prediction in predictions.items():
+                assert prediction is not None
                 errors[name].append(prediction - truth)
             persistence_errors.append(samples[index].used_percent - truth)
     persistence_mae = (

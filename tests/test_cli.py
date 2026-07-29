@@ -32,14 +32,21 @@ except ImportError:  # Windows: these tests exercise the POSIX input path only
     tty = None  # type: ignore[assignment]
 
 
-def _window(used_percent=50.0, resets_at=None):
+def _window(
+    used_percent=50.0,
+    resets_at=None,
+    *,
+    provider=Provider.CODEX,
+    kind=WindowKind.WEEKLY,
+    source_ts=1000.0,
+):
     return Window(
-        provider=Provider.CODEX,
-        kind=WindowKind.WEEKLY,
+        provider=provider,
+        kind=kind,
         used_percent=used_percent,
-        window_minutes=10080,
+        window_minutes=300 if kind is WindowKind.W5H else 10080,
         resets_at=resets_at,
-        source_ts=1000.0,
+        source_ts=source_ts,
         is_estimated=False,
         source_file="test",
     )
@@ -407,24 +414,50 @@ def test_row_style_is_none_when_not_exhausting(cfg):
 
 
 def test_row_style_is_none_for_stale_idle_even_over_threshold(cfg):
-    """Regression: alerts.py already treats IDLE the same as NO_DATA -- a
-    stale snapshot it doesn't trust enough to alert on. Highlighting an
-    idle 95% reading red would flag data that's already been flagged as
-    unreliable."""
+    """A rolling window's stale IDLE level is no more trustworthy than
+    NO_DATA because it may decay unobserved. Highlighting that 95% red would
+    contradict alerts.py, which correctly refuses to alert on it."""
     forecast = dataclasses.replace(_forecast(_window(used_percent=95.0)), status="IDLE")
     assert _row_style(forecast, cfg, now=1000.0) is None
 
 
-def test_row_style_is_red_at_full_exhaustion_even_when_idle(cfg):
-    """Regression: 100% used is the literal last-known reading, not a
-    predicted trend -- it stays true even once the window has gone stale,
-    unlike the 95%-idle case above where the number could plausibly have
-    already dropped. A window that hit its limit and then stopped being
-    polled must not read as merely "idle" on the dashboard."""
+def test_row_style_is_red_at_full_exhaustion_on_a_live_fixed_cycle(cfg):
+    """A fixed-cycle 100% remains true while its known cycle is still live,
+    even after the rate goes idle."""
+    now = 1000.0
     forecast = dataclasses.replace(
-        _forecast(_window(used_percent=100.0)), status="IDLE"
+        _forecast(
+            _window(
+                used_percent=100.0,
+                resets_at=now + 3600.0,
+                provider=Provider.CLAUDE,
+            )
+        ),
+        status="IDLE",
     )
-    assert _row_style(forecast, cfg, now=1000.0) == "red"
+    assert _row_style(forecast, cfg, now=now) == "red"
+
+
+def test_stale_rolling_exhaustion_is_not_styled_or_used_by_the_mascot(cfg):
+    """A rolling 100% can decay after its last observation just like 95%.
+    Alerts already refuse to vouch for that stale level; the row and header
+    must not stay red/barking on a number that may no longer exist."""
+    forecast = dataclasses.replace(
+        _forecast(_window(used_percent=100.0)),
+        status="IDLE",
+    )
+    now = 2000.0
+
+    assert _row_style(forecast, cfg, now=now) is None
+    state = MonitorState(
+        now=now,
+        windows=(forecast.window,),
+        forecasts=(forecast,),
+        alerts=(),
+    )
+    text = _render_to_text(_render(state, cfg, []))
+    assert "🐶 TokenWatchDog" in text
+    assert "🐕 TokenWatchDog" not in text
 
 
 def test_row_shows_tokens_burned_past_quota_when_set(cfg):

@@ -271,6 +271,71 @@ def test_dense_prefers_the_models_own_prediction_over_the_rate_formula():
     assert score.mae_points == 0.0  # graded on 60, not on 50 + 8*1
 
 
+def test_dense_skips_a_timestamp_with_duplicate_rows_from_one_model():
+    """A restarted tick can write the same model twice at one made_at. There
+    is no cohort id that says which duplicate belongs with the other model,
+    so dict-overwriting one answer makes the score depend on row order.
+    Ambiguous moments must be excluded rather than silently cherry-picked."""
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 50.0),
+        _sample(now + HOUR, 60.0),
+        _sample(now + 2 * HOUR, 70.0),
+    ]
+    rows = [
+        _row(now, "linear", None, predicted=60.0),
+        _row(now, "linear", None, predicted=100.0),
+        _row(now, "montecarlo", None, predicted=60.0),
+    ]
+
+    scored = score_dense(["linear", "montecarlo"], [(rows, samples, _is_reset)], 1.0)
+
+    assert scored["linear"].moments == 0
+    assert scored["montecarlo"].moments == 0
+
+
+def test_dense_uses_legacy_fallback_only_for_an_all_legacy_moment():
+    """Pre-column rows remain gradeable through used+burn*h, but a NULL from
+    one model beside another model's real predicted_used_percent may be a
+    deliberate current no-answer. Mixing those two contracts manufactures
+    a matched moment that never existed, so only all-legacy moments fall back."""
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 50.0),
+        _sample(now + HOUR, 60.0),
+        _sample(now + 2 * HOUR, 70.0),
+        _sample(now + 3 * HOUR, 80.0),
+    ]
+    rows = [
+        # Both models predate the column: a valid matched fallback moment.
+        _row(now, "linear", None, used_percent=50.0, burn_per_hour=10.0),
+        _row(now, "montecarlo", None, used_percent=50.0, burn_per_hour=10.0),
+        # Mixed current/legacy-or-no-answer representations: not matched.
+        _row(
+            now + HOUR,
+            "linear",
+            None,
+            used_percent=60.0,
+            burn_per_hour=10.0,
+            predicted=70.0,
+        ),
+        _row(
+            now + HOUR,
+            "montecarlo",
+            None,
+            used_percent=60.0,
+            burn_per_hour=10.0,
+        ),
+    ]
+
+    scored = score_dense(["linear", "montecarlo"], [(rows, samples, _is_reset)], 1.0)
+
+    assert scored["linear"].moments == 1
+    assert scored["montecarlo"].moments == 1
+    assert scored["linear"].mae_points == 0.0
+    assert scored["montecarlo"].mae_points == 0.0
+
+
 def test_the_per_kind_veto_blocks_a_lopsided_pooled_winner():
     """A pooled winner drives alerts on every window, so a big weekly win
     must not crown a model that is measurably worse on the 5-hour window."""
@@ -414,6 +479,17 @@ def test_dense_truth_interpolates_between_the_straddling_samples():
     truth = used_percent_at(sparse, 0, now + 24 * HOUR, rolling)
     assert truth is not None
     assert truth < 10.0  # nowhere near the stale 50
+
+
+def test_dense_truth_never_extrapolates_before_its_origin():
+    """Interpolation is bounded by observations from the forecast's origin
+    forward. A target before that origin used a negative fraction and
+    returned a plausible-looking level the model could never have observed."""
+    now = 1_000_000.0
+    samples = [_sample(now, 10.0), _sample(now + HOUR, 20.0)]
+
+    assert used_percent_at(samples, 0, now - 0.5 * HOUR, _is_reset) is None
+    assert used_percent_at(samples[:1], 0, now, _is_reset) == 10.0
 
 
 def test_dense_skips_rows_that_cannot_be_scored():

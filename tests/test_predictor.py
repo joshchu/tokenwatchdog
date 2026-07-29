@@ -346,6 +346,28 @@ def test_an_observed_boundary_invalidates_the_older_token_anchor(cfg):
     assert forecast.window.resets_at > now  # not the stale 09:24-style past
 
 
+def test_a_fresh_zero_use_boundary_does_not_manufacture_a_new_w5h_block(cfg):
+    """A reset drop proves the old block ended; it does not start the next
+    on-demand 5h block. With no post-boundary token event or 0→positive rise,
+    anchoring at the zero sample invents a reset for a block that does not
+    exist and makes an idle level look current for almost five more hours."""
+    now = 100_000.0
+    boundary_ts = now - 4.9 * 3600
+    history = [
+        _sample(boundary_ts - 300.0, 100.0, None),
+        _sample(boundary_ts, 0.0, None),
+        _sample(now, 0.0, None),
+    ]
+    window = _window(
+        Provider.CLAUDE, WindowKind.W5H, 0.0, now, resets_at=None, is_estimated=False
+    )
+
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.window.resets_at is None
+    assert forecast.time_to_reset_h is None
+
+
 def test_weekly_resets_at_derived_from_observed_reset_not_a_calendar_guess(cfg):
     """Regression: the weekly reset time must come from an actually
     observed reset (block_started_at + 7 days), never a hardcoded

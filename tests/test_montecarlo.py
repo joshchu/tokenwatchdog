@@ -10,11 +10,16 @@ seeded per-test for reproducible CI runs, not to pin exact outputs.
 from __future__ import annotations
 
 import random
+from datetime import timezone
 
 import pytest
 
 from tokenwatchdog.models import Provider, Window, WindowKind
-from tokenwatchdog.predictor import MonteCarloPredictor, _percentile_within_horizon
+from tokenwatchdog.predictor import (
+    MonteCarloPredictor,
+    _percentile_within_horizon,
+    _simulate_exhaustion_hours,
+)
 from tokenwatchdog.store import SampleRow
 
 
@@ -400,6 +405,39 @@ def test_simulation_resolves_exhaustion_inside_the_current_hour(cfg):
     assert forecast.eta_p50 is not None
     minutes_out = (forecast.eta_p50.timestamp() - now) / 60.0
     assert 0.0 < minutes_out < 40.0
+
+
+def test_checkpoint_at_horizon_captures_survivors_without_false_exhaustion():
+    """A checkpoint exactly on an integer horizon is the dense answer, not
+    "missing." The old half-open crossing check captured only runs that
+    exhausted before +1h; survivors returned None, so their omission biased
+    the mean simulated level toward 100%. A fractional final hour must also
+    censor an exhaustion that would happen only after that horizon."""
+    steady_ten = ([10.0], [1.0])
+    survivor = _simulate_exhaustion_hours(
+        20.0,
+        0.0,
+        {},
+        steady_ten,
+        timezone.utc,
+        horizon_hours=1.0,
+        checkpoint_h=1.0,
+    )
+    assert survivor.exhausted_after_h is None
+    assert survivor.level_at_checkpoint == pytest.approx(30.0)
+
+    steady_five = ([5.0], [1.0])
+    fractional = _simulate_exhaustion_hours(
+        95.0,
+        0.0,
+        {},
+        steady_five,
+        timezone.utc,
+        horizon_hours=0.5,
+        checkpoint_h=0.5,
+    )
+    assert fractional.exhausted_after_h is None
+    assert fractional.level_at_checkpoint == pytest.approx(97.5)
 
 
 def test_risk_is_reported_even_when_the_median_future_does_not_exhaust(cfg):

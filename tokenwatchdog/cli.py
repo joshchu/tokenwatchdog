@@ -274,7 +274,7 @@ def _render(
             style=_row_style(forecast, cfg, state.now),
         )
 
-    mascot = _mascot_glyph(state.forecasts, cfg)
+    mascot = _mascot_glyph(state.forecasts, cfg, state.now)
     # Which model is authoritative and why -- shown because `auto` can change
     # it from what config literally says, and an unexplained switch is worse
     # than no switch.
@@ -458,20 +458,21 @@ def _row_style(forecast: Forecast, cfg: Config, now: float) -> str | None:
     pace to exhaust before reset" signal the Status column already labels
     "burning," for a burn that isn't urgent enough to be red yet.
 
-    Full exhaustion is checked first and overrides everything below: 100%
-    used is the literal last-known reading, not a predicted trend.
+    Full exhaustion overrides trend checks once the level itself is valid.
+    A stale rolling 100% is not valid: it can age down unobserved just like
+    95%, so it must pass the same level-vouching gate alerts.py applies.
 
     The IDLE handling tracks alerts.evaluate() deliberately, including its
     level-vs-rate split — a stale *rate* is untrustworthy, but a stale
     *level* is just a level, so an idle window still paints red for being
     over the warn threshold as long as its cycle hasn't turned over."""
     window = forecast.window
-    if window.used_percent >= 100.0:
-        return "red"
     if forecast.status == "NO_DATA":
         return None
     if forecast.status == "IDLE" and not level_still_in_cycle(window, now):
         return None
+    if window.used_percent >= 100.0:
+        return "red"
     if window.used_percent >= cfg.thresholds.warn_percent:
         return "red"
     if forecast.status != "OK" or not forecast.exhausts_before_reset:
@@ -486,10 +487,15 @@ def _row_style(forecast: Forecast, cfg: Config, now: float) -> str | None:
     return "yellow"
 
 
-def _mascot_glyph(forecasts: tuple[Forecast, ...], cfg: Config) -> str:
+def _mascot_glyph(forecasts: tuple[Forecast, ...], cfg: Config, now: float) -> str:
     if any(f.status == "OK" and f.exhausts_before_reset for f in forecasts):
         return _BURN_EMOJI
-    if any(f.window.used_percent >= cfg.thresholds.warn_percent for f in forecasts):
+    if any(
+        f.window.used_percent >= cfg.thresholds.warn_percent
+        and f.status != "NO_DATA"
+        and (f.status != "IDLE" or level_still_in_cycle(f.window, now))
+        for f in forecasts
+    ):
         return _ALERT_EMOJI
     return _CALM_EMOJI
 
