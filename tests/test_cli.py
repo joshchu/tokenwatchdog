@@ -270,6 +270,80 @@ def test_retained_prediction_is_labeled_saved(cfg):
     assert "saved " in text
 
 
+def test_a_censored_band_with_known_risk_renders_safe(cfg):
+    """The simulation ran and most futures survive to the reset: that is an
+    answer, not an absence. Before this, 4,513 consecutive OK weekly ticks
+    rendered "—" while every one was a genuine (and correct) "you won't run
+    out"."""
+    window = _window()
+    predicted = dataclasses.replace(
+        _forecast(window),
+        model_name="montecarlo",
+        eta_p50=None,
+        eta_p90=None,
+        prob_exhaust_before_reset=0.12,
+        confidence="high",  # the simulation actually ran
+    )
+
+    row = _row(
+        predicted, timezone.utc, burn_rate=_forecast(window), predicted=predicted
+    )
+
+    assert row[6] == "safe (risk 12%)"
+
+
+def test_safe_needs_a_simulation_that_actually_ran(cfg):
+    """A status-only result (no confidence, no probability) is a genuine
+    "no answer" and must stay a dash — safe is earned by a run, not
+    assumed from silence."""
+    window = _window()
+    predicted = dataclasses.replace(
+        _forecast(window),
+        model_name="montecarlo",
+        eta_p50=None,
+        prob_exhaust_before_reset=None,
+        confidence=None,
+    )
+
+    row = _row(
+        predicted, timezone.utc, burn_rate=_forecast(window), predicted=predicted
+    )
+
+    assert row[6] == "—"
+
+
+def test_a_fresh_safe_answer_beats_a_retained_band(cfg):
+    """A fresh censored result must win over an older saved band — the
+    saved band describes a moment the simulation has since re-answered."""
+    window = _window()
+    predicted = dataclasses.replace(
+        _forecast(window),
+        model_name="montecarlo",
+        eta_p50=None,
+        eta_p90=None,
+        prob_exhaust_before_reset=0.05,
+        confidence="medium",
+    )
+    retained = RetainedPrediction(
+        provider=window.provider,
+        kind=window.kind,
+        made_at=900.0,
+        used_percent=window.used_percent,
+        eta_p50=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        eta_p90=None,
+    )
+
+    row = _row(
+        predicted,
+        timezone.utc,
+        burn_rate=_forecast(window),
+        predicted=predicted,
+        retained=retained,
+    )
+
+    assert row[6] == "safe (risk 5%)"
+
+
 def test_working_hours_fallback_is_labeled():
     window = _window()
     burn_rate = dataclasses.replace(

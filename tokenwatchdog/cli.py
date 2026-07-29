@@ -288,6 +288,7 @@ def _render(
         subtitle=(
             "* = estimated (token-based limit is a guess, not an official cap)"
             " · red = alert · yellow = trending toward exhaustion"
+            " · safe = most simulated futures survive to the reset"
             + (f" · {model_note}" if model_note else "")
         ),
         border_style="bright_cyan",
@@ -367,11 +368,24 @@ def _fmt_predicted_eta(
     hours you DECLARED in config. Labels distinguish the single-value cases.
 
     This is deliberately a different question from the burn-rate ETA beside
-    it, which asks "at the measured rate, projected around the clock."""
+    it, which asks "at the measured rate, projected around the clock."
+
+    A censored fresh result — the simulation ran and MOST futures survive
+    to the reset, with the tail risk known — renders as "safe (risk N%)"
+    rather than "—": the model answered, and silence was indistinguishable
+    from having nothing to say. Measured before this existed: 4,513
+    consecutive OK ticks on the weekly window rendered "—" while every one
+    of them was a genuine (and correct) "you won't run out"."""
     if predicted is not None and predicted.eta_p50 is not None:
         if predicted.eta_p90 is None:
             return f"P50 {_fmt_dt(predicted.eta_p50, tz)}"
         return f"{_fmt_dt(predicted.eta_p50, tz)} → {_fmt_dt(predicted.eta_p90, tz)}"
+    if (
+        predicted is not None
+        and predicted.confidence is not None  # the simulation actually ran
+        and predicted.prob_exhaust_before_reset is not None
+    ):
+        return f"safe (risk {predicted.prob_exhaust_before_reset * 100:.0f}%)"
     if retained is not None:
         if retained.eta_p90 is None:
             return f"saved P50 {_fmt_dt(retained.eta_p50, tz)}"
