@@ -139,6 +139,11 @@ _FORECAST_COLUMNS_ADDED_LATER = {
     "burn_basis": "TEXT",
     "time_to_reset_h": "REAL",
     "exhausts_before_reset": "INTEGER",
+    # A recorded probability is a deliberate answer even when the median
+    # future never exhausts (no ETA) -- scoring counts such a row as
+    # answered rather than as a coverage miss, and the backtest's risk
+    # calibration grades the probabilities themselves.
+    "prob_exhaust_before_reset": "REAL",
 }
 
 
@@ -180,12 +185,20 @@ class TokenEventRow:
 class ForecastRow:
     """A past forecast, read back to grade it (see scoring.py). Only the
     columns scoring actually reads — the table records more per forecast, but
-    a field here with no reader is just something else to keep true."""
+    a field here with no reader is just something else to keep true.
+
+    `used_percent` and `burn_per_hour` feed the dense fixed-horizon metric
+    (predicted used% at +h = used + burn·h); `prob_exhaust_before_reset`
+    marks a deliberate no-ETA answer as answered. The latter two are NULL on
+    rows written before their columns existed — genuinely not recorded."""
 
     made_at: float
     model_name: str
     eta_calendar: float | None
     status: str | None
+    used_percent: float
+    burn_per_hour: float | None
+    prob_exhaust_before_reset: float | None
 
 
 @dataclass(frozen=True)
@@ -460,8 +473,9 @@ class Store:
             "INSERT INTO forecasts "
             "(made_at, provider, window_kind, model_name, used_percent, "
             " eta_calendar, eta_p50, eta_p90, eta_workhours, status, "
-            " burn_per_hour, burn_basis, time_to_reset_h, exhausts_before_reset) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " burn_per_hour, burn_basis, time_to_reset_h, exhausts_before_reset, "
+            " prob_exhaust_before_reset) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 made_at,
                 window.provider.value,
@@ -477,6 +491,7 @@ class Store:
                 forecast.burn_basis,
                 forecast.time_to_reset_h,
                 int(forecast.exhausts_before_reset),
+                forecast.prob_exhaust_before_reset,
             ),
         )
 
@@ -487,7 +502,8 @@ class Store:
         grades. Rows written before the schema gained `status` have NULL
         there; that's a genuine "not recorded," not a value to invent."""
         rows = self._conn.execute(
-            "SELECT made_at, model_name, eta_calendar, status "
+            "SELECT made_at, model_name, eta_calendar, status, used_percent, "
+            "  burn_per_hour, prob_exhaust_before_reset "
             "FROM forecasts WHERE provider = ? AND window_kind = ? AND made_at >= ? "
             "ORDER BY made_at ASC",
             (provider.value, kind.value, since_ts),
@@ -498,6 +514,9 @@ class Store:
                 model_name=row["model_name"],
                 eta_calendar=row["eta_calendar"],
                 status=row["status"],
+                used_percent=row["used_percent"],
+                burn_per_hour=row["burn_per_hour"],
+                prob_exhaust_before_reset=row["prob_exhaust_before_reset"],
             )
             for row in rows
         ]

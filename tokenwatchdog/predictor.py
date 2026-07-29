@@ -45,7 +45,14 @@ from tokenwatchdog.models import (
     window_duration_seconds,
     window_is_rolling,
 )
-from tokenwatchdog.scoring import better_model, score_model
+from tokenwatchdog.scoring import (
+    DENSE_HORIZON_H,
+    DenseScore,
+    ScoringPair,
+    better_model,
+    pool_dense,
+    score_model_dense,
+)
 from tokenwatchdog.store import SampleRow, Store, TokenEventRow
 
 
@@ -410,19 +417,33 @@ def select_predictor(cfg: Config, store: Store | None = None) -> tuple[Predictor
 
 
 def _grade_stored_models(cfg: Config, store: Store) -> tuple[str, str]:
-    """Grade every model against this machine's own stored forecasts."""
+    """Grade every model against this machine's own stored forecasts.
+
+    The decision runs on the dense fixed-horizon metric, pooled across
+    windows with each window scored at its own kind's horizon (see
+    scoring.DENSE_HORIZON_H) — every model and the persistence baseline are
+    measured on the same store, and persistence rides inside each model's
+    DenseScore so that comparison is moment-matched."""
     del cfg  # retention already bounds what's in the table
-    pairs = []
+    pairs_by_kind: dict[WindowKind, list[ScoringPair]] = {}
     for provider in Provider:
         for kind in WindowKind:
             samples = store.recent_samples(provider, kind, 0.0)
             rows = store.recent_forecasts(provider, kind, 0.0)
             if len(samples) >= 3 and rows:
-                pairs.append((rows, samples, _reset_predicate(provider, kind)))
-    if not pairs:
+                pairs_by_kind.setdefault(kind, []).append(
+                    (rows, samples, _reset_predicate(provider, kind))
+                )
+    if not pairs_by_kind:
         return _DEFAULT_MODEL, f"{_DEFAULT_MODEL}: no stored forecasts to grade yet"
-    scores = {name: score_model(name, pairs) for name in _PREDICTORS}
-    return better_model(_DEFAULT_MODEL, scores)
+    dense: dict[str, DenseScore] = {}
+    for name in _PREDICTORS:
+        per_kind = [
+            score_model_dense(name, pairs, DENSE_HORIZON_H[kind])
+            for kind, pairs in pairs_by_kind.items()
+        ]
+        dense[name] = pool_dense(name, per_kind)
+    return better_model(_DEFAULT_MODEL, dense)
 
 
 # -- shared preprocessing: the "clean burn series" ---------------------------

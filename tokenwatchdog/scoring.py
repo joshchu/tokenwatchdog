@@ -24,42 +24,104 @@ import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from tokenwatchdog.models import WindowKind
 from tokenwatchdog.store import ForecastRow, SampleRow
 
 _EXHAUSTED_PERCENT = 100.0
 
-# Scored episodes a challenger needs before it may displace the default.
-# An "episode" is a moment that was BELOW 100% and whose window then hit it
-# in the same cycle, so an error is computable -- and those are RARE: a weekly
-# window supplies at most a couple a week no matter how long the tool runs.
-# Measured over this repo's first ~6.5 days: 14 episodes for linear and 3 for
-# montecarlo on the 5-hour window, 0 on either weekly one. Tuning anything on
-# that is fitting noise, which is what this threshold exists to prevent.
-#
-# Counting caveat, unfixed: this counts forecast MOMENTS, and many correlated
-# forecasts made while climbing toward one exhaustion each count separately --
-# those 14 point at just 2 real crossings. So 30 is a floor on evidence, not
-# on independent events. Grouping by cycle (or a denser, properly independent
-# metric) is what would make `auto` genuinely decidable; until then it is
-# expected to keep reporting "not enough" and staying on the default.
-MIN_EPISODES_TO_GRADUATE = 30
+# Exhaustion "episodes" (a below-100% moment whose window then hit 100% in
+# the same cycle) stay as a DIAGNOSTIC only: they are far too rare to decide
+# anything -- measured at 2 real crossings in 10.5 days, with the 14-17
+# scorable moments all pointing at those same two events. The decision metric
+# is the dense fixed-horizon score below; no episode count gates anything.
 
-# And it has to win by a real margin, not a rounding difference.
+# A challenger has to win by a real margin, not a rounding difference --
+# measured: sub-margin orderings between models flip sign between independent
+# halves of the same user's history, so anything under this is period noise.
 MIN_RELATIVE_IMPROVEMENT = 0.15
+
+# Dense moments a challenger needs before the comparison is decidable. Both
+# models forecast every watched window every tick, so pooled OK moments
+# accumulate at hundreds per day -- decidable within days rather than never
+# (episodes). The real anti-noise guard is the double bar in better_model:
+# correlated moments cannot fake a win over PERSISTENCE, a zero-parameter
+# baseline that exploits the same autocorrelation in full.
+MIN_DENSE_MOMENTS = 500
+
+# The horizon each window kind is scored at: predicted used% at +h versus
+# what the store later recorded. 1h fits the 5-hour window's decision ("do I
+# stop now"); 24h fits the weekly one ("do I ration today") -- at 1h a weekly
+# window's integer percentage mostly measures quantization, not skill.
+DENSE_HORIZON_H = {WindowKind.W5H: 1.0, WindowKind.WEEKLY: 24.0}
+
+# The zero-parameter baseline: predicted used% at +h = used% now. Measured
+# on 10.5 days of history it beat BOTH models at a 1h horizon on every
+# window, so a model that cannot beat it has no claim to be selected.
+PERSISTENCE = "persistence"
 
 
 @dataclass(frozen=True)
 class ModelScore:
     model_name: str
     moments: int  # forecasts examined
-    with_eta: int  # ...that produced an ETA at all
+    answered: int  # ...that gave an ETA or a deliberate risk-only answer
     episodes: int  # ...whose window then actually exhausted, so error is real
     mae_hours: float | None
     bias_hours: float | None
 
     @property
     def coverage(self) -> float:
-        return self.with_eta / self.moments if self.moments else 0.0
+        return self.answered / self.moments if self.moments else 0.0
+
+
+@dataclass(frozen=True)
+class DenseScore:
+    """Fixed-horizon used% error, plus the persistence baseline measured on
+    the SAME moments — the pairing that makes "beats persistence" a matched
+    comparison rather than a cross-sample one."""
+
+    model_name: str
+    moments: int
+    mae_points: float | None
+    bias_points: float | None
+    persistence_mae_points: float | None
+
+
+def pool_dense(model_name: str, scores: list[DenseScore]) -> DenseScore:
+    """One DenseScore across window kinds scored at different horizons.
+
+    Moment-weighted means — exact, since each MAE is itself a mean of
+    absolute errors. Pooling across horizons is deliberate: the unit is
+    "used% points of error at that window's own decision horizon," and a
+    per-window split never reaches a decidable sample size (the same reason
+    score_model pools episodes)."""
+    mae = 0.0
+    bias = 0.0
+    persistence = 0.0
+    total = 0
+    for score in scores:
+        # A scored entry carries all three means or none: they are built
+        # from the same per-moment error lists in score_model_dense.
+        if (
+            not score.moments
+            or score.mae_points is None
+            or score.bias_points is None
+            or score.persistence_mae_points is None
+        ):
+            continue
+        total += score.moments
+        mae += score.mae_points * score.moments
+        bias += score.bias_points * score.moments
+        persistence += score.persistence_mae_points * score.moments
+    if not total:
+        return DenseScore(model_name, 0, None, None, None)
+    return DenseScore(
+        model_name=model_name,
+        moments=total,
+        mae_points=mae / total,
+        bias_points=bias / total,
+        persistence_mae_points=persistence / total,
+    )
 
 
 def realized_exhaustion_hours(
@@ -137,22 +199,32 @@ def score_model(model_name: str, pairs: list[ScoringPair]) -> ModelScore:
     """
     errors: list[float] = []
     moments = 0
-    with_eta = 0
+    answered = 0
     for rows, samples, is_reset in pairs:
         # Extracted once per window, not per row -- the whole point of the
         # binary search below.
         source_times = [sample.source_ts for sample in samples]
         own = [row for row in rows if row.model_name == model_name]
-        # A forecast the predictor deliberately withheld (no live reading to
-        # extrapolate from) is not a coverage failure, so it isn't counted as
-        # a moment at all. Rows written before `status` existed are NULL and
-        # stay counted, since we genuinely don't know which they were.
-        own = [row for row in own if row.status not in ("IDLE", "NO_DATA")]
+        # A forecast the predictor deliberately withheld -- no live reading
+        # to extrapolate from (IDLE), nothing reported at all (NO_DATA), or
+        # a just-turned-over cycle with one reading (RESET_PENDING) -- is
+        # not a coverage failure, so it isn't counted as a moment at all.
+        # Rows written before `status` existed are NULL and stay counted,
+        # since we genuinely don't know which they were.
+        own = [
+            row for row in own if row.status not in ("IDLE", "NO_DATA", "RESET_PENDING")
+        ]
         moments += len(own)
         for row in own:
+            # A recorded probability with no ETA is a deliberate answer --
+            # "the median future survives; the tail risk is N%" -- not a
+            # missing one, so it counts as answered even though there is no
+            # ETA error to take.
             if row.eta_calendar is None:
+                if row.prob_exhaust_before_reset is not None:
+                    answered += 1
                 continue
-            with_eta += 1
+            answered += 1
             index = _origin_sample_index(source_times, row.made_at)
             if index is None:
                 continue
@@ -169,11 +241,116 @@ def score_model(model_name: str, pairs: list[ScoringPair]) -> ModelScore:
     return ModelScore(
         model_name=model_name,
         moments=moments,
-        with_eta=with_eta,
+        answered=answered,
         episodes=len(errors),
         mae_hours=statistics.fmean(abs(e) for e in errors) if errors else None,
         bias_hours=statistics.fmean(errors) if errors else None,
     )
+
+
+def used_percent_at(
+    samples: list[SampleRow],
+    origin_index: int,
+    target_ts: float,
+    is_reset: ResetPredicate,
+) -> float | None:
+    """The window's used% at `target_ts`, or None if that moment isn't
+    scorable from this cycle.
+
+    The level is the newest same-cycle sample at or before `target_ts` — a
+    used% level is durable between samples (quota doesn't move unobserved),
+    so this is exact, not an interpolation. Scorable requires the cycle to
+    demonstrably survive to `target_ts`: a reset before it, the origin's own
+    declared `resets_at` passing, or the data simply ending all make the
+    question "used% at +h in this cycle" unanswerable rather than zero.
+    """
+    origin = samples[origin_index]
+    if origin.resets_at is not None and target_ts > origin.resets_at:
+        return None
+    level = origin.used_percent
+    for offset in range(origin_index + 1, len(samples)):
+        if is_reset(samples[offset - 1], samples[offset]):
+            return None
+        if samples[offset].source_ts > target_ts:
+            return level
+        level = samples[offset].used_percent
+    return None  # data ends before the horizon -- unknown, not zero
+
+
+def score_model_dense(
+    model_name: str, pairs: list[ScoringPair], horizon_h: float
+) -> DenseScore:
+    """Fixed-horizon used% error: predicted = used% + burn·h (clamped to
+    [0, 100]) versus the level the store later recorded, over every OK
+    moment that has a same-cycle future to check against.
+
+    This is the metric that makes model selection decidable: exhaustion
+    episodes arrive a couple per week, dense moments arrive hundreds per
+    day. It reads entirely from columns the forecasts table already stores
+    (used_percent, burn_per_hour) — which is also what makes burn_per_hour's
+    meaning a graded contract rather than a display convention.
+
+    Persistence (predicted = used% now) is computed on the SAME moments and
+    carried in the result, so "beats persistence" is a matched comparison.
+    """
+    errors: list[float] = []
+    persistence_errors: list[float] = []
+    for rows, samples, is_reset in pairs:
+        source_times = [sample.source_ts for sample in samples]
+        for row in rows:
+            if row.model_name != model_name or row.status != "OK":
+                continue
+            if row.used_percent >= _EXHAUSTED_PERCENT or row.burn_per_hour is None:
+                continue
+            index = _origin_sample_index(source_times, row.made_at)
+            if index is None:
+                continue
+            truth = used_percent_at(
+                samples, index, row.made_at + horizon_h * 3600.0, is_reset
+            )
+            if truth is None:
+                continue
+            predicted = min(
+                100.0, max(0.0, row.used_percent + row.burn_per_hour * horizon_h)
+            )
+            errors.append(predicted - truth)
+            persistence_errors.append(row.used_percent - truth)
+    return DenseScore(
+        model_name=model_name,
+        moments=len(errors),
+        mae_points=statistics.fmean(abs(e) for e in errors) if errors else None,
+        bias_points=statistics.fmean(errors) if errors else None,
+        persistence_mae_points=(
+            statistics.fmean(abs(e) for e in persistence_errors)
+            if persistence_errors
+            else None
+        ),
+    )
+
+
+def brier_score(outcomes: list[tuple[float, int]]) -> float | None:
+    """Mean squared error of probability claims against 0/1 outcomes —
+    lower is better, and a model that can't beat always-guessing-the-base-
+    rate (compare against `brier_score([(base, o) for _, o in ...])`) has
+    an uninformative probability, however plausible it renders."""
+    if not outcomes:
+        return None
+    return statistics.fmean((prob - outcome) ** 2 for prob, outcome in outcomes)
+
+
+def reliability_buckets(
+    outcomes: list[tuple[float, int]],
+) -> list[tuple[float, float, int, float]]:
+    """(lo, hi, n, realized frequency) per claimed-probability band — the
+    table that shows WHERE a probability is miscalibrated, not just that it
+    is. Bands chosen to keep single-user sample sizes readable."""
+    bands = [(0.0, 0.3), (0.3, 0.6), (0.6, 0.9), (0.9, 1.01)]
+    table = []
+    for lo, hi in bands:
+        hits = [outcome for prob, outcome in outcomes if lo <= prob < hi]
+        if hits:
+            table.append((lo, hi, len(hits), statistics.fmean(hits)))
+    return table
 
 
 def _origin_sample_index(source_times: list[float], made_at: float) -> int | None:
@@ -197,49 +374,70 @@ def _origin_sample_index(source_times: list[float], made_at: float) -> int | Non
     return position - 1 if position else None
 
 
-def better_model(default: str, scores: dict[str, ModelScore]) -> tuple[str, str]:
+def better_model(default: str, dense: dict[str, DenseScore]) -> tuple[str, str]:
     """(chosen model, why) — the model `auto` should trust, and a sentence
     saying how that was decided, because a silent switch is worse than no
     switch.
 
-    Returns `default` unless a challenger has cleared both bars above. Both
-    exist because the alternative is picking whichever model happened to
-    look better on a couple of episodes of one person's usage, and then
-    presenting that as a measurement."""
-    ranked = sorted(
-        (
-            (score.mae_hours, score)
-            for score in scores.values()
-            if score.mae_hours is not None
-            and score.episodes >= MIN_EPISODES_TO_GRADUATE
-        ),
-        key=lambda pair: pair[0],
-    )
-    if not ranked:
-        available = max((s.episodes for s in scores.values()), default=0)
-        return default, (
-            f"{default}: not enough scored history to compare models "
-            f"({available} exhaustion episode(s), need {MIN_EPISODES_TO_GRADUATE})"
-        )
-    winner_mae, winner = ranked[0]
-    if winner.model_name == default:
-        return default, f"{default}: best measured MAE ({winner_mae:.1f}h)"
+    Decided on the DENSE metric, never on exhaustion episodes (those stay a
+    printed diagnostic — a couple per week can't decide anything). A
+    challenger displaces the default only by clearing every bar:
 
-    baseline = scores.get(default)
-    if baseline is None or baseline.mae_hours is None:
-        return winner.model_name, (
-            f"{winner.model_name}: {winner_mae:.1f}h MAE over {winner.episodes} "
-            f"episodes; {default} produced no scorable ETA to compare against"
-        )
-    improvement = (baseline.mae_hours - winner_mae) / baseline.mae_hours
-    if improvement < MIN_RELATIVE_IMPROVEMENT:
+    - at least MIN_DENSE_MOMENTS scored moments of its own;
+    - at least MIN_RELATIVE_IMPROVEMENT lower MAE than the default;
+    - the same margin over PERSISTENCE measured on its own moments — the
+      zero-parameter baseline correlated moments can't fake a win against,
+      and the anti-overfitting bar: a model that can't beat "nothing
+      changes" on one user's data has learned that user's noise, not their
+      usage.
+
+    There is deliberately no you-win-by-default branch when the default has
+    no dense score: with no comparison possible, the default stands.
+    """
+    ranked: list[tuple[float, DenseScore]] = []
+    for name, score in dense.items():
+        if name == default or name == PERSISTENCE or score.mae_points is None:
+            continue
+        ranked.append((score.mae_points, score))
+    # Explicit key: on an exact MAE tie the tuple comparison would fall
+    # through to the (orderless) dataclass and raise.
+    ranked.sort(key=lambda pair: pair[0])
+    if not ranked:
+        return default, f"{default}: no challenger has scored dense moments yet"
+    winner_mae, winner = ranked[0]
+
+    if winner.moments < MIN_DENSE_MOMENTS:
         return default, (
-            f"{default}: {winner.model_name} is only {improvement:.0%} better "
-            f"({winner_mae:.1f}h vs {baseline.mae_hours:.1f}h), under the "
+            f"{default}: not enough dense history to compare models "
+            f"({winner.moments} of {MIN_DENSE_MOMENTS} scored moments)"
+        )
+    baseline = dense.get(default)
+    if baseline is None or baseline.mae_points is None:
+        return default, (
+            f"{default}: no dense score of its own to compare against "
+            f"({winner.model_name} has {winner.moments} moments)"
+        )
+    vs_default = (baseline.mae_points - winner_mae) / baseline.mae_points
+    if vs_default < MIN_RELATIVE_IMPROVEMENT:
+        return default, (
+            f"{default}: {winner.model_name} is {vs_default:.0%} better on the "
+            f"dense metric ({winner_mae:.2f} vs "
+            f"{baseline.mae_points:.2f} pts), under the "
             f"{MIN_RELATIVE_IMPROVEMENT:.0%} margin worth switching for"
         )
+    persistence_mae = winner.persistence_mae_points
+    if persistence_mae is None:
+        return default, f"{default}: no persistence baseline on the same moments"
+    vs_persistence = (persistence_mae - winner_mae) / persistence_mae
+    if vs_persistence < MIN_RELATIVE_IMPROVEMENT:
+        return default, (
+            f"{default}: {winner.model_name} beats {default} but not the "
+            f"persistence baseline ({winner_mae:.2f} vs "
+            f"{persistence_mae:.2f} pts on its own moments) — a model that "
+            f"can't beat 'nothing changes' hasn't earned a switch"
+        )
     return winner.model_name, (
-        f"{winner.model_name}: {improvement:.0%} lower MAE than {default} "
-        f"({winner_mae:.1f}h vs {baseline.mae_hours:.1f}h) over "
-        f"{winner.episodes} episodes"
+        f"{winner.model_name}: {vs_default:.0%} lower dense MAE than {default} "
+        f"({winner_mae:.2f} vs {baseline.mae_points:.2f} pts) and "
+        f"{vs_persistence:.0%} under persistence, over {winner.moments} moments"
     )

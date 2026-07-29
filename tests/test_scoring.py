@@ -2,9 +2,16 @@
 
 `predictor.model = "auto"` grades every model against this machine's own
 stored forecasts. The interesting property is not that it picks a winner but
-that it usually declines to: with one user's history, a small MAE difference
-is as likely to be that person's luck as a real improvement, and switching on
+that it usually declines to: with one user's history, a small difference is
+as likely to be that person's luck as a real improvement, and switching on
 it would dress up noise as a measurement.
+
+The decision runs on the DENSE metric — used% error at a fixed horizon,
+hundreds of scorable moments per day — with a double bar: beat the default
+AND beat persistence ("nothing changes"), each by a real margin. Exhaustion
+episodes (a below-cap moment whose window then hit 100%) stay as a printed
+diagnostic; at a couple of real crossings per week they can't decide
+anything.
 """
 
 from __future__ import annotations
@@ -15,45 +22,58 @@ from tokenwatchdog.config import load_config
 from tokenwatchdog.models import Forecast, Provider, Window, WindowKind
 from tokenwatchdog.predictor import _is_reset, select_predictor
 from tokenwatchdog.scoring import (
-    MIN_EPISODES_TO_GRADUATE,
+    MIN_DENSE_MOMENTS,
     MIN_RELATIVE_IMPROVEMENT,
-    ModelScore,
+    DenseScore,
     better_model,
+    pool_dense,
     realized_exhaustion_hours,
     score_model,
+    score_model_dense,
+    used_percent_at,
 )
 from tokenwatchdog.store import ForecastRow, SampleRow
 
 HOUR = 3600.0
 
 
-def _score(name, *, episodes, mae):
-    return ModelScore(
+def _dense(name, *, moments, mae, bias=0.0, persistence=None):
+    return DenseScore(
         model_name=name,
-        moments=episodes * 2,
-        with_eta=episodes,
-        episodes=episodes,
-        mae_hours=mae,
-        bias_hours=0.0,
+        moments=moments,
+        mae_points=mae,
+        bias_points=bias,
+        persistence_mae_points=persistence,
     )
 
 
-def _sample(ts, used_percent):
+def _sample(ts, used_percent, resets_at=None):
     return SampleRow(
         captured_at=ts,
         source_ts=ts,
         used_percent=used_percent,
-        resets_at=None,
+        resets_at=resets_at,
         is_estimated=False,
     )
 
 
-def _row(made_at, model_name, eta_calendar, status="OK"):
+def _row(
+    made_at,
+    model_name,
+    eta_calendar,
+    status="OK",
+    used_percent=50.0,
+    burn_per_hour=None,
+    prob=None,
+):
     return ForecastRow(
         made_at=made_at,
         model_name=model_name,
         eta_calendar=eta_calendar,
         status=status,
+        used_percent=used_percent,
+        burn_per_hour=burn_per_hour,
+        prob_exhaust_before_reset=prob,
     )
 
 
@@ -87,50 +107,195 @@ def _forecast(made_at, used_percent, *, eta, model_name="montecarlo"):
     )
 
 
-def test_thin_history_keeps_the_default_however_good_a_challenger_looks():
+# -- the gate: better_model on dense scores ----------------------------------
+
+
+def test_thin_dense_history_keeps_the_default_however_good_a_challenger_looks():
     """A challenger with a tenth of the default's error still doesn't win on
-    three episodes. This is the guard against exactly the failure mode of
-    tuning to one person's data and calling the result measured."""
+    a hundred moments. This is the guard against tuning to one person's
+    data and calling the result measured."""
     chosen, reason = better_model(
         "linear",
         {
-            "linear": _score("linear", episodes=3, mae=10.0),
-            "montecarlo": _score("montecarlo", episodes=3, mae=1.0),
+            "linear": _dense("linear", moments=800, mae=1.0),
+            "montecarlo": _dense("montecarlo", moments=100, mae=0.1, persistence=1.0),
         },
     )
     assert chosen == "linear"
-    assert "not enough scored history" in reason
-    assert str(MIN_EPISODES_TO_GRADUATE) in reason
+    assert "not enough dense history" in reason
+    assert str(MIN_DENSE_MOMENTS) in reason
 
 
-def test_a_marginal_win_on_ample_history_still_keeps_the_default():
-    """Enough episodes, but the margin is inside the noise floor. Churning
-    the model for a few percent isn't an improvement, it's a coin flip with
-    extra steps."""
-    n = MIN_EPISODES_TO_GRADUATE + 10
+def test_beating_the_default_but_not_persistence_keeps_the_default():
+    """The load-bearing case. Measured on real history, persistence beat
+    both models at a 1h horizon — so a challenger that merely edges out the
+    default while losing to "nothing changes" has learned noise, not usage,
+    and doesn't get to alert anyone."""
     chosen, reason = better_model(
         "linear",
         {
-            "linear": _score("linear", episodes=n, mae=10.0),
-            "montecarlo": _score("montecarlo", episodes=n, mae=9.5),  # 5% better
+            "linear": _dense("linear", moments=900, mae=1.0),
+            "montecarlo": _dense(
+                "montecarlo",
+                moments=900,
+                mae=0.8,  # 20% better than the default...
+                persistence=0.82,  # ...but persistence already does 0.82
+            ),
+        },
+    )
+    assert chosen == "linear"
+    assert "persistence" in reason
+
+
+def test_a_marginal_win_on_ample_history_still_keeps_the_default():
+    """Enough moments, but the margin is inside the noise floor — measured:
+    sub-margin orderings flip sign between independent halves of the same
+    user's history."""
+    chosen, reason = better_model(
+        "linear",
+        {
+            "linear": _dense("linear", moments=900, mae=1.0),
+            "montecarlo": _dense("montecarlo", moments=900, mae=0.95, persistence=2.0),
         },
     )
     assert chosen == "linear"
     assert "margin" in reason
+    assert 0.05 < MIN_RELATIVE_IMPROVEMENT  # sanity: 5% really is sub-margin
 
 
-def test_a_decisive_win_on_ample_history_switches_and_says_why():
-    n = MIN_EPISODES_TO_GRADUATE + 10
+def test_a_decisive_win_over_both_bars_switches_and_says_why():
     chosen, reason = better_model(
         "linear",
         {
-            "linear": _score("linear", episodes=n, mae=10.0),
-            "montecarlo": _score("montecarlo", episodes=n, mae=4.0),  # 60% better
+            "linear": _dense("linear", moments=900, mae=1.0),
+            "montecarlo": _dense("montecarlo", moments=900, mae=0.5, persistence=1.0),
         },
     )
     assert chosen == "montecarlo"
-    assert "60%" in reason and "linear" in reason
-    assert 0.6 > MIN_RELATIVE_IMPROVEMENT  # sanity: the margin really was cleared
+    assert "50%" in reason and "persistence" in reason
+
+
+def test_a_default_with_no_dense_score_is_not_displaced():
+    """No you-win-by-default branch: with nothing to compare against, the
+    default stands. The old episode gate's no-baseline branch was exactly
+    how junk episodes could promote the worse model."""
+    chosen, reason = better_model(
+        "linear",
+        {
+            "montecarlo": _dense("montecarlo", moments=900, mae=0.1, persistence=1.0),
+        },
+    )
+    assert chosen == "linear"
+    assert "no dense score of its own" in reason
+
+
+def test_pooling_weights_by_moments():
+    pooled = pool_dense(
+        "montecarlo",
+        [
+            _dense("montecarlo", moments=100, mae=1.0, bias=1.0, persistence=2.0),
+            _dense("montecarlo", moments=300, mae=3.0, bias=-1.0, persistence=4.0),
+        ],
+    )
+    assert pooled.moments == 400
+    assert pooled.mae_points == 2.5
+    assert pooled.bias_points == -0.5
+    assert pooled.persistence_mae_points == 3.5
+
+
+# -- the dense metric itself --------------------------------------------------
+
+
+def test_dense_scores_predicted_used_percent_at_the_horizon():
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 50.0),
+        _sample(now + HOUR, 60.0),
+        _sample(now + 2 * HOUR, 61.0),
+    ]
+    rows = [_row(now, "linear", None, used_percent=50.0, burn_per_hour=8.0)]
+
+    score = score_model_dense("linear", [(rows, samples, _is_reset)], 1.0)
+
+    assert score.moments == 1
+    assert score.mae_points == 2.0  # predicted 58, truth 60
+    assert score.bias_points == -2.0
+    assert score.persistence_mae_points == 10.0  # "nothing changes" said 50
+
+
+def test_dense_clamps_predictions_at_the_cap():
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 90.0),
+        _sample(now + HOUR, 95.0),
+        _sample(now + 2 * HOUR, 96.0),
+    ]
+    rows = [_row(now, "linear", None, used_percent=90.0, burn_per_hour=50.0)]
+
+    score = score_model_dense("linear", [(rows, samples, _is_reset)], 1.0)
+
+    assert score.mae_points == 5.0  # clamped to 100, truth 95
+
+
+def test_dense_skips_moments_whose_cycle_does_not_reach_the_horizon():
+    """A reset inside the horizon — or the origin's own declared resets_at
+    passing — makes "used% at +h in this cycle" unanswerable, not zero."""
+    now = 1_000_000.0
+    rows = [_row(now, "linear", None, burn_per_hour=8.0)]
+
+    reset_inside = [
+        _sample(now, 50.0),
+        _sample(now + 0.5 * HOUR, 2.0),  # reset before the horizon
+        _sample(now + 2 * HOUR, 10.0),
+    ]
+    score = score_model_dense("linear", [(rows, reset_inside, _is_reset)], 1.0)
+    assert score.moments == 0
+
+    declared_end_inside = [
+        _sample(now, 50.0, resets_at=now + 0.5 * HOUR),
+        _sample(now + 2 * HOUR, 60.0, resets_at=now + 0.5 * HOUR),
+    ]
+    score = score_model_dense("linear", [(rows, declared_end_inside, _is_reset)], 1.0)
+    assert score.moments == 0
+
+
+def test_dense_truth_is_the_newest_sample_at_or_before_the_horizon():
+    """The level is durable between samples, so truth at +1h is the newest
+    reading at or before it — not an interpolation toward a later one."""
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 50.0),
+        _sample(now + 0.5 * HOUR, 55.0),
+        _sample(now + 2 * HOUR, 99.0),
+    ]
+    assert used_percent_at(samples, 0, now + HOUR, _is_reset) == 55.0
+
+    rows = [_row(now, "linear", None, used_percent=50.0, burn_per_hour=5.0)]
+    score = score_model_dense("linear", [(rows, samples, _is_reset)], 1.0)
+    assert score.moments == 1
+    assert score.mae_points == 0.0  # predicted 55, truth 55
+
+
+def test_dense_skips_rows_that_cannot_be_scored():
+    """No burn recorded (pre-migration NULL), already at the cap, or not an
+    OK answer — none of these are moments the model can be graded on."""
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 50.0),
+        _sample(now + HOUR, 60.0),
+        _sample(now + 2 * HOUR, 61.0),
+    ]
+    rows = [
+        _row(now, "linear", None, burn_per_hour=None),
+        _row(now, "linear", None, used_percent=100.0, burn_per_hour=1.0),
+        _row(now, "linear", None, status="IDLE", burn_per_hour=1.0),
+        _row(now, "linear", None, status=None, burn_per_hour=1.0),
+    ]
+
+    assert score_model_dense("linear", [(rows, samples, _is_reset)], 1.0).moments == 0
+
+
+# -- episode scoring (the diagnostic) -----------------------------------------
 
 
 def test_scoring_ignores_forecasts_belonging_to_other_models():
@@ -162,7 +327,7 @@ def test_a_forecast_whose_window_never_exhausted_is_not_scored():
     score = score_model(
         "linear", [([_row(now, "linear", now + HOUR)], samples, _is_reset)]
     )
-    assert score.with_eta == 1  # it did produce an ETA...
+    assert score.answered == 1  # it did produce an ETA...
     assert score.episodes == 0  # ...but there's nothing to grade it against
     assert score.mae_hours is None
 
@@ -178,12 +343,9 @@ def test_auto_on_a_fresh_store_reports_why_it_stayed_on_the_default(tmp_path, st
 
 
 def test_auto_grades_real_stored_rows(tmp_path, store):
-    """End to end through the store: written forecasts come back out, get
-    graded, and still don't clear the bar on a handful of episodes.
-
-    Writes forecast rows as well as samples. With samples alone this asserted
-    the right answer for the wrong reason — grading nothing also returns the
-    default — so it never actually exercised the stored-grading path."""
+    """End to end through the store: written forecasts come back out — with
+    the fields the dense metric reads — get graded, and still don't clear
+    the bar on a handful of moments."""
     cfg = load_config(tmp_path / "config.toml")
     now = 1_000_000.0
     for i in range(4):
@@ -205,22 +367,26 @@ def test_auto_grades_real_stored_rows(tmp_path, store):
             forecast=_forecast(ts, used, eta=ts + 2 * HOUR),
         )
 
+    rows = store.recent_forecasts(Provider.CLAUDE, WindowKind.WEEKLY, 0.0)
+    assert rows[0].used_percent == 40.0  # the dense metric's inputs round-trip
+    assert rows[0].burn_per_hour == 20.0
+    assert rows[0].prob_exhaust_before_reset == 0.5
+
     graded = score_model(
         "montecarlo",
         [
             (
-                store.recent_forecasts(Provider.CLAUDE, WindowKind.WEEKLY, 0.0),
+                rows,
                 store.recent_samples(Provider.CLAUDE, WindowKind.WEEKLY, 0.0),
                 _is_reset,
             )
         ],
     )
-    assert graded.with_eta == 4  # the rows really did come back out...
+    assert graded.answered == 4  # the rows really did come back out...
     assert graded.episodes > 0  # ...and really were gradeable
 
     predictor, reason = select_predictor(cfg, store)
     assert predictor.name == "linear"
-    assert "not enough" in reason or "no stored forecasts" in reason
 
 
 def test_a_moment_already_at_the_cap_is_not_an_episode():
@@ -244,35 +410,37 @@ def test_an_unclamped_reading_above_the_cap_is_also_not_an_episode():
 
 
 def test_sitting_at_the_cap_cannot_mint_episodes_for_one_model():
-    """The defect this guard exists for, end to end.
-
-    While a window is pinned at 100%, montecarlo keeps answering "exhausted
-    now" every tick while linear falls silent once its lookback clears the
-    climb. Each of those answers used to score as an episode worth roughly one
-    sample cadence of error, so two hours of saturation minted ~120 of them
-    for montecarlo against ~9 for linear — enough to clear the graduation bar
-    and hand `auto` to the model that is worse on real episodes, via
-    better_model's no-baseline branch."""
+    """While a window is pinned at 100%, montecarlo keeps answering
+    "exhausted now" every tick. Each of those answers used to score as an
+    episode worth roughly one sample cadence of error — ~120 in two hours —
+    and the old episode-based gate then promoted the model that is worse on
+    real episodes via its no-baseline branch. The at-cap guard keeps them
+    unscorable, and the gate now decides on dense moments, never episodes."""
     now = 1_000_000.0
-    # A pinned-at-100 stretch, sampled every five minutes.
+    # A pinned-at-100 stretch, sampled every five minutes; each row records
+    # the 100% it was made from, as real rows do.
     samples = [_sample(now + i * 300.0, 100.0) for i in range(24)]
-    rows = [_row(now + i * 300.0, "montecarlo", now + i * 300.0) for i in range(24)]
+    rows = [
+        _row(
+            now + i * 300.0,
+            "montecarlo",
+            now + i * 300.0,
+            used_percent=100.0,
+            burn_per_hour=0.0,
+        )
+        for i in range(24)
+    ]
 
     score = score_model("montecarlo", [(rows, samples, _is_reset)])
 
-    assert score.with_eta == 24  # it did answer every tick...
+    assert score.answered == 24  # it did answer every tick...
     assert score.episodes == 0  # ...and not one of them was gradeable
     assert score.mae_hours is None
 
-    chosen, reason = better_model(
-        "linear",
-        {
-            "linear": _score("linear", episodes=0, mae=None),
-            "montecarlo": score,
-        },
-    )
-    assert chosen == "linear"
-    assert "not enough scored history" in reason
+    # Nor can those moments feed the dense metric: at the cap there is
+    # nothing left to predict, so saturation mints nothing anywhere.
+    dense = score_model_dense("montecarlo", [(rows, samples, _is_reset)], 1.0)
+    assert dense.moments == 0
 
 
 def test_a_forecast_is_graded_against_the_reading_it_actually_saw():
@@ -297,20 +465,22 @@ def test_a_forecast_is_graded_against_the_reading_it_actually_saw():
 
 
 def test_a_deliberately_withheld_forecast_is_not_a_coverage_miss():
-    """A forecast the predictor declined to make (no live reading to
-    extrapolate from) isn't the same as one it got wrong — counting IDLE and
-    NO_DATA rows as moments-without-an-ETA would penalize a model for
-    correctly staying quiet."""
+    """A forecast the predictor declined to make — no live reading (IDLE),
+    nothing reported (NO_DATA), a just-turned-over cycle (RESET_PENDING) —
+    isn't the same as one it got wrong. And a risk-only answer (censored
+    median, known tail probability) is an answer, not a miss."""
     now = 1_000_000.0
     samples = [_sample(now, 50.0), _sample(now + HOUR, 100.0)]
     rows = [
         _row(now, "linear", None, status="IDLE"),
         _row(now, "linear", None, status="NO_DATA"),
+        _row(now, "linear", None, status="RESET_PENDING"),
+        _row(now, "linear", None, status="OK", prob=0.2),  # risk-only answer
         _row(now, "linear", now + 2 * HOUR, status="OK"),
     ]
 
     score = score_model("linear", [(rows, samples, _is_reset)])
 
-    assert score.moments == 1  # only the OK row counts
-    assert score.with_eta == 1
+    assert score.moments == 2  # only the two OK rows count
+    assert score.answered == 2  # ...and both answered, one via risk alone
     assert score.coverage == 1.0
