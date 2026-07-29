@@ -144,6 +144,9 @@ _FORECAST_COLUMNS_ADDED_LATER = {
     # answered rather than as a coverage miss, and the backtest's risk
     # calibration grades the probabilities themselves.
     "prob_exhaust_before_reset": "REAL",
+    # The model's own expected used% at its kind's dense horizon -- what
+    # model selection grades (see models.Forecast.predicted_used_percent).
+    "predicted_used_percent": "REAL",
 }
 
 
@@ -199,6 +202,7 @@ class ForecastRow:
     used_percent: float
     burn_per_hour: float | None
     prob_exhaust_before_reset: float | None
+    predicted_used_percent: float | None
 
 
 @dataclass(frozen=True)
@@ -474,8 +478,8 @@ class Store:
             "(made_at, provider, window_kind, model_name, used_percent, "
             " eta_calendar, eta_p50, eta_p90, eta_workhours, status, "
             " burn_per_hour, burn_basis, time_to_reset_h, exhausts_before_reset, "
-            " prob_exhaust_before_reset) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " prob_exhaust_before_reset, predicted_used_percent) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 made_at,
                 window.provider.value,
@@ -492,6 +496,7 @@ class Store:
                 forecast.time_to_reset_h,
                 int(forecast.exhausts_before_reset),
                 forecast.prob_exhaust_before_reset,
+                forecast.predicted_used_percent,
             ),
         )
 
@@ -503,7 +508,7 @@ class Store:
         there; that's a genuine "not recorded," not a value to invent."""
         rows = self._conn.execute(
             "SELECT made_at, model_name, eta_calendar, status, used_percent, "
-            "  burn_per_hour, prob_exhaust_before_reset "
+            "  burn_per_hour, prob_exhaust_before_reset, predicted_used_percent "
             "FROM forecasts WHERE provider = ? AND window_kind = ? AND made_at >= ? "
             "ORDER BY made_at ASC",
             (provider.value, kind.value, since_ts),
@@ -517,6 +522,7 @@ class Store:
                 used_percent=row["used_percent"],
                 burn_per_hour=row["burn_per_hour"],
                 prob_exhaust_before_reset=row["prob_exhaust_before_reset"],
+                predicted_used_percent=row["predicted_used_percent"],
             )
             for row in rows
         ]

@@ -9,6 +9,8 @@ corrupting block boundaries, truth scans, and risk grading.
 
 from __future__ import annotations
 
+import pytest
+
 from tokenwatchdog.models import Provider, Window, WindowKind, window_is_rolling
 from tokenwatchdog.predictor import (
     LinearPredictor,
@@ -141,6 +143,47 @@ def test_gentle_rolloff_decline_is_ok_with_no_eta_not_an_error(cfg):
     assert forecast.burn_per_hour <= 0.0
     assert forecast.eta_calendar is None
     assert forecast.exhausts_before_reset is False
+
+
+def test_rolling_calibration_spans_the_trailing_rise_not_the_whole_block(cfg):
+    """A rolling window is one giant block whose level rises and falls, so
+    a whole-block delta is confounded by roll-off — measured on real
+    history as a net-negative delta that returned None and silently
+    discarded all 8,178 codex token events. The span is the trailing
+    non-decreasing run: 50 → 0 roll-off followed by a 0 → 60 rise
+    calibrates on the rise (60 points / its tokens), not on the net +10."""
+    from tokenwatchdog.predictor import _percent_per_token
+    from tokenwatchdog.store import TokenEventRow
+
+    now = 1_000_000.0
+    clears_at = now + 3 * 24 * HOUR
+    block = [
+        _sample(now - 10 * HOUR, 50.0, clears_at),
+        _sample(now - 8 * HOUR, 20.0, clears_at),  # roll-off
+        _sample(now - 6 * HOUR, 0.0, clears_at),  # rolled to nothing
+        _sample(now - 3 * HOUR, 30.0, clears_at),  # new usage
+        _sample(now, 60.0, clears_at),
+    ]
+    events = [
+        TokenEventRow(
+            ts=now - 3 * HOUR + i * 600.0,
+            model="m",
+            input_tokens=200,
+            output_tokens=100,
+            cache_creation=0,
+            cache_read=0,
+        )
+        for i in range(18)  # 5,400 tokens across the rise, all before `now`
+    ]
+
+    # The whole-block delta (60 - 50 = 10) is confounded by the 50-point
+    # roll-off: the fixed-window path understates the ratio 6x.
+    confounded = _percent_per_token(block, events, rolling=False)
+    assert confounded == pytest.approx(10.0 / 5400.0, rel=0.01)
+
+    ratio = _percent_per_token(block, events, rolling=True)
+    assert ratio is not None
+    assert ratio == pytest.approx(60.0 / 5400.0, rel=0.01)
 
 
 def test_truth_scan_is_bounded_by_the_origins_own_cycle_end():

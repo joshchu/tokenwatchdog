@@ -21,9 +21,10 @@ def _forecast(
     exhausts=False,
     eta_calendar=None,
     time_to_reset_h=None,
+    provider=Provider.CODEX,
 ):
     window = Window(
-        provider=Provider.CODEX,
+        provider=provider,
         kind=WindowKind.WEEKLY,
         used_percent=used_percent,
         window_minutes=10080,
@@ -59,10 +60,47 @@ def test_threshold_fires_once_then_suppressed(cfg, store):
 
 
 def test_threshold_rearms_when_resets_at_advances(cfg, store):
+    # CLAUDE deliberately: on a fixed-cycle window an advancing resets_at IS
+    # a new cycle. The rolling counterpart below pins the opposite.
     now = 1000.0
-    evaluate(_forecast(91.0, resets_at=100_000.0), cfg, store, now)  # fires, disarms
-    assert evaluate(_forecast(91.0, resets_at=100_000.0), cfg, store, now + 60) == []
-    fired_again = evaluate(_forecast(91.0, resets_at=200_000.0), cfg, store, now + 120)
+    evaluate(
+        _forecast(91.0, resets_at=100_000.0, provider=Provider.CLAUDE),
+        cfg,
+        store,
+        now,
+    )  # fires, disarms
+    assert (
+        evaluate(
+            _forecast(91.0, resets_at=100_000.0, provider=Provider.CLAUDE),
+            cfg,
+            store,
+            now + 60,
+        )
+        == []
+    )
+    fired_again = evaluate(
+        _forecast(91.0, resets_at=200_000.0, provider=Provider.CLAUDE),
+        cfg,
+        store,
+        now + 120,
+    )
+    assert len(fired_again) == 1
+
+
+def test_rolling_window_does_not_rearm_on_resets_at_aging(cfg, store):
+    """Codex weekly's resets_at slides forward as old usage ages out of the
+    rolling sum -- that is aging, not a cleared cycle, and re-arming on it
+    re-alerted a still-95% window on every advance. Re-arm there is
+    level-based only (hysteresis)."""
+    now = 1000.0
+    fired = evaluate(_forecast(95.0, resets_at=100_000.0), cfg, store, now)
+    assert len(fired) == 1
+    # resets_at advances while usage never clears: stays silent.
+    assert evaluate(_forecast(95.0, resets_at=200_000.0), cfg, store, now + 60) == []
+    assert evaluate(_forecast(96.0, resets_at=300_000.0), cfg, store, now + 120) == []
+    # The level actually clearing re-arms it.
+    assert evaluate(_forecast(10.0, resets_at=400_000.0), cfg, store, now + 180) == []
+    fired_again = evaluate(_forecast(95.0, resets_at=400_000.0), cfg, store, now + 240)
     assert len(fired_again) == 1
 
 
@@ -122,6 +160,7 @@ def test_burn_alert_rearms_when_resets_at_advances(cfg, store):
         exhausts=True,
         eta_calendar=_dt(now + 3600),
         time_to_reset_h=5.0,
+        provider=Provider.CLAUDE,
     )
     fired = evaluate(first, cfg, store, now)
     assert any(a.alert_kind == "burn" for a in fired)
@@ -135,8 +174,49 @@ def test_burn_alert_rearms_when_resets_at_advances(cfg, store):
         exhausts=True,
         eta_calendar=_dt(now + 3600),
         time_to_reset_h=5.0,
+        provider=Provider.CLAUDE,
     )
     fired_again = evaluate(second, cfg, store, now + 120)
+    assert any(a.alert_kind == "burn" for a in fired_again)
+
+
+def test_rolling_burn_alert_rearms_only_when_the_level_clears(cfg, store):
+    """On a rolling window resets_at advances continuously, so the burn
+    alert's re-arm is the level falling back below burn_min_percent -- under
+    its own floor, the danger it warned about has demonstrably passed."""
+    now = 1000.0
+    burning = _forecast(
+        30.0,
+        resets_at=100_000.0,
+        exhausts=True,
+        eta_calendar=_dt(now + 3600),
+        time_to_reset_h=5.0,
+    )
+    fired = evaluate(burning, cfg, store, now)
+    assert any(a.alert_kind == "burn" for a in fired)
+
+    advanced = _forecast(
+        30.0,
+        resets_at=200_000.0,
+        exhausts=True,
+        eta_calendar=_dt(now + 3600),
+        time_to_reset_h=5.0,
+    )
+    assert not any(
+        a.alert_kind == "burn" for a in evaluate(advanced, cfg, store, now + 60)
+    )
+
+    # Usage rolls off below the burn floor, then a new burst: re-armed.
+    calm = _forecast(5.0, resets_at=300_000.0)
+    evaluate(calm, cfg, store, now + 120)
+    burst = _forecast(
+        30.0,
+        resets_at=300_000.0,
+        exhausts=True,
+        eta_calendar=_dt(now + 3600 + 180),
+        time_to_reset_h=5.0,
+    )
+    fired_again = evaluate(burst, cfg, store, now + 180)
     assert any(a.alert_kind == "burn" for a in fired_again)
 
 
@@ -145,9 +225,19 @@ def test_idle_threshold_still_fires_while_the_level_is_in_cycle(cfg, store):
     read 95% an hour ago and doesn't reset for another day is still at 95%
     now -- quota doesn't un-consume while you're away, so staying silent
     here was suppressing a true alert about a real number."""
-    forecast = _forecast(95.0, status="IDLE", resets_at=100_000.0)
+    forecast = _forecast(
+        95.0, status="IDLE", resets_at=100_000.0, provider=Provider.CLAUDE
+    )
     fired = evaluate(forecast, cfg, store, 1000.0)
     assert [a.alert_kind for a in fired] == ["threshold"]
+
+
+def test_a_stale_rolling_level_is_not_vouched_for(cfg, store):
+    """A rolling window's level decays on its own, so a stale 95% may be
+    60% by now -- alerting on it would be alerting on a number that no
+    longer exists. Only fixed windows get the durable-level treatment."""
+    forecast = _forecast(95.0, status="IDLE", resets_at=100_000.0)
+    assert evaluate(forecast, cfg, store, 1000.0) == []
 
 
 def test_idle_burn_alert_never_fires(cfg, store):

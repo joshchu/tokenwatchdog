@@ -13,6 +13,7 @@ from tokenwatchdog.models import (
     Window,
     WindowKind,
     level_still_in_cycle,
+    window_is_rolling,
 )
 from tokenwatchdog.store import AlertStateRow, Store
 
@@ -158,11 +159,21 @@ def _rearm_if_needed(
     re-arms on a hysteresis drop (used_percent falls back below
     `warn_percent - threshold_hysteresis`), so the same block can re-warn if
     usage dips and climbs again.
+
+    On a ROLLING window, resets_at advancing is aging — old usage sliding
+    out of the sum — not a cycle boundary, so it re-arms nothing there:
+    otherwise a still-95% window re-alerted on every advance while usage
+    never cleared. Rolling re-arm is level-based only: the threshold
+    alert's hysteresis drop, and for the burn alert usage falling back
+    below `burn_min_percent` (under the burn alert's own floor, the danger
+    it warned about has demonstrably passed).
     """
     if state is None or state.armed:
         return True
+    rolling = window_is_rolling(window.provider, window.kind)
     reset_advanced = (
-        window.resets_at is not None
+        not rolling
+        and window.resets_at is not None
         and state.reset_epoch_at_fire is not None
         and window.resets_at > state.reset_epoch_at_fire + 1.0
     )
@@ -170,6 +181,8 @@ def _rearm_if_needed(
         window.used_percent
         < cfg.thresholds.warn_percent - cfg.thresholds.threshold_hysteresis
     )
+    if rolling and alert_kind == "burn":
+        hysteresis_cleared = window.used_percent < cfg.thresholds.burn_min_percent
     if not (reset_advanced or hysteresis_cleared):
         return False
     store.set_alert_state(

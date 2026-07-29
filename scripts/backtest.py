@@ -149,24 +149,34 @@ def _score_pair(
         )
         used_now = samples[index].used_percent
 
+        forecasts = {
+            name: _PREDICTORS[name].forecast(window, history, past_events, cfg, now)
+            for name in model_names
+        }
+        # Dense scoring is MATCHED: the moment counts only when every model
+        # produced a prediction for it — scoring each model on its own
+        # moments let one that answers only on easy moments look better
+        # than a default graded on harder ones.
+        dense_predictions = {
+            name: forecast.predicted_used_percent
+            for name, forecast in forecasts.items()
+            if forecast.status == "OK" and forecast.predicted_used_percent is not None
+        }
+        dense_scorable = (
+            len(dense_predictions) == len(model_names)
+            and used_at_horizon is not None
+            and used_now < 100.0
+        )
         for name in model_names:
             score = scores[name]
             score.moments += 1
-            forecast = _PREDICTORS[name].forecast(
-                window, history, past_events, cfg, now
-            )
+            forecast = forecasts[name]
             assert score.dense_errors is not None
             assert score.persistence_errors is not None
             assert score.risk is not None
-            if (
-                forecast.status == "OK"
-                and used_at_horizon is not None
-                and used_now < 100.0
-            ):
-                predicted = min(
-                    100.0, max(0.0, used_now + forecast.burn_per_hour * horizon_h)
-                )
-                score.dense_errors.append(predicted - used_at_horizon)
+            if dense_scorable:
+                assert used_at_horizon is not None
+                score.dense_errors.append(dense_predictions[name] - used_at_horizon)
                 score.persistence_errors.append(used_now - used_at_horizon)
             if forecast.prob_exhaust_before_reset is not None and outcome is not None:
                 score.risk.append((forecast.prob_exhaust_before_reset, outcome))

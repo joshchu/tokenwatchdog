@@ -257,75 +257,114 @@ def used_percent_at(
     """The window's used% at `target_ts`, or None if that moment isn't
     scorable from this cycle.
 
-    The level is the newest same-cycle sample at or before `target_ts` — a
-    used% level is durable between samples (quota doesn't move unobserved),
-    so this is exact, not an interpolation. Scorable requires the cycle to
-    demonstrably survive to `target_ts`: a reset before it, the origin's own
-    declared `resets_at` passing, or the data simply ending all make the
-    question "used% at +h in this cycle" unanswerable rather than zero.
+    Interpolated linearly between the same-cycle samples straddling the
+    target. "Newest sample at or before" was exact only for a fixed window
+    observed densely; across a sparse gap it returned a level that was
+    hours stale in BOTH directions — a rolling window can decay unobserved
+    (a 50% origin that rolled to ~5% before the next sample read as still
+    50%, rewarding persistence for the gap), and a fixed one can climb.
+    Interpolation uses both observations, and a sample landing exactly at
+    the target is simply itself.
+
+    Scorable requires the cycle to demonstrably survive to `target_ts`:
+    a reset before it, the origin's own declared `resets_at` passing, or
+    the data simply ending all make the question "used% at +h in this
+    cycle" unanswerable rather than zero. A reset inside the gap that
+    straddles the target stays unanswerable too — the boundary's exact
+    moment within the gap is unknown, so the level at the target is as
+    well.
     """
     origin = samples[origin_index]
     if origin.resets_at is not None and target_ts > origin.resets_at:
         return None
-    level = origin.used_percent
+    previous = origin
     for offset in range(origin_index + 1, len(samples)):
-        if is_reset(samples[offset - 1], samples[offset]):
+        current = samples[offset]
+        if is_reset(previous, current):
             return None
-        if samples[offset].source_ts > target_ts:
-            return level
-        level = samples[offset].used_percent
+        if current.source_ts >= target_ts:
+            span = current.source_ts - previous.source_ts
+            if span <= 0:
+                return current.used_percent
+            fraction = (target_ts - previous.source_ts) / span
+            return previous.used_percent + fraction * (
+                current.used_percent - previous.used_percent
+            )
+        previous = current
     return None  # data ends before the horizon -- unknown, not zero
 
 
-def score_model_dense(
-    model_name: str, pairs: list[ScoringPair], horizon_h: float
-) -> DenseScore:
-    """Fixed-horizon used% error: predicted = used% + burn·h (clamped to
-    [0, 100]) versus the level the store later recorded, over every OK
-    moment that has a same-cycle future to check against.
+def score_dense(
+    model_names: list[str], pairs: list[ScoringPair], horizon_h: float
+) -> dict[str, DenseScore]:
+    """Fixed-horizon used% error per model, on MATCHED moments: a moment
+    counts only when EVERY model has a scorable prediction for that same
+    made_at. Scoring each model on its own moment set let a model that
+    answers only on easy moments beat a default graded on harder ones —
+    measured on real stored history as inflating a challenger's apparent
+    edge from 11.6% to 13.2%.
 
-    This is the metric that makes model selection decidable: exhaustion
-    episodes arrive a couple per week, dense moments arrive hundreds per
-    day. It reads entirely from columns the forecasts table already stores
-    (used_percent, burn_per_hour) — which is also what makes burn_per_hour's
-    meaning a graded contract rather than a display convention.
+    The prediction graded is the model's own `predicted_used_percent`
+    (linear: the rate projection; the simulating model: its mean simulated
+    level — where the rhythm knowledge lives). Rows from before that
+    column existed fall back to used + burn·h, which was exact for linear
+    and approximate for the simulating model. This is the metric that
+    makes model selection decidable: exhaustion episodes arrive a couple
+    per week, dense moments arrive hundreds per day.
 
-    Persistence (predicted = used% now) is computed on the SAME moments and
-    carried in the result, so "beats persistence" is a matched comparison.
+    Persistence (predicted = used% now) is computed on the same matched
+    moments and carried in every result, so "beats persistence" is exact.
     """
-    errors: list[float] = []
+    errors: dict[str, list[float]] = {name: [] for name in model_names}
     persistence_errors: list[float] = []
     for rows, samples, is_reset in pairs:
         source_times = [sample.source_ts for sample in samples]
+        by_moment: dict[float, dict[str, float]] = {}
         for row in rows:
-            if row.model_name != model_name or row.status != "OK":
+            if row.model_name not in errors or row.status != "OK":
                 continue
-            if row.used_percent >= _EXHAUSTED_PERCENT or row.burn_per_hour is None:
+            if row.used_percent >= _EXHAUSTED_PERCENT:
                 continue
-            index = _origin_sample_index(source_times, row.made_at)
+            prediction = row.predicted_used_percent
+            if prediction is None and row.burn_per_hour is not None:
+                prediction = min(
+                    100.0, max(0.0, row.used_percent + row.burn_per_hour * horizon_h)
+                )
+            if prediction is None:
+                continue
+            by_moment.setdefault(row.made_at, {})[row.model_name] = prediction
+        for made_at in sorted(by_moment):
+            predictions = by_moment[made_at]
+            if len(predictions) != len(model_names):
+                continue  # not every model answered here — unmatched
+            index = _origin_sample_index(source_times, made_at)
             if index is None:
                 continue
             truth = used_percent_at(
-                samples, index, row.made_at + horizon_h * 3600.0, is_reset
+                samples, index, made_at + horizon_h * 3600.0, is_reset
             )
             if truth is None:
                 continue
-            predicted = min(
-                100.0, max(0.0, row.used_percent + row.burn_per_hour * horizon_h)
-            )
-            errors.append(predicted - truth)
-            persistence_errors.append(row.used_percent - truth)
-    return DenseScore(
-        model_name=model_name,
-        moments=len(errors),
-        mae_points=statistics.fmean(abs(e) for e in errors) if errors else None,
-        bias_points=statistics.fmean(errors) if errors else None,
-        persistence_mae_points=(
-            statistics.fmean(abs(e) for e in persistence_errors)
-            if persistence_errors
-            else None
-        ),
+            for name, prediction in predictions.items():
+                errors[name].append(prediction - truth)
+            persistence_errors.append(samples[index].used_percent - truth)
+    persistence_mae = (
+        statistics.fmean(abs(e) for e in persistence_errors)
+        if persistence_errors
+        else None
     )
+    return {
+        name: DenseScore(
+            model_name=name,
+            moments=len(model_errors),
+            mae_points=(
+                statistics.fmean(abs(e) for e in model_errors) if model_errors else None
+            ),
+            bias_points=statistics.fmean(model_errors) if model_errors else None,
+            persistence_mae_points=persistence_mae if model_errors else None,
+        )
+        for name, model_errors in errors.items()
+    }
 
 
 def brier_score(outcomes: list[tuple[float, int]]) -> float | None:
@@ -417,6 +456,12 @@ def better_model(default: str, dense: dict[str, DenseScore]) -> tuple[str, str]:
             f"{default}: no dense score of its own to compare against "
             f"({winner.model_name} has {winner.moments} moments)"
         )
+    if baseline.mae_points == 0.0:
+        # A zero-error baseline is unbeatable by margin arithmetic (and the
+        # division below would crash the daemon at startup). Flat quota is
+        # exactly where this happens: both models predict "no change" and
+        # both are right.
+        return default, f"{default}: already exact on the dense metric"
     vs_default = (baseline.mae_points - winner_mae) / baseline.mae_points
     if vs_default < MIN_RELATIVE_IMPROVEMENT:
         return default, (
@@ -428,6 +473,13 @@ def better_model(default: str, dense: dict[str, DenseScore]) -> tuple[str, str]:
     persistence_mae = winner.persistence_mae_points
     if persistence_mae is None:
         return default, f"{default}: no persistence baseline on the same moments"
+    if persistence_mae == 0.0:
+        # "Nothing changes" was exactly right on these moments; no model
+        # can clear a margin over zero.
+        return default, (
+            f"{default}: persistence is already exact on "
+            f"{winner.model_name}'s moments — nothing to beat it by"
+        )
     vs_persistence = (persistence_mae - winner_mae) / persistence_mae
     if vs_persistence < MIN_RELATIVE_IMPROVEMENT:
         return default, (

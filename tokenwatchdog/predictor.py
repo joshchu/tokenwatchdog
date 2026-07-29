@@ -24,7 +24,7 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, tzinfo
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from tokenwatchdog.blocks import block_anchor
 from tokenwatchdog.config import (
@@ -47,11 +47,13 @@ from tokenwatchdog.models import (
 )
 from tokenwatchdog.scoring import (
     DENSE_HORIZON_H,
+    MIN_DENSE_MOMENTS,
+    MIN_RELATIVE_IMPROVEMENT,
     DenseScore,
     ScoringPair,
     better_model,
     pool_dense,
-    score_model_dense,
+    score_dense,
 )
 from tokenwatchdog.store import SampleRow, Store, TokenEventRow
 
@@ -207,7 +209,11 @@ class MonteCarloPredictor:
             else _live_burn_rate(block, token_events, cfg, window, now)
         )
 
-        percent_per_token = _percent_per_token(block.samples, token_events)
+        percent_per_token = _percent_per_token(
+            block.samples,
+            token_events,
+            window_is_rolling(window.provider, window.kind),
+        )
         raw_buckets = _build_burn_buckets(
             history, token_events, percent_per_token, tz, now, is_reset
         )
@@ -281,7 +287,7 @@ class MonteCarloPredictor:
         # 0.0 hours, which is falsy, so `or horizon_h` rewrote every run as
         # censored and reported a 0% chance of exhausting on a window that is
         # ALREADY exhausted -- rendered as "Risk 0%" on a red 100% row.
-        simulated = (
+        runs = [
             _simulate_exhaustion_hours(
                 window.used_percent,
                 now,
@@ -290,11 +296,27 @@ class MonteCarloPredictor:
                 tz,
                 horizon_h,
                 live_rate=live.burn_per_hour if live is not None else None,
+                checkpoint_h=DENSE_HORIZON_H[window.kind],
             )
             for _ in range(mc_runs)
-        )
-        outcomes = [horizon_h if hours is None else hours for hours in simulated]
+        ]
+        outcomes = [
+            horizon_h if run.exhausted_after_h is None else run.exhausted_after_h
+            for run in runs
+        ]
         outcomes.sort()
+        # This model's OWN answer to the dense-scoring question, from the
+        # simulation itself: the mean simulated level at the horizon. This
+        # is where the rhythm knowledge lives — burn_per_hour became the
+        # shared live rate, identical across models, so grading it made the
+        # dense metric blind to the simulation entirely (measured: exact
+        # ties on every common moment).
+        levels = [
+            run.level_at_checkpoint
+            for run in runs
+            if run.level_at_checkpoint is not None
+        ]
+        predicted_used = _weighted_mean(levels, [1.0] * len(levels)) if levels else None
         # Because the horizon IS the reset (when known), a non-censored
         # outcome already means "exhausted before the reset" -- there's
         # nothing past the horizon to have compared against.
@@ -310,6 +332,13 @@ class MonteCarloPredictor:
             n_observations,
             coverage=_horizon_bucket_coverage(now, horizon_h, buckets, tz),
         )
+        if live is not None:
+            # The blend hands the near term to the live rate, so a near-cap
+            # answer can be decided entirely by a couple of fresh samples
+            # while n_observations counts weeks of profile. Confidence is
+            # capped by the weaker of the two evidence bases -- it can only
+            # drop, matching how coverage is applied.
+            confidence = _weaker_confidence(confidence, _confidence(live.n_samples))
         if p50_h is None:
             # More than half the simulated futures never exhausted within the
             # horizon, so there is no point ETA to report -- and, critically,
@@ -341,6 +370,7 @@ class MonteCarloPredictor:
                 exhausts_before_reset=False,
                 n_samples=n_observations,
                 burn_basis=reported_basis,
+                predicted_used_percent=predicted_used,
             )
 
         horizon = _eta_horizon(window, resets_at, now_dt, tz)
@@ -374,6 +404,7 @@ class MonteCarloPredictor:
             exhausts_before_reset=eta_p50 is not None and time_to_reset_h is not None,
             n_samples=n_observations,
             burn_basis=reported_basis,
+            predicted_used_percent=predicted_used,
         )
 
 
@@ -441,14 +472,60 @@ def _grade_stored_models(cfg: Config, store: Store) -> tuple[str, str]:
                 )
     if not pairs_by_kind:
         return _DEFAULT_MODEL, f"{_DEFAULT_MODEL}: no stored forecasts to grade yet"
-    dense: dict[str, DenseScore] = {}
-    for name in _PREDICTORS:
-        per_kind = [
-            score_model_dense(name, pairs, DENSE_HORIZON_H[kind])
-            for kind, pairs in pairs_by_kind.items()
-        ]
-        dense[name] = pool_dense(name, per_kind)
-    return better_model(_DEFAULT_MODEL, dense)
+    model_names = list(_PREDICTORS)
+    per_kind_scored = [
+        (kind, score_dense(model_names, pairs, DENSE_HORIZON_H[kind]))
+        for kind, pairs in pairs_by_kind.items()
+    ]
+    dense: dict[str, DenseScore] = {
+        name: pool_dense(name, [scored[name] for _, scored in per_kind_scored])
+        for name in model_names
+    }
+    chosen, reason = better_model(_DEFAULT_MODEL, dense)
+    if chosen == _DEFAULT_MODEL:
+        return chosen, reason
+    veto = _per_kind_veto(chosen, per_kind_scored)
+    if veto is not None:
+        return _DEFAULT_MODEL, veto
+    return chosen, reason
+
+
+def _per_kind_veto(
+    chosen: str,
+    per_kind_scored: list[tuple[WindowKind, dict[str, DenseScore]]],
+) -> str | None:
+    """Why a pooled winner must NOT be switched to, or None if it may.
+
+    A pooled winner drives ALERTS on every window, so it must not be
+    materially worse than the default on any kind with enough matched
+    moments to conclude anything. Without this, a big weekly win could
+    crown a model that is measurably worse on the 5-hour window — the
+    window where alerts are most urgent."""
+    for kind, scored in per_kind_scored:
+        winner_score = scored.get(chosen)
+        default_score = scored.get(_DEFAULT_MODEL)
+        if (
+            winner_score is None
+            or default_score is None
+            or winner_score.moments < MIN_DENSE_MOMENTS
+            or winner_score.mae_points is None
+            or default_score.mae_points is None
+            or default_score.mae_points == 0.0
+        ):
+            continue
+        regression = (
+            winner_score.mae_points - default_score.mae_points
+        ) / default_score.mae_points
+        if regression >= MIN_RELATIVE_IMPROVEMENT:
+            return (
+                f"{_DEFAULT_MODEL}: {chosen} wins pooled but is "
+                f"{regression:.0%} worse on {kind.value} "
+                f"({winner_score.mae_points:.2f} vs "
+                f"{default_score.mae_points:.2f} pts over "
+                f"{winner_score.moments} moments) — no switch that degrades "
+                f"one window's alerts"
+            )
+    return None
 
 
 # -- shared preprocessing: the "clean burn series" ---------------------------
@@ -571,11 +648,13 @@ class _TokenBurn:
 
 
 def _percent_per_token(
-    block_samples: list[SampleRow], token_events: list[TokenEventRow]
+    block_samples: list[SampleRow],
+    token_events: list[TokenEventRow],
+    rolling: bool = False,
 ) -> float | None:
     """How much of this window's quota one token consumes, measured rather
-    than assumed — the authoritative percentage's movement across the whole
-    block divided by the tokens spent over the same span.
+    than assumed — the authoritative percentage's movement across a
+    calibration span divided by the tokens spent over the same span.
 
     This is what lets a token rate become a %/h rate without knowing the
     provider's real token cap (which Codex never publishes and Claude only
@@ -583,12 +662,33 @@ def _percent_per_token(
     if some fraction of account-wide usage never writes a transcript here,
     the ratio absorbs it as long as the mix stays roughly steady.
 
-    None when the block hasn't moved enough to calibrate against, or ends
+    The span is the whole block for a fixed window. A ROLLING window is one
+    giant block whose level rises and falls, so a whole-block delta is
+    confounded by roll-off — measured on real history as a net-negative
+    delta that returned None and silently discarded all 8,178 codex token
+    events. There the span is the trailing non-decreasing run: a stretch
+    where new usage dominated aging-out, which is the least-confounded
+    calibration the series offers (concurrent roll-off during the rise
+    still understates the ratio slightly — conservative, never inflating).
+
+    None when the span hasn't moved enough to calibrate against, or ends
     saturated (a clipped percentage understates the real movement).
     """
     if len(block_samples) < 2:
         return None
-    first, last = block_samples[0], block_samples[-1]
+    span = block_samples
+    if rolling:
+        start = len(block_samples) - 1
+        while (
+            start > 0
+            and block_samples[start - 1].used_percent
+            <= block_samples[start].used_percent
+        ):
+            start -= 1
+        span = block_samples[start:]
+        if len(span) < 2:
+            return None
+    first, last = span[0], span[-1]
     if last.used_percent >= 100.0:
         return None
     delta_percent = last.used_percent - first.used_percent
@@ -623,7 +723,9 @@ def _token_burn_per_hour(
     actually seen: one burst two minutes ago is a burst, not a sustained
     rate, and dividing by its own two-minute span would report it as one.
     """
-    percent_per_token = _percent_per_token(block_samples, token_events)
+    percent_per_token = _percent_per_token(
+        block_samples, token_events, window_is_rolling(window.provider, window.kind)
+    )
     if percent_per_token is None:
         return None
     lookback_hours = _lookback_minutes(cfg, window.kind) / 60.0
@@ -802,30 +904,36 @@ def _derive_resets_at(
 
     Derivations, best first:
 
-    1. **Deterministic anchor** (5-hour window only). The 5-hour window is
-       a fixed block anchored at the first request after an idle gap. Two
-       independent kinds of evidence bound where it started: the last
-       0 → positive rise in the percentage series (`_sample_block_anchor`,
-       account-wide but rounding-lagged) and the first post-gap activity in
-       the token log (`blocks.block_anchor`, exact but blind to usage on
-       any other surface). Both necessarily come at or after the true first
-       message, so the EARLIEST wins. The 7-day window has no comparably
-       real anchor rule, so it does not get this path rather than getting a
-       guessed one.
-    2. **Last observed reset + one duration.** Both windows are
+    1. **Fresh observed boundary** (5-hour window only). A reset drop seen
+       in the account-wide series within the last window duration is the
+       strongest evidence and INVALIDATES all older anchors — CLI activity
+       can run continuously through an account boundary, leaving the
+       token-log anchor pointing into the previous block. The anchor is the
+       earliest evidence at/after the boundary (first post-reset sample, or
+       an earlier token event if the CLI spoke first).
+    2. **Deterministic anchor** (5-hour window only, no fresh boundary).
+       Two independent kinds of evidence bound where the block started: the
+       last 0 → positive rise in the percentage series
+       (`_sample_block_anchor`, account-wide but rounding-lagged) and the
+       first post-gap activity in the token log (`blocks.block_anchor`,
+       exact but blind to usage on any other surface). Both necessarily
+       come at or after the true first message, so the EARLIEST wins. The
+       7-day window has no comparably real anchor rule, so it does not get
+       this path rather than getting a guessed one.
+    3. **Last observed reset + one duration.** Both windows are
        fixed-duration cycles that re-anchor at each real reset, so the next
        one follows from the last one we actually saw. If no reset appears
        in history at all, the true anchor predates our data and is
        genuinely unknown — report that rather than guessing a calendar day.
 
     A 5-hour window whose activity log exists but shows an expired block
-    does NOT fall through to (2): the window is empty and the next block
+    does NOT fall through to (3): the window is empty and the next block
     won't exist until the next request. Advancing a stale anchor there
     invents a reset for a block that isn't running, which is how a
     26-hour-old reading of a 5-hour window came to look like live state
     (see models.level_still_in_cycle).
 
-    If a projection from (2) has already elapsed — a real reset happened
+    If a projection from (3) has already elapsed — a real reset happened
     but its used_percent drop was too small to clear `_is_reset`'s
     threshold, which a lightly used window can do — advance by however many
     whole cycles were missed. Same fixed-cycle assumption, carried through
@@ -834,6 +942,26 @@ def _derive_resets_at(
     """
     duration = window_duration_seconds(window.kind)
     if window.kind is WindowKind.W5H:
+        boundary = block.block_started_at
+        if boundary is not None and now - boundary < duration:
+            # A reset was OBSERVED inside one window duration — the
+            # strongest evidence there is, and it INVALIDATES everything
+            # older: any anchor before the boundary belongs to the previous
+            # block. Live repro (2026-07-29 12:11): the account block
+            # expired at ~11:59 (100 → 2 in the series) while CLI activity
+            # ran continuously through the boundary, so the token-log
+            # anchor still said 09:24 and min() over it reported a reset
+            # 2.6h early. The anchor is the earliest evidence AT/AFTER the
+            # boundary: the first post-reset sample, or an earlier token
+            # event if the CLI spoke first.
+            candidates = [boundary]
+            candidates.extend(
+                event.ts for event in token_events if event.ts >= boundary
+            )
+            rise = _sample_block_anchor(block.samples, duration, now)
+            if rise is not None:
+                candidates.append(rise)  # block-scoped, so already >= boundary
+            return min(candidates) + duration
         anchors = [_sample_block_anchor(block.samples, duration, now)]
         if token_events:
             anchors.append(block_anchor([e.ts for e in token_events], duration, now))
@@ -1116,6 +1244,16 @@ def _horizon_bucket_coverage(
 _LIVE_RATE_HALFLIFE_H = 1.0
 
 
+class _SimulatedRun(NamedTuple):
+    # Hours until this run exhausted, or None if it survived the horizon
+    # (right-censored, not an error).
+    exhausted_after_h: float | None
+    # The run's used% at `checkpoint_h`, or None when no checkpoint was
+    # requested or the horizon ends before it (the cycle resets first, so
+    # "used% at +h in this cycle" has no answer).
+    level_at_checkpoint: float | None
+
+
 def _simulate_exhaustion_hours(
     used_percent: float,
     start_ts: float,
@@ -1124,14 +1262,15 @@ def _simulate_exhaustion_hours(
     tz: tzinfo,
     horizon_hours: float,
     live_rate: float | None = None,
-) -> float | None:
+    checkpoint_h: float | None = None,
+) -> _SimulatedRun:
     """One simulated future: walk forward hour by hour from `start_ts`,
     each hour resampling a burn from that hour-of-week's empirical bucket
     (falling back to the all-buckets pool if that specific hour has no
-    history yet), accumulating usage until it would hit 100%. Returns None
-    if it doesn't exhaust within `horizon_hours` — "didn't run out," not
-    an error; the caller treats that as right-censored AT the horizon
-    rather than discarding the run.
+    history yet), accumulating usage until it would hit 100%. A run that
+    doesn't exhaust within `horizon_hours` is "didn't run out," not an
+    error; the caller treats it as right-censored AT the horizon rather
+    than discarding the run.
 
     `live_rate` is what is happening RIGHT NOW (see _live_burn_rate), and
     it decays into the profile: hour one is the live rate, hour four is
@@ -1141,11 +1280,21 @@ def _simulate_exhaustion_hours(
     hours when minutes remained (2.28h at 80-95% used), and as claiming
     near-certain risk in a quiet week because June's profile said so.
 
+    `checkpoint_h` records this run's level at that point — the input to
+    Forecast.predicted_used_percent, which is what model selection grades.
+    A run that exhausts first checkpoints at 100.
+
     Both pools carry CUMULATIVE weights (see `_to_cumulative`) — this is
     the hot loop, `mc_runs * horizon_hours` draws per tick."""
     remaining = 100.0 - used_percent
+    checkpoint = (
+        checkpoint_h
+        if checkpoint_h is not None and checkpoint_h <= horizon_hours
+        else None
+    )
     if remaining <= 0:
-        return 0.0
+        return _SimulatedRun(0.0, 100.0 if checkpoint is not None else None)
+    level_at_checkpoint: float | None = None
     elapsed = 0.0
     cursor_ts = start_ts
     while elapsed < horizon_hours:
@@ -1159,6 +1308,11 @@ def _simulate_exhaustion_hours(
             # slope, and simulating negative burn would un-consume quota.
             weight = 0.5 ** (elapsed / _LIVE_RATE_HALFLIFE_H)
             burn = weight * max(live_rate, 0.0) + (1.0 - weight) * burn
+        if checkpoint is not None and elapsed <= checkpoint < elapsed + 1.0:
+            # Pro-rate the crossing hour so a fractional checkpoint reads
+            # the level mid-hour rather than a whole hour early.
+            partial = burn * (checkpoint - elapsed)
+            level_at_checkpoint = min(100.0, 100.0 - remaining + partial)
         if burn >= remaining:
             # Interpolate inside the hour it runs out in rather than
             # rounding up to the whole hour. Without this the simulation
@@ -1166,11 +1320,16 @@ def _simulate_exhaustion_hours(
             # so for a window resetting in half an hour every outcome
             # landed past the horizon and got censored, and the P50/P90
             # band went silent exactly when it was most urgent.
-            return elapsed + remaining / burn
+            exhausted_at = elapsed + remaining / burn
+            if checkpoint is not None and (
+                level_at_checkpoint is None or exhausted_at <= checkpoint
+            ):
+                level_at_checkpoint = 100.0
+            return _SimulatedRun(exhausted_at, level_at_checkpoint)
         remaining -= burn
         elapsed += 1.0
         cursor_ts += 3600.0
-    return None
+    return _SimulatedRun(None, level_at_checkpoint)
 
 
 def _percentile_within_horizon(
@@ -1210,6 +1369,11 @@ def _confidence(n_samples: int, coverage: float | None = None) -> Confidence:
     if coverage < 0.8 and rating == "high":
         return "medium"
     return rating
+
+
+def _weaker_confidence(a: Confidence, b: Confidence) -> Confidence:
+    order = {"low": 0, "medium": 1, "high": 2}
+    return a if order[a] <= order[b] else b
 
 
 def _eta_horizon(
@@ -1290,6 +1454,16 @@ def _project_forecast(
 ) -> Forecast:
     now_dt = datetime.fromtimestamp(now, tz=tz)
     time_to_reset_h = (resets_at - now) / 3600.0 if resets_at is not None else None
+    # This model's answer to the dense-scoring question: the rate projected
+    # to the kind's horizon. None when the cycle demonstrably ends first —
+    # "used% at +h in this cycle" has no answer then, matching both the
+    # simulating model and the truth-side eligibility rule.
+    dense_h = DENSE_HORIZON_H[window.kind]
+    predicted_used = (
+        None
+        if time_to_reset_h is not None and time_to_reset_h < dense_h
+        else min(100.0, max(0.0, window.used_percent + burn_per_hour * dense_h))
+    )
 
     if burn_per_hour <= 0:
         # Flat/negative burn means there's no exhaustion trajectory at all —
@@ -1312,6 +1486,7 @@ def _project_forecast(
             exhausts_before_reset=False,
             n_samples=n_samples,
             burn_basis=burn_basis,
+            predicted_used_percent=predicted_used,
         )
 
     remaining_percent = max(0.0, 100.0 - window.used_percent)
@@ -1354,6 +1529,7 @@ def _project_forecast(
         exhausts_before_reset=eta_calendar is not None and time_to_reset_h is not None,
         n_samples=n_samples,
         burn_basis=burn_basis,
+        predicted_used_percent=predicted_used,
     )
 
 

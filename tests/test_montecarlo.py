@@ -101,6 +101,9 @@ def test_simulation_is_capped_at_an_imminent_reset(cfg):
 
 
 def test_idle_with_a_valid_current_level_still_predicts_from_learned_rhythm(cfg):
+    # CLAUDE deliberately: a stale level is durable only on a FIXED window.
+    # A rolling window's level decays unobserved, so it is never vouched
+    # for (see test_alerts.test_a_stale_rolling_level_is_not_vouched_for).
     now = 1_000_000.0
     stale_ts = now - cfg.thresholds.stale_after_minutes_weekly * 60 - 60
     resets_at = now + 60 * 3600
@@ -113,7 +116,13 @@ def test_idle_with_a_valid_current_level_still_predicts_from_learned_rhythm(cfg)
         if percent >= 95.0:
             percent = 0.0
         ts += 3600
-    window = _window(WindowKind.WEEKLY, history[-1].used_percent, stale_ts, resets_at)
+    window = _window(
+        WindowKind.WEEKLY,
+        history[-1].used_percent,
+        stale_ts,
+        resets_at,
+        provider=Provider.CLAUDE,
+    )
 
     forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
 
@@ -243,11 +252,17 @@ def test_unknown_reset_simulates_only_the_windows_own_duration(cfg):
     hours it was 5/168 ≈ 3% coverage and rated "low"."""
     now = 1_000_000.0
     week = 168 * 3600.0
-    # Six hourly readings from exactly one week ago, climbing 1%/h in one
-    # unbroken block — their hour-of-week slots are precisely now..now+5.
-    # Burn is far too slow to exhaust a 5h horizon (70% remaining at 1%/h)
-    # and no reset is observed or derivable (no token events, one block).
-    history = [_sample(now - week + k * 3600, 20.0 + k) for k in range(6)]
+    # Eight hourly readings from exactly one week ago — their hour-of-week
+    # slots cover now..now+7, so the 5h horizon is fully known — plus three
+    # fresh readings inside the w5h lookback (the live rate's evidence,
+    # which caps confidence at medium). Burn is far too slow to exhaust a
+    # 5h horizon and no reset is observed or derivable.
+    history = [_sample(now - week + k * 3600, 20.0 + k) for k in range(8)]
+    history += [
+        _sample(now - 2400.0, 29.0),
+        _sample(now - 1200.0, 29.5),
+        _sample(now, 30.0),
+    ]
     window = _window(WindowKind.W5H, 30.0, now)
 
     forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)

@@ -313,6 +313,39 @@ def test_earlier_local_evidence_beats_the_rounding_lagged_rise(cfg):
     assert forecast.window.resets_at == pytest.approx(cli_start + 5 * 3600)
 
 
+def test_an_observed_boundary_invalidates_the_older_token_anchor(cfg):
+    """Live repro (2026-07-29 12:11): the account's 5h block expired at
+    ~11:59 — visible as 100 → 2 in the account-wide series — while CLI
+    activity ran continuously through the boundary. The token-log anchor
+    (09:24) predates the boundary, so min() over it reported the reset
+    2.6h early (14:24 instead of ~17:00). An observed boundary invalidates
+    every older anchor; the new anchor is the earliest evidence at/after
+    it."""
+    now = 100_000.0
+    boundary_ts = now - 420.0  # the first post-reset sample, 7 min ago
+    history = [
+        _sample(now - 2000.0, 100.0, None),
+        _sample(now - 1700.0, 100.0, None),  # saturated old block
+        _sample(boundary_ts, 2.0, None),  # expiry drop observed
+        _sample(now, 6.0, None),
+    ]
+    # CLI activity continuous through the boundary: the naive token anchor
+    # would still point 3h into the PREVIOUS block.
+    events = [_token_event(now - 3 * 3600.0 + i * 600.0) for i in range(20)]
+    window = _window(
+        Provider.CLAUDE, WindowKind.W5H, 6.0, now, resets_at=None, is_estimated=False
+    )
+
+    forecast = LinearPredictor().forecast(window, history, events, cfg, now)
+
+    # Anchored at the first token event AT/AFTER the boundary (CLI spoke
+    # within the boundary-to-sample gap), never at the pre-boundary anchor.
+    post_boundary_events = [e.ts for e in events if e.ts >= boundary_ts]
+    expected = min([boundary_ts, *post_boundary_events]) + 5 * 3600
+    assert forecast.window.resets_at == pytest.approx(expected)
+    assert forecast.window.resets_at > now  # not the stale 09:24-style past
+
+
 def test_weekly_resets_at_derived_from_observed_reset_not_a_calendar_guess(cfg):
     """Regression: the weekly reset time must come from an actually
     observed reset (block_started_at + 7 days), never a hardcoded

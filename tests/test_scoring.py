@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 
 from tokenwatchdog.config import load_config
 from tokenwatchdog.models import Forecast, Provider, Window, WindowKind
-from tokenwatchdog.predictor import _is_reset, select_predictor
+from tokenwatchdog.predictor import _is_reset, _reset_predicate, select_predictor
 from tokenwatchdog.scoring import (
     MIN_DENSE_MOMENTS,
     MIN_RELATIVE_IMPROVEMENT,
@@ -28,8 +28,8 @@ from tokenwatchdog.scoring import (
     better_model,
     pool_dense,
     realized_exhaustion_hours,
+    score_dense,
     score_model,
-    score_model_dense,
     used_percent_at,
 )
 from tokenwatchdog.store import ForecastRow, SampleRow
@@ -65,6 +65,7 @@ def _row(
     used_percent=50.0,
     burn_per_hour=None,
     prob=None,
+    predicted=None,
 ):
     return ForecastRow(
         made_at=made_at,
@@ -74,6 +75,7 @@ def _row(
         used_percent=used_percent,
         burn_per_hour=burn_per_hour,
         prob_exhaust_before_reset=prob,
+        predicted_used_percent=predicted,
     )
 
 
@@ -189,6 +191,125 @@ def test_a_default_with_no_dense_score_is_not_displaced():
     assert "no dense score of its own" in reason
 
 
+def test_a_zero_error_default_is_unbeatable_not_a_crash():
+    """A flat window makes both dense MAEs exactly 0.0 — the margin
+    division crashed select_predictor at daemon startup. Zero baseline
+    error is unbeatable by margin arithmetic; the default stands."""
+    chosen, reason = better_model(
+        "linear",
+        {
+            "linear": _dense("linear", moments=900, mae=0.0),
+            "montecarlo": _dense("montecarlo", moments=900, mae=0.0, persistence=0.0),
+        },
+    )
+    assert chosen == "linear"
+    assert "already exact" in reason
+
+
+def test_zero_persistence_error_cannot_be_beaten_by_margin():
+    chosen, reason = better_model(
+        "linear",
+        {
+            "linear": _dense("linear", moments=900, mae=1.0),
+            "montecarlo": _dense("montecarlo", moments=900, mae=0.5, persistence=0.0),
+        },
+    )
+    assert chosen == "linear"
+    assert "persistence" in reason
+
+
+def test_dense_scoring_is_matched_across_models():
+    """A moment where only one model answered is excluded for BOTH —
+    scoring each model on its own moments let one that answers only on
+    easy moments beat a default graded on harder ones."""
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 50.0),
+        _sample(now + HOUR, 60.0),
+        _sample(now + 2 * HOUR, 70.0),
+        _sample(now + 3 * HOUR, 80.0),
+    ]
+    rows = [
+        # Moment A: both models answered.
+        _row(now, "linear", None, predicted=58.0),
+        _row(now, "montecarlo", None, predicted=62.0),
+        # Moment B: only linear answered — excluded for both.
+        _row(now + HOUR, "linear", None, predicted=95.0),
+    ]
+
+    scored = score_dense(["linear", "montecarlo"], [(rows, samples, _is_reset)], 1.0)
+
+    assert scored["linear"].moments == 1
+    assert scored["montecarlo"].moments == 1
+    assert scored["linear"].mae_points == 2.0  # 58 vs truth 60; B's miss excluded
+    assert scored["montecarlo"].mae_points == 2.0
+    # Persistence is measured once, on the shared moments.
+    assert scored["linear"].persistence_mae_points == 10.0
+    assert scored["montecarlo"].persistence_mae_points == 10.0
+
+
+def test_dense_prefers_the_models_own_prediction_over_the_rate_formula():
+    """predicted_used_percent is the model's real answer (for the
+    simulating model, its mean simulated level — where rhythm knowledge
+    lives). The burn·h formula is only the fallback for rows from before
+    the column existed — grading burn alone made the metric blind to the
+    simulation, measured as exact ties on every common moment."""
+    now = 1_000_000.0
+    samples = [
+        _sample(now, 50.0),
+        _sample(now + HOUR, 60.0),
+        _sample(now + 2 * HOUR, 61.0),
+    ]
+    rows = [
+        # Same burn as the fallback would use, but the model's own
+        # prediction says something different — the prediction wins.
+        _row(now, "linear", None, burn_per_hour=8.0, predicted=60.0),
+    ]
+
+    score = score_dense(["linear"], [(rows, samples, _is_reset)], 1.0)["linear"]
+
+    assert score.mae_points == 0.0  # graded on 60, not on 50 + 8*1
+
+
+def test_the_per_kind_veto_blocks_a_lopsided_pooled_winner():
+    """A pooled winner drives alerts on every window, so a big weekly win
+    must not crown a model that is measurably worse on the 5-hour window."""
+    from tokenwatchdog.predictor import _per_kind_veto
+
+    per_kind = [
+        (
+            WindowKind.WEEKLY,
+            {
+                "linear": _dense("linear", moments=1000, mae=10.0),
+                "montecarlo": _dense("montecarlo", moments=1000, mae=1.0),
+            },
+        ),
+        (
+            WindowKind.W5H,
+            {
+                "linear": _dense("linear", moments=600, mae=1.0),
+                "montecarlo": _dense("montecarlo", moments=600, mae=10.0),
+            },
+        ),
+    ]
+
+    veto = _per_kind_veto("montecarlo", per_kind)
+    assert veto is not None
+    assert "w5h" in veto and "worse" in veto
+
+    # With no materially-worse kind, no veto.
+    fine = [
+        (
+            WindowKind.W5H,
+            {
+                "linear": _dense("linear", moments=600, mae=1.0),
+                "montecarlo": _dense("montecarlo", moments=600, mae=0.95),
+            },
+        )
+    ]
+    assert _per_kind_veto("montecarlo", fine) is None
+
+
 def test_pooling_weights_by_moments():
     pooled = pool_dense(
         "montecarlo",
@@ -215,7 +336,7 @@ def test_dense_scores_predicted_used_percent_at_the_horizon():
     ]
     rows = [_row(now, "linear", None, used_percent=50.0, burn_per_hour=8.0)]
 
-    score = score_model_dense("linear", [(rows, samples, _is_reset)], 1.0)
+    score = score_dense(["linear"], [(rows, samples, _is_reset)], 1.0)["linear"]
 
     assert score.moments == 1
     assert score.mae_points == 2.0  # predicted 58, truth 60
@@ -232,7 +353,7 @@ def test_dense_clamps_predictions_at_the_cap():
     ]
     rows = [_row(now, "linear", None, used_percent=90.0, burn_per_hour=50.0)]
 
-    score = score_model_dense("linear", [(rows, samples, _is_reset)], 1.0)
+    score = score_dense(["linear"], [(rows, samples, _is_reset)], 1.0)["linear"]
 
     assert score.mae_points == 5.0  # clamped to 100, truth 95
 
@@ -248,32 +369,51 @@ def test_dense_skips_moments_whose_cycle_does_not_reach_the_horizon():
         _sample(now + 0.5 * HOUR, 2.0),  # reset before the horizon
         _sample(now + 2 * HOUR, 10.0),
     ]
-    score = score_model_dense("linear", [(rows, reset_inside, _is_reset)], 1.0)
+    score = score_dense(["linear"], [(rows, reset_inside, _is_reset)], 1.0)["linear"]
     assert score.moments == 0
 
     declared_end_inside = [
         _sample(now, 50.0, resets_at=now + 0.5 * HOUR),
         _sample(now + 2 * HOUR, 60.0, resets_at=now + 0.5 * HOUR),
     ]
-    score = score_model_dense("linear", [(rows, declared_end_inside, _is_reset)], 1.0)
+    score = score_dense(["linear"], [(rows, declared_end_inside, _is_reset)], 1.0)[
+        "linear"
+    ]
     assert score.moments == 0
 
 
-def test_dense_truth_is_the_newest_sample_at_or_before_the_horizon():
-    """The level is durable between samples, so truth at +1h is the newest
-    reading at or before it — not an interpolation toward a later one."""
+def test_dense_truth_interpolates_between_the_straddling_samples():
+    """Truth at +1h is interpolated between the same-cycle samples around
+    it. "Newest at or before" was hours stale across a sparse gap — in both
+    directions: a rolling window decays unobserved (a 50% origin that
+    rolled to ~5% before the next sample read as still 50%, rewarding
+    persistence for the gap), and a fixed one climbs."""
     now = 1_000_000.0
     samples = [
         _sample(now, 50.0),
         _sample(now + 0.5 * HOUR, 55.0),
-        _sample(now + 2 * HOUR, 99.0),
+        _sample(now + 1.5 * HOUR, 75.0),
     ]
-    assert used_percent_at(samples, 0, now + HOUR, _is_reset) == 55.0
+    # Halfway between (0.5h, 55) and (1.5h, 75).
+    assert used_percent_at(samples, 0, now + HOUR, _is_reset) == 65.0
 
-    rows = [_row(now, "linear", None, used_percent=50.0, burn_per_hour=5.0)]
-    score = score_model_dense("linear", [(rows, samples, _is_reset)], 1.0)
-    assert score.moments == 1
-    assert score.mae_points == 0.0  # predicted 55, truth 55
+    # A sample landing exactly at the target is simply itself.
+    exact = [_sample(now, 10.0), _sample(now + HOUR, 20.0)]
+    assert used_percent_at(exact, 0, now + HOUR, _is_reset) == 20.0
+
+    # The sparse-gap case that motivated this: the next observation is far
+    # past the target, and the window rolled off in between. Rolling
+    # predicate — under _is_reset a 45-point drop would read as a reset,
+    # but roll-off is not a boundary (see predictor._is_rolloff_clear).
+    clears_at = now + 6 * 24 * HOUR
+    sparse = [
+        _sample(now, 50.0, resets_at=clears_at),
+        _sample(now + 25 * HOUR, 5.0, resets_at=clears_at),
+    ]
+    rolling = _reset_predicate(Provider.CODEX, WindowKind.WEEKLY)
+    truth = used_percent_at(sparse, 0, now + 24 * HOUR, rolling)
+    assert truth is not None
+    assert truth < 10.0  # nowhere near the stale 50
 
 
 def test_dense_skips_rows_that_cannot_be_scored():
@@ -292,7 +432,10 @@ def test_dense_skips_rows_that_cannot_be_scored():
         _row(now, "linear", None, status=None, burn_per_hour=1.0),
     ]
 
-    assert score_model_dense("linear", [(rows, samples, _is_reset)], 1.0).moments == 0
+    assert (
+        score_dense(["linear"], [(rows, samples, _is_reset)], 1.0)["linear"].moments
+        == 0
+    )
 
 
 # -- episode scoring (the diagnostic) -----------------------------------------
@@ -439,7 +582,7 @@ def test_sitting_at_the_cap_cannot_mint_episodes_for_one_model():
 
     # Nor can those moments feed the dense metric: at the cap there is
     # nothing left to predict, so saturation mints nothing anywhere.
-    dense = score_model_dense("montecarlo", [(rows, samples, _is_reset)], 1.0)
+    dense = score_dense(["montecarlo"], [(rows, samples, _is_reset)], 1.0)["montecarlo"]
     assert dense.moments == 0
 
 

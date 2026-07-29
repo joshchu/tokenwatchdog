@@ -75,16 +75,24 @@ class Window:
 def level_still_in_cycle(window: Window, now: float) -> bool:
     """Whether `window.used_percent` still describes the live cycle.
 
-    Staleness is a fact about a *rate*, not a *level*: quota does not
-    un-consume while you're away, so a reading of 100% taken six hours ago
-    against a window that resets in four days is still exactly 100% now.
-    Requires a known `resets_at` — without one we can't establish that no
-    reset has happened since.
+    Staleness is a fact about a *rate*, not a *level*: on a FIXED window
+    quota does not un-consume while you're away, so a reading of 100% taken
+    six hours ago against a window that resets in four days is still
+    exactly 100% now. Requires a known `resets_at` — without one we can't
+    establish that no reset has happened since.
+
+    A ROLLING window's level decays on its own as old usage ages out, so a
+    stale reading there describes nothing — a 95% from twelve hours ago may
+    be 60% now, and vouching for it would alert on (or simulate from) a
+    number that no longer exists. Callers only consult this for stale
+    readings; a fresh rolling level never reaches here.
 
     `now < resets_at` alone is not enough because a derived reset can advance
     by whole cycles after its original boundary. The reading must also fall
     inside the cycle that ends at `resets_at`.
     """
+    if window_is_rolling(window.provider, window.kind):
+        return False
     if window.resets_at is None or now >= window.resets_at:
         return False
     cycle_started_at = window.resets_at - window_duration_seconds(window.kind)
@@ -114,6 +122,15 @@ class Forecast:
     exhausts_before_reset: bool
     n_samples: int
     burn_basis: BurnBasis | None = None  # None when nothing was measured
+    # The model's own expected used% at this window kind's dense-scoring
+    # horizon (scoring.DENSE_HORIZON_H) — what model selection actually
+    # grades. For linear this is the rate projection; for the simulating
+    # model it is the mean simulated level, which is where its rhythm
+    # knowledge lives (burn_per_hour alone became identical across models
+    # once both honestly reported the live rate, making the dense metric
+    # blind to the simulation). None when nothing was predicted or the
+    # cycle ends before the horizon.
+    predicted_used_percent: float | None = None
     # None until used_percent has actually pinned at 100 this cycle -- see
     # predictor.tokens_burned_past_quota for why burn_per_hour alone goes
     # blind right at the one moment it matters most.
