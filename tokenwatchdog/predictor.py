@@ -695,6 +695,35 @@ def _is_rate_stale(window: Window, cfg: Config, now: float) -> bool:
     return (now - window.source_ts) > stale_minutes * 60
 
 
+def _sample_block_anchor(
+    block_samples: list[SampleRow], duration_seconds: float, now: float
+) -> float | None:
+    """Anchor evidence from the authoritative percentage series itself: the
+    last 0 → positive rise is the first reading after the current block
+    began. The series is account-wide where the token log is this machine's
+    CLI only — a block anchored by usage on another surface (Desktop, phone,
+    claude.ai) never appears in local transcripts but shows up here within
+    one sample cadence. Measured live (2026-07-29): the local log's first
+    activity came 77 minutes after the account's block had started, and the
+    displayed reset was late by exactly that much.
+
+    The rise is "no later than" the true anchor, not exact: an integer
+    percentage rounds sub-percent usage to zero, so the rise lags the true
+    first message by however long usage stayed under ~1%.
+
+    None when there is no rise to see, or when the rise is a full window
+    duration old — that block has expired, and whatever boundary came after
+    it was missed, which is unknown rather than guessable.
+    """
+    anchor = None
+    for prev, curr in itertools.pairwise(block_samples):
+        if prev.used_percent == 0.0 and curr.used_percent > 0.0:
+            anchor = curr.source_ts
+    if anchor is None or now - anchor >= duration_seconds:
+        return None
+    return anchor
+
+
 def _derive_resets_at(
     window: Window,
     block: _BlockView,
@@ -705,19 +734,30 @@ def _derive_resets_at(
     itself, straight from real account state; neither Claude Desktop nor
     token-compute do.
 
-    Two derivations, best first:
+    Derivations, best first:
 
     1. **Deterministic anchor** (5-hour window only). The 5-hour window is
-       a fixed block anchored at the first request after an idle gap, so
-       `blocks.block_anchor` computes the reset outright from the token log
-       — available immediately, with no reset ever having to be caught in
-       the act. The 7-day window has no comparably real anchor rule, so it
-       does not get this path rather than getting a guessed one.
+       a fixed block anchored at the first request after an idle gap. Two
+       independent kinds of evidence bound where it started: the last
+       0 → positive rise in the percentage series (`_sample_block_anchor`,
+       account-wide but rounding-lagged) and the first post-gap activity in
+       the token log (`blocks.block_anchor`, exact but blind to usage on
+       any other surface). Both necessarily come at or after the true first
+       message, so the EARLIEST wins. The 7-day window has no comparably
+       real anchor rule, so it does not get this path rather than getting a
+       guessed one.
     2. **Last observed reset + one duration.** Both windows are
        fixed-duration cycles that re-anchor at each real reset, so the next
        one follows from the last one we actually saw. If no reset appears
        in history at all, the true anchor predates our data and is
        genuinely unknown — report that rather than guessing a calendar day.
+
+    A 5-hour window whose activity log exists but shows an expired block
+    does NOT fall through to (2): the window is empty and the next block
+    won't exist until the next request. Advancing a stale anchor there
+    invents a reset for a block that isn't running, which is how a
+    26-hour-old reading of a 5-hour window came to look like live state
+    (see models.level_still_in_cycle).
 
     If a projection from (2) has already elapsed — a real reset happened
     but its used_percent drop was too small to clear `_is_reset`'s
@@ -727,16 +767,15 @@ def _derive_resets_at(
     past.
     """
     duration = window_duration_seconds(window.kind)
-    if window.kind is WindowKind.W5H and token_events:
-        # Authoritative when there's an activity log to read: an anchor gives
-        # the real reset, and no anchor means the block has already expired
-        # -- the window is empty and the next one doesn't exist until the
-        # next request. Falling through to (2) there would advance a stale
-        # anchor into the future and invent a reset for a block that isn't
-        # running, which is how a 26-hour-old reading of a 5-hour window came
-        # to look like live state (see alerts.level_still_in_cycle).
-        anchor = block_anchor([e.ts for e in token_events], duration, now)
-        return anchor + duration if anchor is not None else None
+    if window.kind is WindowKind.W5H:
+        anchors = [_sample_block_anchor(block.samples, duration, now)]
+        if token_events:
+            anchors.append(block_anchor([e.ts for e in token_events], duration, now))
+        live = [anchor for anchor in anchors if anchor is not None]
+        if live:
+            return min(live) + duration
+        if token_events:
+            return None
     if block.block_started_at is None:
         return None
     resets_at = block.block_started_at + duration

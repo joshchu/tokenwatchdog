@@ -219,6 +219,97 @@ def test_unknown_w5h_block_start_leaves_reset_unknown(cfg):
     assert forecast.exhausts_before_reset is False
 
 
+def test_w5h_reset_anchors_at_the_account_wide_rise_not_the_local_log(cfg):
+    """Live repro (2026-07-29): the account's 5h block started ~08:05 —
+    visible as the percentage series rising 0 → 1 — but the first LOCAL
+    CLI activity came at 09:24, so the token-log anchor reported a reset
+    77 minutes late (14:24 shown; the account expired ~12:00). Usage on
+    another surface (Desktop, phone, claude.ai) burns the same account
+    block without ever writing a local transcript; the rise is the
+    account-wide evidence, and the earliest evidence wins."""
+    now = 100_000.0
+    rise_ts = now - 2.5 * 3600  # account block began ~2.5h ago
+    history = (
+        # An hour of idle zeros, then the account-wide series rises.
+        [_sample(rise_ts - m * 300.0, 0.0, None) for m in range(12, 0, -1)]
+        + [_sample(rise_ts, 1.0, None), _sample(now, 49.0, None)]
+    )
+    # The local CLI log only woke up much later.
+    local_events = [_token_event(now - 3600.0), _token_event(now - 60.0)]
+    window = _window(
+        Provider.CLAUDE, WindowKind.W5H, 49.0, now, resets_at=None, is_estimated=False
+    )
+
+    forecast = LinearPredictor().forecast(window, history, local_events, cfg, now)
+
+    assert forecast.window.resets_at == pytest.approx(rise_ts + 5 * 3600)
+
+
+def test_w5h_reset_known_even_when_the_cli_log_is_silent(cfg):
+    """The other half of the same failure: CLI idle all day while Desktop
+    burns the block. No token events at all, no ≥5-point drop to observe —
+    the rise alone is enough to anchor the reset."""
+    now = 100_000.0
+    rise_ts = now - 3600.0
+    history = [
+        _sample(rise_ts - 600, 0.0, None),
+        _sample(rise_ts - 300, 0.0, None),
+        _sample(rise_ts, 2.0, None),
+        _sample(now, 30.0, None),
+    ]
+    window = _window(
+        Provider.CLAUDE, WindowKind.W5H, 30.0, now, resets_at=None, is_estimated=False
+    )
+
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.window.resets_at == pytest.approx(rise_ts + 5 * 3600)
+
+
+def test_an_expired_rise_is_not_an_anchor(cfg):
+    """A rise older than the window's own duration belongs to a block that
+    has already expired — whatever boundary came after it was missed, so
+    the reset is honestly unknown, not projected forward from stale
+    evidence."""
+    now = 100_000.0
+    rise_ts = now - 6 * 3600  # older than the 5h window itself
+    history = [
+        _sample(rise_ts - 300, 0.0, None),
+        _sample(rise_ts, 2.0, None),
+        _sample(now - 60, 8.0, None),
+        _sample(now, 10.0, None),
+    ]
+    window = _window(
+        Provider.CLAUDE, WindowKind.W5H, 10.0, now, resets_at=None, is_estimated=False
+    )
+
+    forecast = LinearPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.time_to_reset_h is None
+
+
+def test_earlier_local_evidence_beats_the_rounding_lagged_rise(cfg):
+    """The mirror case: tiny CLI usage anchors the block while the integer
+    percentage still rounds to zero — the rise lags, the token log is
+    exact, and the earliest evidence wins."""
+    now = 100_000.0
+    cli_start = now - 2 * 3600  # true anchor: a sub-1% CLI request
+    rise_ts = now - 3600.0  # the integer series only rose later
+    history = [
+        _sample(rise_ts - 300, 0.0, None),
+        _sample(rise_ts, 1.0, None),
+        _sample(now, 20.0, None),
+    ]
+    events = [_token_event(cli_start), _token_event(now - 120.0)]
+    window = _window(
+        Provider.CLAUDE, WindowKind.W5H, 20.0, now, resets_at=None, is_estimated=False
+    )
+
+    forecast = LinearPredictor().forecast(window, history, events, cfg, now)
+
+    assert forecast.window.resets_at == pytest.approx(cli_start + 5 * 3600)
+
+
 def test_weekly_resets_at_derived_from_observed_reset_not_a_calendar_guess(cfg):
     """Regression: the weekly reset time must come from an actually
     observed reset (block_started_at + 7 days), never a hardcoded

@@ -311,10 +311,16 @@ a gap — run `scripts/backtest.py` to see where your own history stands.
 - **Claude's 5-hour reset is computed; its weekly reset still has to be
   observed.** Claude reports no reset time at all. The 5-hour window is a
   fixed block anchored at your first request after an idle gap, so its reset
-  follows from the token log immediately. The weekly window has no equivalent
-  rule — a 7-day gap in activity isn't what starts a new weekly cycle — so it
-  waits for an actual reset to appear in your history, and until one does the
-  countdown is honestly unknown rather than guessed.
+  is derived from two kinds of local evidence — the account-wide percentage
+  series rising from zero, and the first post-gap activity in the CLI token
+  log — taking whichever saw the block start first. It can still run late:
+  the percentage is a whole number, so a block opened by a few small
+  requests on another surface (Desktop, phone, claude.ai) is invisible
+  until cumulative usage crosses ~1%, and the derived reset inherits that
+  lag. The weekly window has no equivalent rule — a 7-day gap in activity
+  isn't what starts a new weekly cycle — so it waits for an actual reset to
+  appear in your history, and until one does the countdown is honestly
+  unknown rather than guessed.
 - **The weekly token-based percentage is a trailing 7-day sum**, not a true
   fixed cycle, for the same reason: there's no anchor to align it to. It's an
   estimate (flagged `*` in the dashboard), and the tail of it drifts as old
