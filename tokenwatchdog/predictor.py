@@ -250,9 +250,17 @@ class MonteCarloPredictor:
         # beyond it — so a low-but-nonzero burn with a reset coming soon
         # correctly reports "not at risk" instead of an ETA far past the
         # point where the quota will have already refilled. Without a
-        # known reset (cold start), fall back to a 2-week cap so we're not
-        # simulating indefinitely.
-        horizon_h = time_to_reset_h if time_to_reset_h is not None else 24.0 * 14
+        # known reset (cold start), the window's own duration is the bound:
+        # a 5-hour window refills at least every 5 hours, so nothing past
+        # that can be this cycle's exhaustion. This is the same bound
+        # `_eta_horizon` applies to the output — simulating a 14-day future
+        # and then blanking everything past a 5-hour cap paid for up to
+        # 672k draws a tick that could never survive.
+        horizon_h = (
+            time_to_reset_h
+            if time_to_reset_h is not None
+            else window_duration_seconds(window.kind) / 3600.0
+        )
 
         mc_runs = max(cfg.predictor.mc_runs, 1)
         # Every run contributes exactly one outcome, exhausted or not — a

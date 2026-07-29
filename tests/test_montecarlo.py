@@ -145,6 +145,34 @@ def test_reset_pending_short_circuits_before_simulating(cfg):
     assert forecast.status == "RESET_PENDING"
 
 
+def test_unknown_reset_simulates_only_the_windows_own_duration(cfg):
+    """With no derivable reset, the horizon is the window's own duration —
+    a 5-hour window refills at least every 5 hours, so nothing past that can
+    be this cycle's exhaustion. The old 14-day fallback paid for up to 672k
+    draws a tick and then blanked everything past the 5-hour output cap.
+
+    The wiring is observable through confidence: this profile knows exactly
+    the hour-of-week slots the coming five hours occupy (learned one week
+    ago), so judged against the window's own span coverage is complete and
+    the medium rating from n stands; judged against 336 mostly-unknown
+    hours it was 5/168 ≈ 3% coverage and rated "low"."""
+    now = 1_000_000.0
+    week = 168 * 3600.0
+    # Six hourly readings from exactly one week ago, climbing 1%/h in one
+    # unbroken block — their hour-of-week slots are precisely now..now+5.
+    # Burn is far too slow to exhaust a 5h horizon (70% remaining at 1%/h)
+    # and no reset is observed or derivable (no token events, one block).
+    history = [_sample(now - week + k * 3600, 20.0 + k) for k in range(6)]
+    window = _window(WindowKind.W5H, 30.0, now)
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.status == "OK"
+    assert forecast.eta_p50 is None  # censored at 5h, honestly
+    assert forecast.prob_exhaust_before_reset is None  # reset unknown
+    assert forecast.confidence == "medium"
+
+
 def test_no_history_falls_back_to_ok_with_no_confidence(cfg):
     now = 1_000_000.0
     window = _window(WindowKind.WEEKLY, 10.0, now)
