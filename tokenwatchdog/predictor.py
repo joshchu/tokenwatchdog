@@ -128,38 +128,19 @@ class LinearPredictor:
                 resets_at=resets_at,
             )
 
-        fit_samples = _slope_fit_samples(block.samples, cfg, window.kind, now)
-        percent_burn = _robust_slope_per_hour(fit_samples)
-        token_burn = _token_burn_per_hour(block.samples, token_events, cfg, window, now)
-
-        if token_burn is not None and (
-            token_burn.burn_per_hour > 0 or percent_burn <= 0
-        ):
-            burn_per_hour = token_burn.burn_per_hour
-            basis: BurnBasis = "tokens"
-            n_samples = token_burn.n_events
-        else:
-            # Either nothing calibrated, or the token log claims zero burn
-            # while the authoritative percentage says otherwise. The latter
-            # is real: an account-wide percentage also counts usage that
-            # never lands in this machine's token log (Claude Desktop and
-            # agent mode burn the same quota without writing a CLI
-            # transcript). Reporting a confident zero there would be worse
-            # than a coarse slope, so the coarse slope wins that tie.
-            burn_per_hour = percent_burn
-            basis = "percent"
-            n_samples = len(fit_samples)
+        live = _live_burn_rate(block, token_events, cfg, window, now)
+        assert live is not None  # len(block.samples) >= 2 was checked above
 
         return _project_forecast(
             window=window,
-            burn_per_hour=burn_per_hour,
+            burn_per_hour=live.burn_per_hour,
             resets_at=resets_at,
-            n_samples=n_samples,
+            n_samples=live.n_samples,
             cfg=cfg,
             now=now,
             tz=tz,
             model_name=self.name,
-            burn_basis=basis,
+            burn_basis=live.basis,
         )
 
 
@@ -216,6 +197,16 @@ class MonteCarloPredictor:
                 resets_at=resets_at,
             )
 
+        # The live rate rides only while it's trustworthy: on a stale rate
+        # the IDLE-but-level-valid path simulates from the profile alone,
+        # exactly as before — an hours-old burst must not dominate hour one
+        # of an idle window's future.
+        live = (
+            None
+            if rate_is_stale
+            else _live_burn_rate(block, token_events, cfg, window, now)
+        )
+
         percent_per_token = _percent_per_token(block.samples, token_events)
         raw_buckets = _build_burn_buckets(
             history, token_events, percent_per_token, tz, now, is_reset
@@ -239,10 +230,16 @@ class MonteCarloPredictor:
         }
         all_values = [v for values, _ in weighted.values() for v in values]
         all_weights = [w for _, weights in weighted.values() for w in weights]
-        # Decay-weighted, matching how every draw below is weighted -- a
-        # plain mean here would quietly disagree with the simulation it's
-        # reported alongside.
+        # The rate this forecast REPORTS. With a live rate, it's the same
+        # number linear reports — one field, one meaning; the dense metric
+        # grades this exact contract (predicted used% at +h = used + burn·h),
+        # and the whole-week mean it used to report here measured 7.62 pts
+        # of 1h error against linear's 5.03 on identical moments. Without a
+        # live rate (cold start), the decay-weighted profile mean remains
+        # the honest fallback, matching how the draws are weighted.
         mean_burn = _weighted_mean(all_values, all_weights)
+        reported_burn = live.burn_per_hour if live is not None else mean_burn
+        reported_basis: BurnBasis = live.basis if live is not None else basis
         # Cumulative weights, built ONCE per bucket. random.choices()
         # recomputes them on every single call when handed raw weights,
         # which is O(bucket size) per draw against ~mc_runs * horizon draws
@@ -286,7 +283,13 @@ class MonteCarloPredictor:
         # ALREADY exhausted -- rendered as "Risk 0%" on a red 100% row.
         simulated = (
             _simulate_exhaustion_hours(
-                window.used_percent, now, buckets, fallback_pool, tz, horizon_h
+                window.used_percent,
+                now,
+                buckets,
+                fallback_pool,
+                tz,
+                horizon_h,
+                live_rate=live.burn_per_hour if live is not None else None,
             )
             for _ in range(mc_runs)
         )
@@ -327,7 +330,7 @@ class MonteCarloPredictor:
                 window=window,
                 status=forecast_status,
                 model_name=self.name,
-                burn_per_hour=mean_burn,
+                burn_per_hour=reported_burn,
                 time_to_reset_h=time_to_reset_h,
                 eta_calendar=None,
                 eta_workhours=None,
@@ -337,7 +340,7 @@ class MonteCarloPredictor:
                 confidence=confidence,
                 exhausts_before_reset=False,
                 n_samples=n_observations,
-                burn_basis=basis,
+                burn_basis=reported_basis,
             )
 
         horizon = _eta_horizon(window, resets_at, now_dt, tz)
@@ -356,7 +359,7 @@ class MonteCarloPredictor:
             window=window,
             status=forecast_status,
             model_name=self.name,
-            burn_per_hour=mean_burn,
+            burn_per_hour=reported_burn,
             time_to_reset_h=time_to_reset_h,
             eta_calendar=eta_p50,  # point estimate = the median simulated outcome
             eta_workhours=eta_workhours,
@@ -368,7 +371,7 @@ class MonteCarloPredictor:
             # already before it -- see the horizon_h comment above.
             exhausts_before_reset=eta_p50 is not None and time_to_reset_h is not None,
             n_samples=n_observations,
-            burn_basis=basis,
+            burn_basis=reported_basis,
         )
 
 
@@ -846,6 +849,52 @@ def _derive_resets_at(
     return resets_at
 
 
+@dataclass(frozen=True)
+class _LiveRate:
+    burn_per_hour: float
+    basis: BurnBasis
+    n_samples: int  # the evidence behind the rate, for confidence
+
+
+def _live_burn_rate(
+    block: _BlockView,
+    token_events: list[TokenEventRow],
+    cfg: Config,
+    window: Window,
+    now: float,
+) -> _LiveRate | None:
+    """The currently measured burn rate — ONE definition, shared by both
+    models so they can never disagree about what "the live rate" is: linear
+    projects it directly, and the simulation blends it into its near-term
+    draws (see _simulate_exhaustion_hours).
+
+    Token throughput wins over the percent slope unless the token log
+    claims zero burn while the authoritative percentage says otherwise.
+    That tie is real: an account-wide percentage also counts usage that
+    never lands in this machine's token log (Claude Desktop and agent mode
+    burn the same quota without writing a CLI transcript), and reporting a
+    confident zero there would be worse than a coarse slope.
+
+    None when the block hasn't two samples to difference yet.
+    """
+    if len(block.samples) < 2:
+        return None
+    fit_samples = _slope_fit_samples(block.samples, cfg, window.kind, now)
+    percent_burn = _robust_slope_per_hour(fit_samples)
+    token_burn = _token_burn_per_hour(block.samples, token_events, cfg, window, now)
+    if token_burn is not None and (token_burn.burn_per_hour > 0 or percent_burn <= 0):
+        return _LiveRate(
+            burn_per_hour=token_burn.burn_per_hour,
+            basis="tokens",
+            n_samples=token_burn.n_events,
+        )
+    return _LiveRate(
+        burn_per_hour=percent_burn,
+        basis="percent",
+        n_samples=len(fit_samples),
+    )
+
+
 def _lookback_minutes(cfg: Config, kind: WindowKind) -> float:
     return (
         cfg.burn.lookback_w5h_minutes
@@ -1051,6 +1100,20 @@ def _horizon_bucket_coverage(
     return covered / hours
 
 
+# Half-life (hours) over which the live measured rate hands off to the
+# hour-of-week profile inside a simulated future. ONE constant, not config
+# and not per-window-kind: burst persistence is a property of the user's
+# behavior, not of which window's bookkeeping observes it. Measured on two
+# INDEPENDENT halves of 8 weeks of token history (four splits): activity
+# persistence half-life ~2-3h in every split, while the rate's magnitude
+# decays faster (median next-hour/this-hour burn 0.12-0.56) — bracketing
+# this between ~0.5h and ~2h everywhere. 1.0 sits inside the bracket in
+# every split, and the acceptance gate re-checks the conclusion at 0.5h and
+# 2.0h: if it flips inside the measured bracket, the constant is doing the
+# work and the blend doesn't ship.
+_LIVE_RATE_HALFLIFE_H = 1.0
+
+
 def _simulate_exhaustion_hours(
     used_percent: float,
     start_ts: float,
@@ -1058,6 +1121,7 @@ def _simulate_exhaustion_hours(
     fallback_pool: WeightedPool,
     tz: tzinfo,
     horizon_hours: float,
+    live_rate: float | None = None,
 ) -> float | None:
     """One simulated future: walk forward hour by hour from `start_ts`,
     each hour resampling a burn from that hour-of-week's empirical bucket
@@ -1066,6 +1130,14 @@ def _simulate_exhaustion_hours(
     if it doesn't exhaust within `horizon_hours` — "didn't run out," not
     an error; the caller treats that as right-censored AT the horizon
     rather than discarding the run.
+
+    `live_rate` is what is happening RIGHT NOW (see _live_burn_rate), and
+    it decays into the profile: hour one is the live rate, hour four is
+    ~94% profile. Without it the first simulated hour drew from "what
+    Tuesday 2pm is generally like," so a burst that started ten minutes
+    ago couldn't influence the near-term at all — measured as predicting
+    hours when minutes remained (2.28h at 80-95% used), and as claiming
+    near-certain risk in a quiet week because June's profile said so.
 
     Both pools carry CUMULATIVE weights (see `_to_cumulative`) — this is
     the hot loop, `mc_runs * horizon_hours` draws per tick."""
@@ -1080,6 +1152,11 @@ def _simulate_exhaustion_hours(
         if not values:
             values, cum_weights = fallback_pool
         burn = max(random.choices(values, cum_weights=cum_weights, k=1)[0], 0.0)
+        if live_rate is not None:
+            # max(live, 0): a rolling window can measure a negative live
+            # slope, and simulating negative burn would un-consume quota.
+            weight = 0.5 ** (elapsed / _LIVE_RATE_HALFLIFE_H)
+            burn = weight * max(live_rate, 0.0) + (1.0 - weight) * burn
         if burn >= remaining:
             # Interpolate inside the hour it runs out in rather than
             # rounding up to the whole hour. Without this the simulation

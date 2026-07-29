@@ -292,14 +292,21 @@ def _pace_change_history(now, *, old_rate, new_rate, new_phase_hours):
     return old_phase + new_phase
 
 
-def test_linear_tracks_a_sustained_pace_change_monte_carlo_lags(cfg):
+def test_a_sustained_pace_change_reaches_both_models_the_same_way(cfg):
     """The flip side of outlier-resistance: a REAL, sustained pace change
     (not a one-off blip) must still be picked up, not smoothed away
     forever. Once the new pace has held for the whole lookback, linear
-    reports it. Monte Carlo instead pools burn observations from the entire
-    history (recency-decayed, not excluded), so its mean stays anchored near
-    the old rate until the new rate has had time to outweigh days of old
-    data -- a real tradeoff between the two models, not a bug in either."""
+    reports it — and Monte Carlo now reports THE SAME rate, because
+    burn_per_hour means one thing across models (the shared
+    _live_burn_rate; the whole-week mean it reported here before measured
+    7.62 pts of 1h error against linear's 5.03 on identical moments).
+
+    This window is close to the cap, so the simulation's near field — where
+    the live rate dominates the blend — decides the outcome, and the median
+    simulated exhaustion must land where the live rate says, not where
+    days of old-rate history say. That divergence (2.28h predicted with
+    minutes remaining) was the original measured failure. The far-field
+    handoff to the profile is pinned separately in test_montecarlo.py."""
     now = 2_000_000.0
     old_rate, new_rate = 0.3, 10.0  # %/h -- a genuine ~33x step up
     history = _pace_change_history(
@@ -320,11 +327,17 @@ def test_linear_tracks_a_sustained_pace_change_monte_carlo_lags(cfg):
     mc_forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
 
     assert linear_forecast.burn_per_hour == pytest.approx(new_rate, rel=0.3)
-    # Monte Carlo's mean is volume-dominated by four days of old-rate data
-    # against a few hours of new-rate data -- it must land far closer to the
-    # old rate than to the new one.
-    assert mc_forecast.burn_per_hour < (old_rate + new_rate) / 2
-    assert linear_forecast.burn_per_hour > mc_forecast.burn_per_hour * 5
+    # One field, one meaning: both models report the same live rate.
+    assert mc_forecast.burn_per_hour == pytest.approx(
+        linear_forecast.burn_per_hour, rel=0.01
+    )
+    # And near the cap the simulation agrees with the live projection --
+    # remaining quota is inside the blend's live-dominated first hour.
+    assert linear_forecast.eta_calendar is not None
+    assert mc_forecast.eta_p50 is not None
+    live_eta_h = (linear_forecast.eta_calendar.timestamp() - now) / 3600.0
+    mc_p50_h = (mc_forecast.eta_p50.timestamp() - now) / 3600.0
+    assert mc_p50_h == pytest.approx(live_eta_h, rel=0.15)
 
 
 def test_weekly_burn_smooths_a_pace_change_shorter_than_its_lookback(cfg):

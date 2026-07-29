@@ -147,6 +147,89 @@ def test_reset_pending_short_circuits_before_simulating(cfg):
     assert forecast.status == "RESET_PENDING"
 
 
+def _burst_history(now, *, level_now, burst_rate, resets_at):
+    """Hours of slow ~1%/h climb, then one final hour at `burst_rate` —
+    the live-burst shape, sized so the burst fills the w5h lookback (60
+    min): the robust slope deliberately smooths a burst SHORTER than the
+    lookback as an outlier, which is its own pinned behavior."""
+    slow_hours = 3
+    start = level_now - burst_rate - slow_hours * 1.0
+    history = [
+        _sample(now - (slow_hours - i) * 3600.0 - 3600.0, start + i * 1.0, resets_at)
+        for i in range(slow_hours + 1)
+    ]
+    history.append(_sample(now - 1800.0, level_now - burst_rate / 2.0, resets_at))
+    history.append(_sample(now, level_now, resets_at))
+    return history
+
+
+def test_live_rate_dominates_the_first_simulated_hour(cfg):
+    """The original measured failure (F2): at 80-95% used mid-burst the
+    model predicted 2.28h when the truth was minutes, because its first
+    simulated hour drew from "what this hour-of-week is generally like"
+    rather than from the burst happening right now. With the live rate
+    seeding the blend, remaining quota inside the first hour resolves at
+    the live pace."""
+    now = 1_000_000.0
+    resets_at = now + 3 * 3600
+    history = _burst_history(now, level_now=92.0, burst_rate=10.0, resets_at=resets_at)
+    window = _window(WindowKind.W5H, 92.0, now, resets_at, provider=Provider.CLAUDE)
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.eta_p50 is not None
+    eta_h = (forecast.eta_p50.timestamp() - now) / 3600.0
+    # 8% remaining at ~10%/h live -> around the hour mark; nowhere near
+    # the ~8h the slow profile alone would say.
+    assert eta_h < 2.0
+    assert forecast.burn_per_hour == pytest.approx(10.0, rel=0.4)
+
+
+def test_live_rate_decays_into_the_profile_instead_of_extrapolating(cfg):
+    """The blend is a blend, not a linear clone: far from the cap, the
+    live burst hands off to the profile within a few hours (the geometric
+    sum contributes only ~2x the live rate in total), so the median future
+    reflects the slow history — censored here — rather than the burst
+    extrapolated for hours."""
+    now = 1_000_000.0
+    resets_at = now + 4.5 * 3600
+    history = _burst_history(now, level_now=20.0, burst_rate=10.0, resets_at=resets_at)
+    window = _window(WindowKind.W5H, 20.0, now, resets_at, provider=Provider.CLAUDE)
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    # Pure live-rate extrapolation would claim exhaustion in ~8h — inside
+    # a naive 8h view but far past what the blend sustains: ~20% of quota
+    # from the decaying burst plus ~1%/h of profile never reaches 100%
+    # before the reset. The median run censors.
+    assert forecast.eta_p50 is None
+    # The rate REPORTED is still the live one — one field, one meaning.
+    assert forecast.burn_per_hour == pytest.approx(10.0, rel=0.4)
+
+
+def test_a_stale_rate_is_not_blended(cfg):
+    """An hours-old burst must not dominate hour one of an idle window's
+    future: on a stale rate the simulation runs from the profile alone,
+    and the reported rate falls back to the profile mean."""
+    now = 1_000_000.0
+    stale_ts = now - cfg.thresholds.stale_after_minutes_weekly * 60 - 60
+    resets_at = now + 48 * 3600
+    history = [
+        _sample(stale_ts - h * 3600, max(0.0, 50.0 - 10.0 - (h - 1) * 0.2), resets_at)
+        for h in range(72, 0, -1)
+    ]
+    history.append(_sample(stale_ts, 50.0, resets_at))  # burst, then silence
+    window = _window(
+        WindowKind.WEEKLY, 50.0, stale_ts, resets_at, provider=Provider.CLAUDE
+    )
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.status == "IDLE"  # level valid, rate stale -> still simulates
+    # Reported rate is the profile mean, nowhere near the stale 10%/h burst.
+    assert forecast.burn_per_hour < 2.0
+
+
 def test_unknown_reset_simulates_only_the_windows_own_duration(cfg):
     """With no derivable reset, the horizon is the window's own duration —
     a 5-hour window refills at least every 5 hours, so nothing past that can

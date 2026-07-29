@@ -144,9 +144,9 @@ def realized_exhaustion_hours(
     quietly minting one scorable "episode" per tick for whichever model still
     answers at the cap. Two hours of sitting at 100% produced 120 such
     episodes for montecarlo against 9 for linear (whose slope goes flat once
-    its lookback clears the climb), enough to clear
-    MIN_EPISODES_TO_GRADUATE and promote the model that is markedly WORSE on
-    real episodes. An episode has to start below the cap and cross it.
+    its lookback clears the climb) — enough, under the old episode-count
+    gate, to promote the model that is markedly WORSE on real episodes. An
+    episode has to start below the cap and cross it.
 
     The scan is additionally bounded by the origin sample's own declared
     `resets_at`: an exhaustion after the boundary the forecast was scoped to
