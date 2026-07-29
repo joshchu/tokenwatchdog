@@ -1,10 +1,16 @@
 """Claude Code / Claude Desktop quota reader.
 
-Two sources, both handled here:
+Three sources, in decreasing order of fidelity:
 
+- **Source C — the claude CLI** (`providers/claude_cli.py`): the
+  authoritative reading — spawns ``claude -p "/usage"`` and parses the
+  server-reported percent and reset time for both windows. No credential
+  handling anywhere in this tool: the ``claude`` binary owns its own auth.
+  Throttled and cached because each spawn hits Anthropic's rate-limited
+  usage endpoint; see that module for the details.
 - **Source A — Claude Desktop** (`plan-usage-history.json`): a ready-made
   `fh` (five-hour %) / `sd` (weekly %) snapshot. No `resets_at` at all —
-  deriving a reset time from window definitions is the predictor's job, not
+  deriving a reset time from the sample series is the predictor's job, not
   this module's.
 - **Source B — token-compute**: sum per-message token usage from
   `~/.claude/projects/**/*.jsonl` and divide by an estimated limit, since
@@ -18,11 +24,15 @@ Two sources, both handled here:
   within the retention lookback get re-read, and the running total is a SQL
   sum over what's already stored.
 
-`cfg.claude.source`: "desktop" or "tokens" pins one source; "auto" prefers
-Desktop when it has data and falls back to tokens otherwise. Token events are
-ingested into the store unconditionally either way — storage-first, so a
-future predictor has real history to learn from even if Desktop happened to
-be the live source most of the time.
+`cfg.claude.source`: "cli", "desktop", or "tokens" pins one source; "auto"
+prefers the CLI reading, falls back to Desktop, then to tokens. In auto
+mode a live CLI reading is returned *appended after* the Desktop
+history: the engine keeps the last window per kind for the live view (CLI
+wins) while still backfilling every retained Desktop sample into the store —
+the predictor's burn profile learns from the denser history either way.
+Token events are ingested into the store unconditionally — storage-first, so
+a future predictor has real history to learn from even if another source
+happened to be the live one most of the time.
 """
 
 from __future__ import annotations
@@ -37,6 +47,7 @@ from typing import Any
 from tokenwatchdog.blocks import block_anchor
 from tokenwatchdog.config import Config
 from tokenwatchdog.models import Provider, Window, WindowKind
+from tokenwatchdog.providers.claude_cli import CliUsageSource
 from tokenwatchdog.store import Store, TokenEventRow
 from tokenwatchdog.timeutil import parse_iso_to_epoch
 
@@ -60,17 +71,31 @@ _P90_SAFETY_FACTOR = 0.9  # treat the largest historical burst as ~90% of the tr
 class ClaudeProvider:
     name = "claude"
 
+    def __init__(self, cli: CliUsageSource | None = None) -> None:
+        # One long-lived source per provider: it owns the spawn throttle
+        # that reconciles a 60s poll loop with the CLI's 180s floor.
+        self._cli = cli if cli is not None else CliUsageSource()
+
     def read(self, cfg: Config, store: Store) -> list[Window]:
         now = time.time()
         _ingest_token_events(cfg, store, now)
 
         if cfg.claude.source == "tokens":
             return _read_tokens(cfg, store, now)
+        exact_windows = (
+            self._cli.read(cfg, now) if cfg.claude.source in ("auto", "cli") else []
+        )
+        if cfg.claude.source == "cli":
+            return exact_windows
 
         desktop_windows = _read_desktop(cfg)
         if cfg.claude.source == "desktop":
             return desktop_windows
-        # auto: prefer Desktop's real percentage when present, else compute.
+        # auto: Desktop history first so it backfills the store, the exact
+        # reading last so it wins the live view (the engine keeps the last
+        # window per kind).
+        if exact_windows:
+            return desktop_windows + exact_windows
         return desktop_windows if desktop_windows else _read_tokens(cfg, store, now)
 
 

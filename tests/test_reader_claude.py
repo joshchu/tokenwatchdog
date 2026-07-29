@@ -19,6 +19,7 @@ from tokenwatchdog.config import load_config
 from tokenwatchdog.models import Provider, WindowKind
 from tokenwatchdog.predictor import tokens_burned_past_quota
 from tokenwatchdog.providers import claude as claude_provider
+from tokenwatchdog.providers.claude_cli import CliUsageSource
 from tokenwatchdog.store import SampleRow
 
 
@@ -460,3 +461,73 @@ def test_unchanged_transcripts_are_not_re_read_every_poll(tmp_path, store):
         100,
         200,
     }
+
+
+# -- the CLI source in the provider chain ---------------------------------
+
+_CLI_OUTPUT = (
+    "You are currently using your subscription to power your Claude Code usage\n"
+    "\n"
+    "Current session: 88% used · resets Jul 29 at 5pm (America/New_York)\n"
+    "Current week (all models): 5% used · resets Aug 5 at 1pm (America/New_York)\n"
+)
+_CLI_SOURCE_LABEL = "claude -p /usage"
+
+
+def _write_desktop_history(sandbox_home):
+    desktop_dir = sandbox_home / "Library" / "Application Support" / "Claude"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "plan-usage-history.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "samples": [
+                    {"t": 1_000_000, "org": "org-1", "u": {"fh": 40, "sd": 12}},
+                ],
+            }
+        )
+    )
+
+
+def test_auto_returns_desktop_backfill_with_the_cli_reading_last(
+    sandbox_home, tmp_path, store
+):
+    """The engine keeps the LAST window per kind for the live view, so the
+    exact CLI reading must come after the Desktop history — Desktop rows
+    still backfill the store, the CLI values win the display."""
+    _write_desktop_history(sandbox_home)
+    cfg = _write_config(tmp_path, '[claude]\nsource = "auto"\n')
+    provider = claude_provider.ClaudeProvider(
+        cli=CliUsageSource(spawn=lambda cfg: _CLI_OUTPUT)
+    )
+
+    windows = provider.read(cfg, store)
+    assert [w.source_file for w in windows[:2]] != [_CLI_SOURCE_LABEL] * 2
+    assert [w.source_file for w in windows[-2:]] == [_CLI_SOURCE_LABEL] * 2
+    assert windows[-1].resets_at is not None
+
+
+def test_auto_falls_back_to_desktop_when_the_cli_is_unavailable(
+    sandbox_home, tmp_path, store
+):
+    _write_desktop_history(sandbox_home)
+    cfg = _write_config(tmp_path, '[claude]\nsource = "auto"\n')
+    provider = claude_provider.ClaudeProvider(
+        cli=CliUsageSource(spawn=lambda cfg: None)
+    )
+
+    windows = provider.read(cfg, store)
+    assert windows
+    assert all(w.source_file != _CLI_SOURCE_LABEL for w in windows)
+
+
+def test_cli_pin_returns_only_the_cli_reading(sandbox_home, tmp_path, store):
+    _write_desktop_history(sandbox_home)  # present but must be ignored
+    cfg = _write_config(tmp_path, '[claude]\nsource = "cli"\n')
+    provider = claude_provider.ClaudeProvider(
+        cli=CliUsageSource(spawn=lambda cfg: _CLI_OUTPUT)
+    )
+
+    windows = provider.read(cfg, store)
+    assert len(windows) == 2
+    assert {w.source_file for w in windows} == {_CLI_SOURCE_LABEL}

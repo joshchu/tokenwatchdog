@@ -28,7 +28,7 @@ _VALID_PREDICTOR_MODELS = {
     "montecarlo",
     "holtwinters",
 }
-_VALID_CLAUDE_SOURCES = {"auto", "desktop", "tokens"}
+_VALID_CLAUDE_SOURCES = {"auto", "cli", "desktop", "tokens"}
 _VALID_LIMIT_MODES = {"p90", "plan"}
 _VALID_WINDOW_KINDS = {"weekly", "w5h"}
 
@@ -57,8 +57,11 @@ class CodexConfig:
 
 @dataclass(frozen=True)
 class ClaudeConfig:
-    source: str = "auto"  # "auto" (desktop->tokens) | "desktop" | "tokens"
+    source: str = "auto"  # "auto" (cli->desktop->tokens) | "cli" | "desktop" | "tokens"
     config_dir: str = ""  # "" -> $CLAUDE_CONFIG_DIR or ~/.claude
+    # "" -> find `claude` on PATH. Set explicitly when running under
+    # launchd, whose minimal PATH won't include user-installed binaries.
+    cli_path: str = ""
     limit_mode: str = "p90"  # "p90" | "plan"
     plan_limits_tokens: dict[str, int] = field(
         default_factory=lambda: {"default_claude_max_5x": 88_000}
@@ -363,8 +366,9 @@ input_price_per_million_usd = 0.0    # set to your plan's real overage/credit ra
 output_price_per_million_usd = 0.0   # to show $ burned past quota instead of just tokens
 
 [claude]
-source = "auto"                      # "auto" (desktop->tokens) | "desktop" | "tokens"
+source = "auto"                      # "auto" (cli->desktop->tokens) | "cli" | "desktop" | "tokens"
 config_dir = ""                      # "" -> $CLAUDE_CONFIG_DIR or ~/.claude
+cli_path = ""                        # "" -> find `claude` on PATH (set under launchd)
 limit_mode = "p90"                   # "p90" | "plan"
 input_price_per_million_usd = 0.0        # set to your plan's real overage/credit
 output_price_per_million_usd = 0.0       # rate to show $ burned past quota instead

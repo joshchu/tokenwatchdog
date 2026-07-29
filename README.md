@@ -229,13 +229,19 @@ definition but not their inputs (replayed forecasts versus stored ones).
 
 ## How it works
 
-TokenWatchDog reads quota data **only from local files already on your
-machine** — Codex's session logs and Claude Code's/Claude Desktop's local
-usage data. It never calls any API and never transmits anything. Those
-session logs do contain your conversation history, but TokenWatchDog only
-ever extracts numeric usage fields (token counts, timestamps, model names)
-from each line — the message content itself is never logged, stored, or
-transmitted anywhere.
+TokenWatchDog reads quota data **from your own machine and your own
+providers, nothing else**. For Claude, the freshest reading comes from
+spawning Claude Code's own CLI — `claude -p "/usage"`, a free, LLM-less
+local slash command that reports the server's numbers — so this tool never
+touches credentials; the `claude` binary owns its own auth. Claude
+Desktop's usage snapshot and Claude Code's transcripts are the fallbacks,
+and Codex is read from its session logs. The only network traffic is what
+the `claude` binary itself sends to Anthropic to answer that query:
+TokenWatchDog holds no tokens, calls no API of its own, and never
+transmits anything anywhere. The session logs it parses do contain your
+conversation history, but only numeric usage fields (token counts,
+timestamps, model names) are ever extracted — the message content itself
+is never logged, stored, or transmitted anywhere.
 
 Burn rate is measured from token throughput wherever possible. Neither
 provider publishes its real token cap, so instead of guessing one, the tool
@@ -310,12 +316,14 @@ model and says so. That's the design working, not a gap — run
   what Codex exposes, not a bug. Its per-request *token* counts are a time
   series and are backfilled, which is why burn rate survives downtime better
   than the percentage does.
-- **Claude history can be backfilled.** Both Claude sources keep their own
-  history independent of whether TokenWatchDog is running — token-compute
-  re-scans Claude Code's own transcripts (bounded by
-  `predictor.history_retention_weeks`), and Desktop mode reads everything
-  `plan-usage-history.json` still retains (~5 days). Either way, a period
-  with the tool off isn't a gap once it's running again.
+- **Claude history can be backfilled.** The Desktop and token-compute
+  sources keep their own history independent of whether TokenWatchDog is
+  running — token-compute re-scans Claude Code's own transcripts (bounded
+  by `predictor.history_retention_weeks`), and Desktop mode reads
+  everything `plan-usage-history.json` still retains (~5 days). Either
+  way, a period with the tool off isn't a gap once it's running again.
+  (The CLI source is live-only — its exact readings accumulate in
+  `history.db` from the moment the tool runs.)
 - **Only tested on macOS so far.** The core polling/prediction logic is plain
   Python, Windows installs receive the IANA timezone data needed for
   DST-aware projections, and the spacebar refresh has a Windows `msvcrt`
@@ -331,27 +339,28 @@ model and says so. That's the design working, not a gap — run
   Windows therefore falls back to Claude Code transcripts rather than reading
   the Desktop usage file. A Windows CI job plus a Task Scheduler/service smoke
   test should be required before calling the platform supported.
-- **Claude's 5-hour reset is computed; its weekly reset still has to be
-  observed.** Claude reports no reset time at all. The 5-hour window is a
-  fixed block anchored at your first request after an idle gap, so its reset
-  is derived from local evidence, best first: an *observed expiry* (the
-  account-wide percentage dropping as the old block ends) invalidates every
-  older anchor — CLI activity can run straight through an account boundary,
-  leaving the token log pointing into the previous block — then the
-  percentage rising from zero, then the first post-gap activity in the CLI
-  token log, taking the earliest evidence of the current block. It can
-  still run late: the percentage is a whole number, so a block opened by a
-  few small requests on another surface (Desktop, phone, claude.ai) is
-  invisible until cumulative usage crosses ~1%, and the derived reset
-  inherits that lag. The weekly window has no equivalent rule — a 7-day gap
-  in activity isn't what starts a new weekly cycle — so it waits for an
-  actual reset to appear in your history, and until one does the countdown
-  is honestly unknown rather than guessed. Every derived reset also carries
-  up to half a sample gap of uncertainty (~2–3 minutes at Desktop's
-  5-minute cadence): a boundary is only ever observed as the straddle
-  between the last old-cycle sample and the first new-cycle one, and the
-  anchor is that straddle's midpoint — no local data can see through the
-  gap more finely.
+- **Claude reset times are server-reported to the minute; the fallbacks
+  estimate.** The primary source asks Claude Code itself
+  (`claude -p "/usage"`), which prints each window's reset rounded to the
+  nearest minute. Anthropic's actual reset instants sit a fraction of a
+  second off the hour (e.g. `:59:59.95`), so the Claude app — which
+  truncates instead of rounding — can display one minute earlier than the
+  watchdog for the same instant; the countdown itself is right to well
+  under a minute. When the CLI is unavailable and the tool falls back to
+  Desktop/transcript estimation, resets are *derived*: the 5-hour window is
+  a fixed block anchored at your first request after an idle gap, taken
+  from local evidence, best first — an observed expiry (the account-wide
+  percentage dropping as the old block ends) invalidates every older
+  anchor, then the percentage rising from zero, then the first post-gap
+  activity in the CLI token log. That derivation can run late (a block
+  opened by a few small requests on another surface is invisible until
+  cumulative usage crosses ~1%), the weekly window has no equivalent rule —
+  it waits for an actual reset to appear in your history, and until one
+  does the countdown is honestly unknown rather than guessed — and every
+  derived reset carries up to half a sample gap of uncertainty (~2–3
+  minutes at Desktop's 5-minute cadence): a boundary is only ever observed
+  as the straddle between the last old-cycle sample and the first new-cycle
+  one, and the anchor is that straddle's midpoint.
 - **Codex's weekly window rolls; it never "resets."** Old usage ages out of
   a moving 7-day sum continuously, so its level can fall without any
   boundary (measured: 17→0 in twelve minutes as a week-old burst aged out),
