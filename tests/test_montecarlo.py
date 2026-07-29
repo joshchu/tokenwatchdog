@@ -258,6 +258,30 @@ def test_unknown_reset_simulates_only_the_windows_own_duration(cfg):
     assert forecast.confidence == "medium"
 
 
+def test_workhours_eta_is_the_p50_not_a_double_count(cfg):
+    """The p50 already walks a learned week — overnight idling is in the
+    profile. Re-projecting it through the working-hours budget gate counted
+    time-of-day twice (that gate's contract is a 24/7 burn-hours budget,
+    which only linear's constant-rate hours satisfy)."""
+    now = 1_000_000.0
+    resets_at = now + 60 * 3600
+    history = []
+    ts = now - 5 * 24 * 3600
+    percent = 0.0
+    while ts <= now:
+        history.append(_sample(ts, percent, resets_at if ts == now else None))
+        percent += 2.0
+        if percent >= 95.0:
+            percent = 0.0
+        ts += 3600
+    window = _window(WindowKind.WEEKLY, history[-1].used_percent, now, resets_at)
+
+    forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
+
+    assert forecast.eta_p50 is not None
+    assert forecast.eta_workhours == forecast.eta_p50
+
+
 def test_no_history_falls_back_to_ok_with_no_confidence(cfg):
     now = 1_000_000.0
     window = _window(WindowKind.WEEKLY, 10.0, now)

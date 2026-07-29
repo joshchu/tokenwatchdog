@@ -349,11 +349,13 @@ class MonteCarloPredictor:
             now_dt + timedelta(hours=p90_h) if p90_h is not None else None,
             horizon,
         )
-        eta_workhours, _ = _cap_at_horizon(
-            project_workhours_exhaustion(now_dt, p50_h, cfg.working_hours),
-            None,
-            horizon,
-        )
+        # The simulation already walked wall-clock hours through a learned
+        # week — its p50 IS the schedule-aware answer. Piping it through
+        # project_workhours_exhaustion (whose contract is a 24/7 burn-hours
+        # BUDGET, which linear's constant-rate hours genuinely are) counted
+        # time-of-day twice, inflating stored eta_workhours by however much
+        # of the p50 fell outside working hours.
+        eta_workhours = eta_p50
 
         return Forecast(
             window=window,
