@@ -61,19 +61,27 @@ enough that it will run out before the window naturally resets.
   reset describes an event that can't happen, and no window is ever projected
   to take longer to exhaust than its own duration
 - `predictor.model = "auto"` grades every model against **your** stored
-  forecasts and keeps the default unless a challenger wins by a real margin
-  across enough scored episodes; it reports which it chose and why, and
-  declines rather than switching on a sample too small to mean anything
-- Staleness applies to the burn *rate*, not the used-% *level*: quota doesn't
-  un-consume while you're away, so a 100%-used reading still alerts once its
-  cycle is confirmed live. The burn-rate ETA disappears when that rate is
-  stale, while the learned prediction may continue from an in-cycle level.
+  forecasts on a dense fixed-horizon metric (predicted used% at +1h/+24h vs
+  what actually happened), and switches only when a challenger beats BOTH the
+  default AND a persistence baseline ("nothing changes") by a real margin on
+  matched moments — without being materially worse on any single window. It
+  reports which it chose and why, and declines rather than switching on a
+  sample too small to mean anything
+- Staleness applies to the burn *rate*, not the used-% *level*: on a fixed
+  window quota doesn't un-consume while you're away, so a 100%-used reading
+  still alerts once its cycle is confirmed live. The burn-rate ETA disappears
+  when that rate is stale, while the learned prediction may continue from an
+  in-cycle level. Codex's weekly window is the exception — it's a *rolling*
+  sum whose level decays on its own, so a stale reading there is never
+  vouched for.
   If the provider cannot prove the cycle while idle, the latest compatible
   saved percentile forecast remains visible as `saved` until its P50 passes
   or one quota-window duration elapses
 - `scripts/backtest.py` replays your stored history to score each predictor
-  (ETA coverage, mean error, bias, P90 calibration), so "which model is
-  better" is a measurement rather than an argument
+  (ETA coverage, mean error, bias, P90 calibration, the dense fixed-horizon
+  metric with its persistence baseline, and risk-probability calibration
+  against a base-rate benchmark), so "which model is better" is a
+  measurement rather than an argument
 - 90%-usage alert and a separate "burning too fast" alert, both native
   notifications with a cute spoken "Woof! Woof!" by default (any system
   sound name works too, or turn notifications off entirely with
@@ -146,8 +154,8 @@ time is never misread as UTC.
 | **Status** | `ok` — live, and not on pace to exhaust. `🔥 burning` — on pace to hit 100% before the reset. `idle` — the newest reading is older than this window's staleness threshold (10 min for 5-hour, 3 h for weekly, both configurable), so no *rate* can be measured; the **Used %** level still counts. `reset_pending` — the window just turned over and there's only one reading in the new cycle. `no_data` — the provider isn't reporting this window at all (today, Codex's 5-hour). |
 | **Burn %/h** | Percent of *this window's* quota consumed per hour at the currently measured rate — not tokens per hour, and not a share of anything else, so it divides straight into the percent remaining. Normally measured from real token throughput and converted by the percent-per-token calibration; a trailing `~` means it fell back to the slope of the reported percentage itself, which is quantized to whole numbers and therefore coarse. `—` on any row that isn't live (`idle`, `no_data`, `reset_pending`), because a rate is the one thing a stale reading can't support. |
 | **ETA on burn %/h** | When the window runs out if the displayed recent burn rate continues around the clock. It is the direct counterpart to **Burn %/h**: percent remaining divided by that rate, rendered as a weekday and time. |
-| **Predicted ETA (P50 → P90)** | When it runs out *given how you actually use this across a week*. `Sat 08:53 → Mon 19:46` is a full range: the left timestamp is the median simulated exhaustion time (P50), and the right is the later 90th-percentile time (P90). `P50 Sat 08:53` means a median exists but fewer than 90% of simulations exhaust before reset. `hours Sat 08:53` is the configured-working-hours fallback while the learned profile is thin. On an `idle` row, `saved ...` is the latest persisted percentile result based on the same last-used percentage; it is display context only and never drives alerts. |
-| **Resets** | When this window's quota refills. Reported directly by Codex; for Claude, computed from the 5-hour block anchor, or `—` for the weekly window until a reset is actually observed. |
+| **Predicted ETA (P50 → P90)** | When it runs out *given how you actually use this across a week*. `Sat 08:53 → Mon 19:46` is a full range: the left timestamp is the median simulated exhaustion time (P50), and the right is the later 90th-percentile time (P90). `P50 Sat 08:53` means a median exists but fewer than 90% of simulations exhaust before reset. `hours Sat 08:53` is the configured-working-hours fallback while the learned profile is thin. `safe (risk 4%)` means a fresh simulation ran and MOST futures survive to the reset — an answer, not an absence — with the tail risk spelled out. On an `idle` row, `saved ...` is the latest persisted percentile result based on the same last-used percentage; it is display context only and never drives alerts. |
+| **Resets** | When this window's quota refills. Reported directly by Codex — though its weekly value is a rolling projection that slides as old usage ages out, not a fixed boundary. For Claude's 5-hour window it's derived from the earliest account-wide evidence of the block's start (an observed expiry drop, the percentage rising from zero, or the first post-gap CLI activity — whichever saw it first); `—` for Claude's weekly window until a reset is actually observed. |
 | **Risk** | Probability of exhausting before that reset — the share of simulated futures that reach 100% in time. Worth seeing separately from the ETA: a 40% chance of running out matters even when the median future doesn't. Only present while a simulating model is running, and the column is hidden entirely when no model produces one. |
 | **Conf.** | How much evidence is behind the estimate: `high` at 10+ observations, `medium` at 3+, else `low`. The hour-of-week models additionally downgrade it by how much of the period being projected actually has data (below 50% coverage is `low` regardless); coverage can only lower a rating, never raise it. Under the default `linear` there's no profile to cover, so what you see is the observation count alone. |
 
@@ -158,20 +166,21 @@ provider-reported reset really is the next one; nothing re-clamps it).
 
 A blank ETA is a real answer rather than a missing one. **ETA on burn %/h**
 is blank on an `idle`, `no_data`, or `reset_pending` row because there is no
-live rate to extend. **Predicted ETA** may remain on an `idle` row; it is blank
-when neither a current simulation nor an eligible saved prediction exists,
-the history is too thin, or most simulated futures survive until the reset.
+live rate to extend. **Predicted ETA** may remain on an `idle` row; when a fresh simulation ran
+and most futures survive to the reset it reads `safe (risk N%)` rather than
+going blank, and it is blank only when neither a current simulation nor an
+eligible saved prediction exists or the history is too thin.
 A saved result is eligible only while its used percentage still matches the
 displayed level, its P50 remains in the future, no newer reset or active result
 has invalidated it, and it is less than one quota-window duration old.
 
-Row colors track the alert conditions closely: **red** for something that
-fired or would fire (over the warn threshold, or burning with an imminent
-ETA), **yellow** for the weaker "on pace to exhaust before reset." One
-deliberate divergence: a 100% reading always paints red, even when it's stale
-enough that alerting has stopped vouching for the cycle — being at your cap is
-worth seeing regardless. The dog in the title agrees — 🐶 calm, 🐕 at the warn
-threshold, 🔥 burning.
+Row colors track the alert conditions: **red** for something that fired or
+would fire (100% used or over the warn threshold — while the level can still
+be vouched for — or burning with an imminent ETA), **yellow** for the weaker
+"on pace to exhaust before reset." A fixed-cycle 100% stays red through an
+idle stretch for as long as its known cycle is live; a stale *rolling* 100%
+does not, because that number may have already decayed. The dog in the title
+follows the same rules — 🐶 calm, 🐕 at the warn threshold, 🔥 burning.
 
 ### Backtest scores
 
@@ -185,6 +194,8 @@ hours, cycles, and token events it had to work with) and one row per model:
 | **MAE h** | Mean absolute error of the ETA, in hours. |
 | **bias h** | Mean *signed* error. Positive means the ETAs ran late (predicting exhaustion after it happened); negative means early and alarmist. Tracked separately because the two directions aren't equally costly, and because a change can meaningfully cut bias while leaving MAE inside the noise. |
 | **P90 hit** | Calibration of the band: how often the truth actually landed at or before the model's P90. A well-calibrated P90 sits near 90% — much higher means the band is wider than it needs to be, much lower means it's overconfident. Blank for models that don't produce a band. |
+| **dense used% at +h** | The decision metric — what `auto` actually switches on. Each model's own predicted level at the window's decision horizon (+1h for 5-hour, +24h for weekly) against what the store later recorded, in percentage points, on moments where *every* model answered, with a `persistence` row ("nothing changes") on the same moments as the bar to clear. |
+| **risk** | Probability calibration: the Risk column's claims against 0/1 outcomes — a Brier score next to the always-guess-the-base-rate benchmark, plus a reliability table (claimed band → realized frequency). A Brier above the benchmark means the probability is worse than uninformative, however precise it renders. |
 
 An episode has to *start* below the cap and cross it. A moment already at
 100% is not one: every model trivially answers "exhausted now," so scoring it
@@ -200,20 +211,21 @@ at-cap origins fixes all three.
 
 Two things to still keep in mind when reading the table:
 
-- **`scored` counts forecast moments, not distinct events.** Many correlated
-  forecasts made while climbing toward one exhaustion each count separately —
-  on this history, 14 episodes point at just 2 real crossings. So 30 is a
-  floor on evidence, not on independent events.
+- **Exhaustion episodes are a diagnostic, not the decision.** `scored` counts
+  forecast moments, and many correlated forecasts made while climbing toward
+  one exhaustion each count separately — on early history, 14 episodes
+  pointed at just 2 real crossings. Nothing gates on that count anymore;
+  `auto` decides on the dense metric, which accumulates hundreds of matched
+  moments per day and carries its own ≥500-moment / ≥15%-margin /
+  beat-persistence bars.
 - **`P90 hit` is conditional**, on an episode both producing a band and then
-  exhausting, so it isn't a full unconditional calibration check. It prints
-  `—` while no genuine episode has carried an uncensored P90.
+  exhausting, so it isn't a full unconditional calibration check — the risk
+  section is the unconditional one. It prints `—` while no genuine episode
+  has carried an uncensored P90.
 
-Expect the honest numbers to be sparse and to stay that way: on ~6.5 days of
-real history the count is 14 for the default model and 3 for the simulating
-one, so `auto` reports "not enough" and stays put. That is the design working.
-The footer says so explicitly, but treat its verdict as describing the replay
-only — it and the runtime `auto` gate share a definition but not their inputs
-(replayed forecasts versus stored ones).
+The footer states whether the replay's dense sample is decidable. Treat it as
+describing the replay only — it and the runtime `auto` gate share a
+definition but not their inputs (replayed forecasts versus stored ones).
 
 ## How it works
 
@@ -232,7 +244,9 @@ percentage's movement across the current cycle, divided by the tokens spent
 over that same span — and uses that ratio to turn recent tokens/hour into
 %/h. It refuses to calibrate from a cycle that hasn't moved at least a few
 points, or one that ends pinned at 100%, and falls back to the percentage's
-own slope in those cases.
+own slope in those cases. On Codex's rolling weekly window — where the level
+rises and falls as old usage ages out, confounding a whole-cycle delta — it
+calibrates on the most recent rising stretch instead.
 
 Two models run each tick. **ETA on burn %/h** comes from a robust
 (outlier-resistant) fit of the recent rate, projected forward to when usage
@@ -243,6 +257,14 @@ band and a probability of exhausting before the reset. Because that bucketing
 is built from token history, an hour with no requests contributes a real zero
 rather than no data at all — which is what lets it learn that you don't burn
 quota overnight, instead of filling those hours in from your daytime average.
+Each simulated future starts from what is happening *right now*: the first
+hour burns at the live measured rate — the same number the Burn %/h column
+shows — handing off to the learned profile within the hour (measured: the
+rate's magnitude decays to roughly a third by the next hour, and giving the
+live rate more reach than that measurably degraded both accuracy and risk
+calibration). That is what lets a burst that started ten minutes ago move
+the near-term prediction instead of being averaged into "what Tuesdays are
+generally like."
 While the profile is still thin, **Predicted ETA** falls back to the working
 hours you declared in config: the burn budget run through only those intervals
 instead of treating every hour as billable. Once learned, the prediction keeps
@@ -257,15 +279,16 @@ status continues to suppress burn-rate alerts.
 
 `predictor.model` picks which of the two is *authoritative* — the one alerts
 fire from. `"auto"` decides that by grading both against your own stored
-forecasts, and stays on the burn-rate model unless the other wins by a real
-margin over enough scored episodes. It says which and why rather than
-switching silently. That choice does not swap the dashboard columns: the
+forecasts on the dense fixed-horizon metric, and stays on the burn-rate model
+unless the challenger beats both it and the persistence baseline by ≥15%
+across ≥500 matched moments — and isn't materially worse on any single
+window. It says which and why rather than switching silently. That choice does not swap the dashboard columns: the
 burn-rate ETA remains beside **Burn %/h**, and the learned prediction remains
 under **Predicted ETA**.
 
 The "burning too fast" alert uses the authoritative model's ETA. With the
 default burn-rate model that is **ETA on burn %/h**; if the learned model
-eventually wins enough scored episodes, it becomes **Predicted ETA**.
+ever clears the selection bars, it becomes **Predicted ETA**.
 
 ## Status
 
@@ -273,11 +296,11 @@ The core (both providers, both predictors, alerting, terminal dashboard,
 measured model selection) is implemented and tested. A packaged standalone
 binary and a menu-bar front-end are natural next steps but aren't built yet.
 
-Model selection is wired up but has not yet fired on real data: grading needs
-windows that actually reached 100%, and a weekly window supplies at most a
-couple of those a week, so `auto` currently reports "not enough scored
-history" and stays on the burn-rate model. That's the intended behavior, not
-a gap — run `scripts/backtest.py` to see where your own history stands.
+Model selection is wired up and measurable but has not switched on real
+data: on ~11 days of history the learned model grades ~9% better pooled,
+under the 15% margin the switch requires, so `auto` stays on the burn-rate
+model and says so. That's the design working, not a gap — run
+`scripts/backtest.py` to see where your own history stands.
 
 ## Limitations
 
@@ -311,16 +334,27 @@ a gap — run `scripts/backtest.py` to see where your own history stands.
 - **Claude's 5-hour reset is computed; its weekly reset still has to be
   observed.** Claude reports no reset time at all. The 5-hour window is a
   fixed block anchored at your first request after an idle gap, so its reset
-  is derived from two kinds of local evidence — the account-wide percentage
-  series rising from zero, and the first post-gap activity in the CLI token
-  log — taking whichever saw the block start first. It can still run late:
-  the percentage is a whole number, so a block opened by a few small
-  requests on another surface (Desktop, phone, claude.ai) is invisible
-  until cumulative usage crosses ~1%, and the derived reset inherits that
-  lag. The weekly window has no equivalent rule — a 7-day gap in activity
-  isn't what starts a new weekly cycle — so it waits for an actual reset to
-  appear in your history, and until one does the countdown is honestly
-  unknown rather than guessed.
+  is derived from local evidence, best first: an *observed expiry* (the
+  account-wide percentage dropping as the old block ends) invalidates every
+  older anchor — CLI activity can run straight through an account boundary,
+  leaving the token log pointing into the previous block — then the
+  percentage rising from zero, then the first post-gap activity in the CLI
+  token log, taking the earliest evidence of the current block. It can
+  still run late: the percentage is a whole number, so a block opened by a
+  few small requests on another surface (Desktop, phone, claude.ai) is
+  invisible until cumulative usage crosses ~1%, and the derived reset
+  inherits that lag. The weekly window has no equivalent rule — a 7-day gap
+  in activity isn't what starts a new weekly cycle — so it waits for an
+  actual reset to appear in your history, and until one does the countdown
+  is honestly unknown rather than guessed.
+- **Codex's weekly window rolls; it never "resets."** Old usage ages out of
+  a moving 7-day sum continuously, so its level can fall without any
+  boundary (measured: 17→0 in twelve minutes as a week-old burst aged out),
+  and the provider's `resets_at` is a sliding projection, not a cycle end.
+  TokenWatchDog models it that way: drops don't split cycles, forecasts are
+  scoped to the declared clear-time, alerts re-arm on the level actually
+  clearing rather than on `resets_at` moving, and a stale rolling reading
+  is never treated as still current.
 - **The weekly token-based percentage is a trailing 7-day sum**, not a true
   fixed cycle, for the same reason: there's no anchor to align it to. It's an
   estimate (flagged `*` in the dashboard), and the tail of it drifts as old
