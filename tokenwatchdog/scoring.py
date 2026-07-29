@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import bisect
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from tokenwatchdog.store import ForecastRow, SampleRow
@@ -85,6 +86,14 @@ def realized_exhaustion_hours(
     MIN_EPISODES_TO_GRADUATE and promote the model that is markedly WORSE on
     real episodes. An episode has to start below the cap and cross it.
 
+    The scan is additionally bounded by the origin sample's own declared
+    `resets_at`: an exhaustion after the boundary the forecast was scoped to
+    belongs to a different cycle even if no drop was caught in the act. This
+    is a no-op for Claude (its samples never carry resets_at) and is what
+    makes grading on a ROLLING window (codex weekly) independent of drop
+    detection — roll-off drops there aren't resets, so the scan can't rely
+    on seeing one.
+
     `is_reset` is injected rather than imported to keep this module free of
     a circular dependency on predictor.py. It must be the same predicate the
     predictors use -- a threshold of its own here read a 5-hour window as
@@ -95,7 +104,10 @@ def realized_exhaustion_hours(
     # percentage is unclamped and can read above 100.
     if samples[index].used_percent >= _EXHAUSTED_PERCENT:
         return None
+    cycle_end = samples[index].resets_at
     for offset in range(index + 1, len(samples)):
+        if cycle_end is not None and samples[offset].source_ts > cycle_end:
+            return None
         if is_reset(samples[offset - 1], samples[offset]):
             return None
         if samples[offset].used_percent >= _EXHAUSTED_PERCENT:
@@ -103,17 +115,20 @@ def realized_exhaustion_hours(
     return None
 
 
-def score_model(
-    model_name: str,
-    pairs: list[tuple[list[ForecastRow], list[SampleRow]]],
-    is_reset,
-) -> ModelScore:
+ResetPredicate = Callable[[SampleRow, SampleRow], bool]
+ScoringPair = tuple[list[ForecastRow], list[SampleRow], ResetPredicate]
+
+
+def score_model(model_name: str, pairs: list[ScoringPair]) -> ModelScore:
     """Grade one model across every window's stored forecasts.
 
-    `pairs` is one (forecasts, samples) pair per window. Errors are pooled
-    across all of them rather than scored per window, because exhaustion
-    episodes are the scarce resource: split per window, none of them ever
-    reaches a decidable sample size.
+    `pairs` is one (forecasts, samples, reset-predicate) triple per window —
+    the predicate rides with its window because "what counts as a cycle
+    boundary" is a per-window fact now that rolling windows exist (see
+    predictor._reset_predicate). Errors are pooled across all of them rather
+    than scored per window, because exhaustion episodes are the scarce
+    resource: split per window, none of them ever reaches a decidable sample
+    size.
 
     Each forecast is matched to the newest sample that existed when it was
     made (see `_origin_sample_index`), and errors are computed between two
@@ -123,7 +138,7 @@ def score_model(
     errors: list[float] = []
     moments = 0
     with_eta = 0
-    for rows, samples in pairs:
+    for rows, samples, is_reset in pairs:
         # Extracted once per window, not per row -- the whole point of the
         # binary search below.
         source_times = [sample.source_ts for sample in samples]

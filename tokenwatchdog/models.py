@@ -34,6 +34,17 @@ def window_duration_seconds(kind: WindowKind) -> float:
     return _W5H_SECONDS if kind is WindowKind.W5H else _WEEKLY_SECONDS
 
 
+def window_is_rolling(provider: Provider, kind: WindowKind) -> bool:
+    """Whether this window is a rolling roll-off sum rather than a fixed
+    cycle. Codex's weekly limit rolls: used_percent drifts DOWN on its own
+    as old usage ages out, with no reset event. Measured over 10.5 days of
+    real history: 2 of 3 drops flagged as "resets" were roll-off — 17→0 in
+    12 minutes (a week-old burst aging out) and 14→1 across a 52.7-hour
+    idle gap — and each falsely split a cycle. Claude's windows and Codex's
+    5-hour window are fixed blocks that genuinely reset."""
+    return provider is Provider.CODEX and kind is WindowKind.WEEKLY
+
+
 ForecastStatus = Literal["OK", "IDLE", "NO_DATA", "RESET_PENDING"]
 Confidence = Literal["low", "medium", "high"]
 AlertKind = Literal["threshold", "burn"]

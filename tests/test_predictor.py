@@ -125,9 +125,12 @@ def test_staleness_is_per_window_so_the_weekly_rate_survives_a_short_break(cfg):
 
 
 def test_negative_delta_is_reset_pending(cfg):
+    # CLAUDE deliberately: this pins generic fixed-cycle behavior, and codex
+    # weekly is a ROLLING window where a drop alone is roll-off, not a reset
+    # (see tests/test_rolling_window.py for that side).
     now = 100_000.0
     history = [_sample(now - 120, 95.0), _sample(now, 5.0)]
-    window = _window(Provider.CODEX, WindowKind.WEEKLY, 5.0, now)
+    window = _window(Provider.CLAUDE, WindowKind.WEEKLY, 5.0, now)
     forecast = LinearPredictor().forecast(window, history, [], cfg, now)
     assert forecast.status == "RESET_PENDING"
     assert forecast.burn_per_hour == 0.0

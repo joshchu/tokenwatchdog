@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import itertools
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, tzinfo
 from typing import Protocol
@@ -42,6 +43,7 @@ from tokenwatchdog.models import (
     WindowKind,
     level_still_in_cycle,
     window_duration_seconds,
+    window_is_rolling,
 )
 from tokenwatchdog.scoring import better_model, score_model
 from tokenwatchdog.store import SampleRow, Store, TokenEventRow
@@ -77,7 +79,7 @@ class LinearPredictor:
         now: float,
     ) -> Forecast:
         tz = resolve_timezone(cfg)
-        block = _current_block(history)
+        block = _current_block(history, _reset_predicate(window.provider, window.kind))
         resets_at = window.resets_at
         if resets_at is None:
             resets_at = _derive_resets_at(window, block, token_events, now)
@@ -174,7 +176,8 @@ class MonteCarloPredictor:
         now: float,
     ) -> Forecast:
         tz = resolve_timezone(cfg)
-        block = _current_block(history)
+        is_reset = _reset_predicate(window.provider, window.kind)
+        block = _current_block(history, is_reset)
         resets_at = window.resets_at
         if resets_at is None:
             resets_at = _derive_resets_at(window, block, token_events, now)
@@ -208,7 +211,7 @@ class MonteCarloPredictor:
 
         percent_per_token = _percent_per_token(block.samples, token_events)
         raw_buckets = _build_burn_buckets(
-            history, token_events, percent_per_token, tz, now
+            history, token_events, percent_per_token, tz, now, is_reset
         )
         basis: BurnBasis = "tokens" if percent_per_token else "percent"
         n_observations = sum(len(entries) for entries in raw_buckets.values())
@@ -415,10 +418,10 @@ def _grade_stored_models(cfg: Config, store: Store) -> tuple[str, str]:
             samples = store.recent_samples(provider, kind, 0.0)
             rows = store.recent_forecasts(provider, kind, 0.0)
             if len(samples) >= 3 and rows:
-                pairs.append((rows, samples))
+                pairs.append((rows, samples, _reset_predicate(provider, kind)))
     if not pairs:
         return _DEFAULT_MODEL, f"{_DEFAULT_MODEL}: no stored forecasts to grade yet"
-    scores = {name: score_model(name, pairs, _is_reset) for name in _PREDICTORS}
+    scores = {name: score_model(name, pairs) for name in _PREDICTORS}
     return better_model(_DEFAULT_MODEL, scores)
 
 
@@ -461,7 +464,42 @@ def _is_reset(prev: SampleRow, curr: SampleRow) -> bool:
     return True
 
 
-def _split_into_blocks(history: list[SampleRow]) -> list[list[SampleRow]]:
+ResetPredicate = Callable[[SampleRow, SampleRow], bool]
+
+
+def _is_rolloff_clear(prev: SampleRow, curr: SampleRow) -> bool:
+    """Cycle boundary for a ROLLING window (see models.window_is_rolling).
+
+    A rolling window has no reset events, so a drop alone proves nothing —
+    old usage aging out produces drops of any size (measured: 17→0 in 12
+    minutes when a week-old burst aged out; even a 100→3 overnight drop
+    landed days before its declared clear-time, i.e. it was last week's
+    binge aging out too). This accepts a boundary only when the provider's
+    own declared clear-time has actually passed AND the level lands near
+    zero. `_is_reset`'s resets_at-advance rule is deliberately absent: on a
+    rolling window resets_at sliding forward is aging, not a boundary.
+
+    In practice this may never fire — on 10.5 days of real history it
+    splits nothing, which is the honest reading of a rolling accumulation.
+    That is safe because nothing load-bearing needs a split here:
+    RESET_PENDING simply never gates a rolling window, and scoring doesn't
+    scan for drops — realized_exhaustion_hours is bounded by each origin's
+    own declared resets_at, under which a re-climb to 100% inside the
+    horizon is a true exhaustion even if the level troughed in between.
+    """
+    dropped = curr.used_percent < prev.used_percent - _RESET_DROP_PERCENT
+    if not dropped or curr.used_percent >= _RESET_NEAR_ZERO_PERCENT:
+        return False
+    return prev.resets_at is not None and curr.source_ts >= prev.resets_at - 1.0
+
+
+def _reset_predicate(provider: Provider, kind: WindowKind) -> ResetPredicate:
+    return _is_rolloff_clear if window_is_rolling(provider, kind) else _is_reset
+
+
+def _split_into_blocks(
+    history: list[SampleRow], is_reset: ResetPredicate = _is_reset
+) -> list[list[SampleRow]]:
     """`history` cut at every detected reset — oldest block first. Shared by
     `_current_block` (which only wants the last one) and the montecarlo
     bucket builder (which wants burn observations from every past block,
@@ -470,18 +508,20 @@ def _split_into_blocks(history: list[SampleRow]) -> list[list[SampleRow]]:
         return []
     blocks: list[list[SampleRow]] = [[history[0]]]
     for i in range(1, len(history)):
-        if _is_reset(history[i - 1], history[i]):
+        if is_reset(history[i - 1], history[i]):
             blocks.append([])
         blocks[-1].append(history[i])
     return blocks
 
 
-def _current_block(history: list[SampleRow]) -> _BlockView:
+def _current_block(
+    history: list[SampleRow], is_reset: ResetPredicate = _is_reset
+) -> _BlockView:
     """The tail of `history` since the most recently observed reset. If no
     reset appears in `history` at all, the whole slice is "the current
     block" but its true start is unknown — that's a fact, not a bug; report
     it as such rather than guessing when the block began."""
-    blocks = _split_into_blocks(history)
+    blocks = _split_into_blocks(history, is_reset)
     if not blocks:
         return _BlockView(samples=[], block_started_at=None)
     block = blocks[-1]
@@ -811,19 +851,24 @@ def _robust_slope_per_hour(samples: list[SampleRow]) -> float:
     """Median of fixed-lag-k slopes (%/h), k = max(1, n // 4) — NOT the
     median of all C(n,2) pairwise slopes (Theil-Sen), which this replaced.
 
-    used_percent only ever moves up within a block (a real quota counter
-    never partially un-consumes), so a "burst outlier" here can only be a
-    PERMANENT step from that point forward, never a reverting point
-    anomaly. That matters: a step after position i corrupts i*(n-i) of
-    the C(n,2) all-pairs slopes, which is >50% (past the median's
-    breakdown point) whenever the step lands near the middle of the
-    window — measured concretely as producing an estimate *worse* than a
-    naive endpoint-to-endpoint slope. A step can corrupt at most k of the
+    Within a block the dominant failure mode is a PERMANENT step (a burst
+    moves the level and it stays moved — quota doesn't un-consume), not a
+    reverting point anomaly. That matters: a step after position i corrupts
+    i*(n-i) of the C(n,2) all-pairs slopes, which is >50% (past the
+    median's breakdown point) whenever the step lands near the middle of
+    the window — measured concretely as producing an estimate *worse* than
+    a naive endpoint-to-endpoint slope. A step can corrupt at most k of the
     (n-k) fixed-lag-k slopes regardless of WHERE it falls, bounding
     contamination well under 50% for any position — while the wider
     baseline (k samples apart, not 1) keeps each slope less noise-amplified
-    than raw consecutive deltas would be against Claude's is_estimated
-    source, which can legitimately wobble within a block (see _is_reset)."""
+    than raw consecutive deltas would be.
+
+    Down-drift is real and no assumption here forbids it: Claude's
+    estimated source is a trailing sum that legitimately wobbles downward
+    (see _is_reset), and a rolling window (codex weekly, see
+    models.window_is_rolling) drifts down as old usage ages out. A
+    negative median is an honest answer — `_project_forecast` maps
+    burn <= 0 to a calm no-ETA rather than treating it as an error."""
     n = len(samples)
     if n < 2:
         return 0.0
@@ -870,13 +915,14 @@ def _build_burn_buckets(
     percent_per_token: float | None,
     tz: tzinfo,
     now: float,
+    is_reset: ResetPredicate = _is_reset,
 ) -> dict[int, list[tuple[float, float]]]:
     """(observation_ts, burn_%/h) bucketed by hour-of-week — the profile the
     simulation samples its futures from. Prefers the token series; falls
     back to differencing percentages when there's no calibration."""
     if percent_per_token is not None and percent_per_token > 0 and token_events:
         return _token_burn_buckets(token_events, percent_per_token, tz, now)
-    return _percent_burn_buckets(history, tz)
+    return _percent_burn_buckets(history, tz, is_reset)
 
 
 def _token_burn_buckets(
@@ -916,14 +962,14 @@ def _token_burn_buckets(
 
 
 def _percent_burn_buckets(
-    history: list[SampleRow], tz: tzinfo
+    history: list[SampleRow], tz: tzinfo, is_reset: ResetPredicate = _is_reset
 ) -> dict[int, list[tuple[float, float]]]:
     """Fallback profile: consecutive same-block sample pairs across EVERY
     observed block, not just the live one. Coarser than the token path
     (whole-number percentages, and long idle gaps get dropped rather than
     counted as zero), but it needs no calibration."""
     buckets: dict[int, list[tuple[float, float]]] = {}
-    for block in _split_into_blocks(history):
+    for block in _split_into_blocks(history, is_reset):
         for i in range(1, len(block)):
             prev, curr = block[i - 1], block[i]
             dt_hours = (curr.source_ts - prev.source_ts) / 3600.0

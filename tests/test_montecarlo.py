@@ -28,10 +28,10 @@ def _sample(source_ts, used_percent, resets_at=None):
     )
 
 
-def _window(kind, used_percent, source_ts, resets_at=None):
+def _window(kind, used_percent, source_ts, resets_at=None, provider=Provider.CODEX):
     window_minutes = 300 if kind is WindowKind.W5H else 10080
     return Window(
-        provider=Provider.CODEX,
+        provider=provider,
         kind=kind,
         used_percent=used_percent,
         window_minutes=window_minutes,
@@ -138,9 +138,11 @@ def test_idle_with_a_level_from_an_old_cycle_still_short_circuits(cfg):
 
 
 def test_reset_pending_short_circuits_before_simulating(cfg):
+    # CLAUDE deliberately: fixed-cycle semantics. A codex weekly drop is
+    # roll-off, not a reset (see tests/test_rolling_window.py).
     now = 1_000_000.0
     history = [_sample(now - 120, 95.0), _sample(now, 5.0)]
-    window = _window(WindowKind.WEEKLY, 5.0, now)
+    window = _window(WindowKind.WEEKLY, 5.0, now, provider=Provider.CLAUDE)
     forecast = MonteCarloPredictor().forecast(window, history, [], cfg, now)
     assert forecast.status == "RESET_PENDING"
 

@@ -142,10 +142,10 @@ def test_scoring_ignores_forecasts_belonging_to_other_models():
         _row(now, "linear", now + 2 * HOUR),  # 1h late
         _row(now, "montecarlo", now + 10 * HOUR),  # 9h late
     ]
-    pairs = [(rows, samples)]
+    pairs = [(rows, samples, _is_reset)]
 
-    linear = score_model("linear", pairs, _is_reset)
-    montecarlo = score_model("montecarlo", pairs, _is_reset)
+    linear = score_model("linear", pairs)
+    montecarlo = score_model("montecarlo", pairs)
 
     assert linear.episodes == montecarlo.episodes == 1
     assert linear.mae_hours is not None and montecarlo.mae_hours is not None
@@ -160,7 +160,7 @@ def test_a_forecast_whose_window_never_exhausted_is_not_scored():
     assert realized_exhaustion_hours(samples, 0, _is_reset) is None
 
     score = score_model(
-        "linear", [([_row(now, "linear", now + HOUR)], samples)], _is_reset
+        "linear", [([_row(now, "linear", now + HOUR)], samples, _is_reset)]
     )
     assert score.with_eta == 1  # it did produce an ETA...
     assert score.episodes == 0  # ...but there's nothing to grade it against
@@ -211,9 +211,9 @@ def test_auto_grades_real_stored_rows(tmp_path, store):
             (
                 store.recent_forecasts(Provider.CLAUDE, WindowKind.WEEKLY, 0.0),
                 store.recent_samples(Provider.CLAUDE, WindowKind.WEEKLY, 0.0),
+                _is_reset,
             )
         ],
-        _is_reset,
     )
     assert graded.with_eta == 4  # the rows really did come back out...
     assert graded.episodes > 0  # ...and really were gradeable
@@ -258,7 +258,7 @@ def test_sitting_at_the_cap_cannot_mint_episodes_for_one_model():
     samples = [_sample(now + i * 300.0, 100.0) for i in range(24)]
     rows = [_row(now + i * 300.0, "montecarlo", now + i * 300.0) for i in range(24)]
 
-    score = score_model("montecarlo", [(rows, samples)], _is_reset)
+    score = score_model("montecarlo", [(rows, samples, _is_reset)])
 
     assert score.with_eta == 24  # it did answer every tick...
     assert score.episodes == 0  # ...and not one of them was gradeable
@@ -286,7 +286,7 @@ def test_a_forecast_is_graded_against_the_reading_it_actually_saw():
     made_at = now + HOUR - 60.0
     rows = [_row(made_at, "linear", now + HOUR)]
 
-    score = score_model("linear", [(rows, samples)], _is_reset)
+    score = score_model("linear", [(rows, samples, _is_reset)])
 
     assert score.episodes == 1  # graded against the 50% reading, not the 100%
     assert score.mae_hours is not None
@@ -309,7 +309,7 @@ def test_a_deliberately_withheld_forecast_is_not_a_coverage_miss():
         _row(now, "linear", now + 2 * HOUR, status="OK"),
     ]
 
-    score = score_model("linear", [(rows, samples)], _is_reset)
+    score = score_model("linear", [(rows, samples, _is_reset)])
 
     assert score.moments == 1  # only the OK row counts
     assert score.with_eta == 1

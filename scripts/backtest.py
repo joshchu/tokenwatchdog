@@ -40,7 +40,7 @@ from tokenwatchdog.config import DEFAULT_DB_PATH, Config, load_config  # noqa: E
 from tokenwatchdog.models import Provider, Window, WindowKind  # noqa: E402
 from tokenwatchdog.predictor import (  # noqa: E402
     _PREDICTORS,
-    _is_reset,
+    _reset_predicate,
     _split_into_blocks,
 )
 from tokenwatchdog.scoring import (  # noqa: E402
@@ -63,11 +63,12 @@ class Score:
             self.errors_h = []
 
 
-def _truth_hours(samples: list[SampleRow], index: int) -> float | None:
+def _truth_hours(samples: list[SampleRow], index: int, is_reset) -> float | None:
     """What actually happened after `samples[index]` — the same definition
     `predictor.select_predictor` grades against, so a change measured here
-    can't disagree with the choice made at runtime."""
-    return realized_exhaustion_hours(samples, index, _is_reset)
+    can't disagree with the choice made at runtime. The predicate is the
+    window's own (rolling windows don't reset on drops)."""
+    return realized_exhaustion_hours(samples, index, is_reset)
 
 
 def _window_at(provider: Provider, kind: WindowKind, sample: SampleRow) -> Window:
@@ -93,6 +94,7 @@ def _score_pair(
     stride: int,
 ) -> dict[str, Score]:
     scores = {name: Score() for name in model_names}
+    is_reset = _reset_predicate(provider, kind)
     for index in range(1, len(samples), stride):
         now = samples[index].source_ts
         # Everything the predictor would have had at that moment, and
@@ -101,7 +103,7 @@ def _score_pair(
         history = samples[: index + 1]
         past_events = [e for e in token_events if e.ts <= now]
         window = _window_at(provider, kind, samples[index])
-        truth_h = _truth_hours(samples, index)
+        truth_h = _truth_hours(samples, index, is_reset)
 
         for name in model_names:
             score = scores[name]
@@ -186,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                 if len(samples) < 3:
                     continue
                 any_scored = True
-                blocks = _split_into_blocks(samples)
+                blocks = _split_into_blocks(samples, _reset_predicate(provider, kind))
                 scores = _score_pair(
                     provider,
                     kind,
