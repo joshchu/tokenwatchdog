@@ -535,6 +535,10 @@ def _per_kind_veto(
 class _BlockView:
     samples: list[SampleRow]  # current-block samples only, oldest first
     block_started_at: float | None  # known ONLY if a reset was observed
+    # The last sample of the PREVIOUS block, when a reset was observed --
+    # the true boundary lies in (previous_sample_ts, block_started_at], and
+    # anchoring needs both ends of that straddle (see _boundary_estimate).
+    previous_sample_ts: float | None = None
 
 
 _RESET_DROP_PERCENT = 5.0
@@ -628,8 +632,33 @@ def _current_block(
     if not blocks:
         return _BlockView(samples=[], block_started_at=None)
     block = blocks[-1]
-    started_at = block[0].source_ts if len(blocks) > 1 else None
-    return _BlockView(samples=block, block_started_at=started_at)
+    if len(blocks) > 1:
+        return _BlockView(
+            samples=block,
+            block_started_at=block[0].source_ts,
+            previous_sample_ts=blocks[-2][-1].source_ts,
+        )
+    return _BlockView(samples=block, block_started_at=None)
+
+
+def _boundary_estimate(block: _BlockView) -> float | None:
+    """Best point estimate of when the observed boundary actually happened.
+
+    A reset is only ever OBSERVED as a straddle: the last sample still
+    showing the old cycle, then the next sample showing the new one. The
+    true boundary lies strictly between them, and the samples arrive on a
+    ~5-minute cadence, so anchoring at the post-reset sample ran late by up
+    to a full gap on every projected reset -- measured live: the weekly
+    reset displayed 13:04 against the provider's own 12:59, all week, every
+    week. The midpoint is the unbiased estimate; its error is at most half
+    the straddling gap, and no local data can see through the gap more
+    finely (a tool-off stretch makes the gap -- and the honest uncertainty
+    -- correspondingly wide)."""
+    if block.block_started_at is None:
+        return None
+    if block.previous_sample_ts is None:
+        return block.block_started_at
+    return (block.previous_sample_ts + block.block_started_at) / 2.0
 
 
 # -- token-velocity burn: the high-resolution signal -------------------------
@@ -875,9 +904,12 @@ def _sample_block_anchor(
     activity came 77 minutes after the account's block had started, and the
     displayed reset was late by exactly that much.
 
-    The rise is "no later than" the true anchor, not exact: an integer
-    percentage rounds sub-percent usage to zero, so the rise lags the true
-    first message by however long usage stayed under ~1%.
+    The rise is observed as a straddle — the last zero sample, then the
+    first positive one — so the anchor estimate is the midpoint of that
+    gap: taking the positive sample ran late by up to a full cadence, and
+    the true first message can also precede the rise by however long usage
+    stayed under the integer percentage's ~1% floor (that part no local
+    data can see).
 
     None when there is no rise to see, or when the rise is a full window
     duration old — that block has expired, and whatever boundary came after
@@ -886,7 +918,7 @@ def _sample_block_anchor(
     anchor = None
     for prev, curr in itertools.pairwise(block_samples):
         if prev.used_percent == 0.0 and curr.used_percent > 0.0:
-            anchor = curr.source_ts
+            anchor = (prev.source_ts + curr.source_ts) / 2.0
     if anchor is None or now - anchor >= duration_seconds:
         return None
     return anchor
@@ -958,7 +990,8 @@ def _derive_resets_at(
             # activity starts it.
             candidates = []
             if block.samples and block.samples[0].used_percent > 0.0:
-                candidates.append(boundary)
+                estimate = _boundary_estimate(block)
+                candidates.append(estimate if estimate is not None else boundary)
             candidates.extend(
                 event.ts for event in token_events if event.ts >= boundary
             )
@@ -974,9 +1007,10 @@ def _derive_resets_at(
             return min(live) + duration
         if token_events:
             return None
-    if block.block_started_at is None:
+    boundary_estimate = _boundary_estimate(block)
+    if boundary_estimate is None:
         return None
-    resets_at = block.block_started_at + duration
+    resets_at = boundary_estimate + duration
     if resets_at <= now:
         missed_cycles = int((now - resets_at) // duration) + 1
         resets_at += missed_cycles * duration

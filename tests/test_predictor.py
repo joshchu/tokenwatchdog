@@ -245,7 +245,9 @@ def test_w5h_reset_anchors_at_the_account_wide_rise_not_the_local_log(cfg):
 
     forecast = LinearPredictor().forecast(window, history, local_events, cfg, now)
 
-    assert forecast.window.resets_at == pytest.approx(rise_ts + 5 * 3600)
+    # The rise is a straddle: last zero sample 5 minutes before rise_ts.
+    rise_anchor = (rise_ts - 300.0 + rise_ts) / 2.0
+    assert forecast.window.resets_at == pytest.approx(rise_anchor + 5 * 3600)
 
 
 def test_w5h_reset_known_even_when_the_cli_log_is_silent(cfg):
@@ -266,7 +268,8 @@ def test_w5h_reset_known_even_when_the_cli_log_is_silent(cfg):
 
     forecast = LinearPredictor().forecast(window, history, [], cfg, now)
 
-    assert forecast.window.resets_at == pytest.approx(rise_ts + 5 * 3600)
+    rise_anchor = (rise_ts - 300.0 + rise_ts) / 2.0
+    assert forecast.window.resets_at == pytest.approx(rise_anchor + 5 * 3600)
 
 
 def test_an_expired_rise_is_not_an_anchor(cfg):
@@ -338,10 +341,10 @@ def test_an_observed_boundary_invalidates_the_older_token_anchor(cfg):
 
     forecast = LinearPredictor().forecast(window, history, events, cfg, now)
 
-    # Anchored at the first token event AT/AFTER the boundary (CLI spoke
-    # within the boundary-to-sample gap), never at the pre-boundary anchor.
-    post_boundary_events = [e.ts for e in events if e.ts >= boundary_ts]
-    expected = min([boundary_ts, *post_boundary_events]) + 5 * 3600
+    # Anchored at the straddle midpoint (last pre-drop sample at now-1700,
+    # boundary sample at now-420) — earlier than any post-boundary token
+    # event and never at the pre-boundary token anchor.
+    expected = (now - 1700.0 + boundary_ts) / 2.0 + 5 * 3600
     assert forecast.window.resets_at == pytest.approx(expected)
     assert forecast.window.resets_at > now  # not the stale 09:24-style past
 
@@ -411,8 +414,11 @@ def test_stale_derived_reset_is_advanced_to_a_future_cycle_not_left_in_the_past(
     forecast = LinearPredictor().forecast(window, history, [], cfg, now)
     assert forecast.window.resets_at is not None
     assert forecast.window.resets_at > now
-    # Anchored to the same block_start + a whole number of 5h cycles.
-    assert (forecast.window.resets_at - block_start) % (5 * 3600) == pytest.approx(
+    # Anchored to the straddle midpoint (the boundary is only known to lie
+    # between the last pre-reset and first post-reset samples) + whole 5h
+    # cycles.
+    anchor = (block_start - 60 + block_start) / 2.0
+    assert (forecast.window.resets_at - anchor) % (5 * 3600) == pytest.approx(
         0.0, abs=0.01
     )
 

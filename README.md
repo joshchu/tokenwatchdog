@@ -346,7 +346,12 @@ model and says so. That's the design working, not a gap — run
   inherits that lag. The weekly window has no equivalent rule — a 7-day gap
   in activity isn't what starts a new weekly cycle — so it waits for an
   actual reset to appear in your history, and until one does the countdown
-  is honestly unknown rather than guessed.
+  is honestly unknown rather than guessed. Every derived reset also carries
+  up to half a sample gap of uncertainty (~2–3 minutes at Desktop's
+  5-minute cadence): a boundary is only ever observed as the straddle
+  between the last old-cycle sample and the first new-cycle one, and the
+  anchor is that straddle's midpoint — no local data can see through the
+  gap more finely.
 - **Codex's weekly window rolls; it never "resets."** Old usage ages out of
   a moving 7-day sum continuously, so its level can fall without any
   boundary (measured: 17→0 in twelve minutes as a week-old burst aged out),
