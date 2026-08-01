@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import time as time_mod
+from pathlib import Path
+from unittest import mock
 
 from tokenwatchdog.config import load_config
 from tokenwatchdog.models import Provider, WindowKind
@@ -419,6 +421,149 @@ def test_newest_by_mtime_is_selected(tmp_path, store):
     windows = CodexProvider().read(cfg, store)
     assert len(windows) == 1
     assert windows[0].used_percent == 99.0
+
+
+def test_stale_echo_of_the_old_cycle_loses_to_the_rotated_window(tmp_path, store):
+    """Regression for a live incident: an overnight session re-emitted its
+    last-known rate limits (99% used, the exhausted cycle's resets_at)
+    under a brand-new timestamp — making it newest by BOTH file mtime and
+    line time — an hour after a fresh session had already reported the
+    rotated window (5% used, resets_at days later). The announced reset
+    time, not recency, must arbitrate."""
+    codex_home = tmp_path / "codex_home"
+    old_cycle_reset = 1_785_935_826.0
+    new_cycle_reset = old_cycle_reset + 3 * 86400.0
+    fresh = _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-08-01T12:22:21.000Z",
+                {
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": new_cycle_reset,
+                    },
+                    "secondary": None,
+                },
+            )
+        ],
+        day="01",
+    )
+    echo = _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-08-01T13:15:34.000Z",  # a NEWER line than the fresh one
+                {
+                    "primary": {
+                        "used_percent": 99.0,
+                        "window_minutes": 10080,
+                        "resets_at": old_cycle_reset,
+                    },
+                    "secondary": None,
+                },
+            )
+        ],
+        day="31",
+    )
+    now = time_mod.time()
+    os.utime(fresh, (now - 3000, now - 3000))
+    os.utime(echo, (now, now))  # and the newest file by mtime
+
+    cfg = _cfg_for(tmp_path, codex_home)
+    (window,) = CodexProvider().read(cfg, store)
+    assert window.used_percent == 5.0
+    assert window.resets_at == new_cycle_reset
+
+
+def test_within_reset_jitter_the_newest_line_wins(tmp_path, store):
+    """A rolling window's resets_at is a sliding projection that jitters by
+    seconds between requests — inside that tolerance recency still decides."""
+    codex_home = tmp_path / "codex_home"
+    base_reset = 1_785_935_826.0
+    older = _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-08-01T10:00:00.000Z",
+                {
+                    "primary": {
+                        "used_percent": 40.0,
+                        "window_minutes": 10080,
+                        # 30s LATER than the newer line's — inside tolerance
+                        "resets_at": base_reset + 30.0,
+                    },
+                    "secondary": None,
+                },
+            )
+        ],
+        day="01",
+    )
+    newer = _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-08-01T11:00:00.000Z",
+                {
+                    "primary": {
+                        "used_percent": 42.0,
+                        "window_minutes": 10080,
+                        "resets_at": base_reset,
+                    },
+                    "secondary": None,
+                },
+            )
+        ],
+        day="02",
+    )
+    now = time_mod.time()
+    os.utime(older, (now - 1000, now - 1000))
+    os.utime(newer, (now, now))
+
+    cfg = _cfg_for(tmp_path, codex_home)
+    (window,) = CodexProvider().read(cfg, store)
+    assert window.used_percent == 42.0
+
+
+def test_unchanged_rollouts_are_not_reparsed_on_the_next_read(tmp_path, store):
+    """Comparing candidates means parsing several whole rollout files, and
+    long-lived session files reach many MB — a second read with nothing
+    modified on disk must not open any of them again."""
+    codex_home = tmp_path / "codex_home"
+    _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-08-01T10:00:00.000Z",
+                {
+                    "primary": {
+                        "used_percent": 12.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1_785_935_826.0,
+                    },
+                    "secondary": None,
+                },
+            )
+        ],
+    )
+    cfg = _cfg_for(tmp_path, codex_home)
+    provider = CodexProvider()
+    assert provider.read(cfg, store)  # populates cache + ingest cursor
+
+    opens = 0
+    real_open = Path.open
+
+    def counting_open(self, *args, **kwargs):
+        nonlocal opens
+        if self.name.endswith(".jsonl"):
+            opens += 1
+        return real_open(self, *args, **kwargs)
+
+    with mock.patch.object(Path, "open", counting_open):
+        windows = provider.read(cfg, store)
+    assert opens == 0
+    assert windows[0].used_percent == 12.0  # served from the snapshot cache
 
 
 def test_no_cursor_is_recorded_when_the_sessions_dir_is_absent(tmp_path, store):

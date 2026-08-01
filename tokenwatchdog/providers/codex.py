@@ -1,12 +1,16 @@
 """Codex CLI quota reader — parses local rollout JSONL session logs.
 
-Two load-bearing rules, both learned the hard way from real rollout files:
+Three load-bearing rules, all learned the hard way from real rollout files:
 
 - Classify each rate-limit block by `window_minutes`, NEVER by the
   primary/secondary key name — which window carries which key has already
   flipped once across Codex builds.
 - Prefer the absolute `resets_at` (epoch seconds); fall back to computing it
   from `resets_in_seconds` + the event's own timestamp for older builds.
+- Never trust "newest file, last line" alone: sessions interleave, and a
+  session resumed after sitting idle can re-emit its last-known rate limits
+  under a brand-new timestamp. Recent candidates are compared and the
+  snapshot announcing the latest `resets_at` wins (see `_supersedes`).
 
 Malformed/missing data returns an empty list rather than a guessed value —
 never fabricate a reading.
@@ -40,11 +44,17 @@ _W5H_MAX_MINUTES = 350
 _WEEKLY_MIN_MINUTES = 9000
 
 # A brand-new session file can be newest-by-mtime yet have no token_count
-# event logged to it yet (nothing has happened in it). Fall back through a
-# few more recent files rather than reporting no data while an older,
-# still-valid reading (rate limits are account-wide, not per-session) sits
-# right there.
+# event logged to it yet (nothing has happened in it), and the file with the
+# newest mtime is not necessarily the one holding the newest account state
+# (rate limits are account-wide, not per-session). Every candidate's last
+# snapshot competes; this only bounds how far back the scan reaches.
 _MAX_CANDIDATE_FILES = 5
+
+# Two snapshots whose resets_at differ by no more than this are treated as
+# announcing the same cycle state: a rolling window's resets_at is a sliding
+# projection that jitters by seconds between requests, while a genuine
+# window rotation moves it forward by days.
+_RESETS_TIE_TOLERANCE_S = 60.0
 
 # Bump this when ingestion semantics change in a way that requires existing
 # rollout files to be revisited. V2 removes repeated cumulative snapshots that
@@ -55,18 +65,66 @@ _INGEST_VERSION = 2
 class CodexProvider:
     name = "codex"
 
+    def __init__(self) -> None:
+        # path -> (mtime, last rate-limits event). Comparing candidates means
+        # parsing several whole rollout files, and long-lived session files
+        # reach many MB; re-parsing unchanged ones every ~60s tick is the
+        # same measured mistake the ingest cursor below already fixed.
+        self._snapshot_cache: dict[Path, tuple[float, dict[str, Any] | None]] = {}
+
     def read(self, cfg: Config, store: Store) -> list[Window]:
         home = _codex_home(cfg)
         _ingest_token_events(cfg, home, store, time.time())
         candidates = _rollout_files_newest_first(home)[:_MAX_CANDIDATE_FILES]
+        best: dict[WindowKind, Window] = {}
         for path in candidates:
-            event = _find_last_token_count_event(path)
+            event = self._last_snapshot(path)
             if event is None:
                 continue
-            windows = _windows_from_event(event, str(path))
-            if windows:
-                return windows
-        return []
+            for window in _windows_from_event(event, str(path)):
+                incumbent = best.get(window.kind)
+                if incumbent is None or _supersedes(window, incumbent):
+                    best[window.kind] = window
+        kept = set(candidates)
+        self._snapshot_cache = {
+            path: entry for path, entry in self._snapshot_cache.items() if path in kept
+        }
+        return [best[kind] for kind in sorted(best, key=lambda kind: kind.value)]
+
+    def _last_snapshot(self, path: Path) -> dict[str, Any] | None:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        cached = self._snapshot_cache.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        event = _find_last_token_count_event(path)
+        self._snapshot_cache[path] = (mtime, event)
+        return event
+
+
+def _supersedes(challenger: Window, incumbent: Window) -> bool:
+    """Pick between two sessions' readings of the same window.
+
+    Line recency alone cannot arbitrate: a session resumed after sitting
+    idle re-emits its LAST-KNOWN rate limits under a brand-new timestamp
+    (observed live: an overnight session's compaction task echoed the
+    previous quota cycle's 99%-used/old-resets_at an hour after a fresh
+    session had already reported the rotated window at 5%). The announced
+    reset time can arbitrate, because it only ever moves forward — sliding
+    forward on a rolling window, jumping forward by days when the window
+    rotates — so the snapshot announcing the later reset is the newer
+    account state no matter when its line was written. Within the jitter
+    tolerance, recency breaks the tie.
+    """
+    if challenger.resets_at is not None and incumbent.resets_at is not None:
+        if abs(challenger.resets_at - incumbent.resets_at) > _RESETS_TIE_TOLERANCE_S:
+            return challenger.resets_at > incumbent.resets_at
+    elif (challenger.resets_at is None) != (incumbent.resets_at is None):
+        # A snapshot that knows its reset outranks one that doesn't.
+        return incumbent.resets_at is None
+    return challenger.source_ts > incumbent.source_ts
 
 
 def _codex_home(cfg: Config) -> Path:
