@@ -12,6 +12,12 @@ Three load-bearing rules, all learned the hard way from real rollout files:
   under a brand-new timestamp. Recent candidates are compared and the
   snapshot announcing the latest `resets_at` wins (see `_supersedes`).
 
+Rollouts also lag the account whenever usage happens on a surface that
+doesn't write local sessions (Codex web/cloud, another machine), so the
+freshest reading comes from `providers/codex_app_server.py` — asking the
+codex binary itself — and competes with the rollout snapshots under the
+same rule.
+
 Malformed/missing data returns an empty list rather than a guessed value —
 never fabricate a reading.
 
@@ -36,6 +42,7 @@ from typing import Any
 
 from tokenwatchdog.config import Config
 from tokenwatchdog.models import Provider, Window, WindowKind
+from tokenwatchdog.providers.codex_app_server import AppServerUsageSource
 from tokenwatchdog.store import Store
 from tokenwatchdog.timeutil import parse_iso_to_epoch
 
@@ -65,7 +72,12 @@ _INGEST_VERSION = 2
 class CodexProvider:
     name = "codex"
 
-    def __init__(self) -> None:
+    def __init__(self, app_server: AppServerUsageSource | None = None) -> None:
+        # One long-lived app-server source per provider: it owns the spawn
+        # throttle that reconciles a 60s poll loop with a 180s spawn floor.
+        self._app_server = (
+            app_server if app_server is not None else AppServerUsageSource()
+        )
         # path -> (mtime, last rate-limits event). Comparing candidates means
         # parsing several whole rollout files, and long-lived session files
         # reach many MB; re-parsing unchanged ones every ~60s tick is the
@@ -73,18 +85,31 @@ class CodexProvider:
         self._snapshot_cache: dict[Path, tuple[float, dict[str, Any] | None]] = {}
 
     def read(self, cfg: Config, store: Store) -> list[Window]:
+        now = time.time()
         home = _codex_home(cfg)
-        _ingest_token_events(cfg, home, store, time.time())
-        candidates = _rollout_files_newest_first(home)[:_MAX_CANDIDATE_FILES]
+        _ingest_token_events(cfg, home, store, now)
         best: dict[WindowKind, Window] = {}
+
+        def compete(window: Window) -> None:
+            incumbent = best.get(window.kind)
+            if incumbent is None or _supersedes(window, incumbent):
+                best[window.kind] = window
+
+        # The live app-server reading is just another candidate under the
+        # same supersedes rule: rollouts lag the account whenever usage
+        # happens on another surface (web/cloud/another machine), while a
+        # rollout line a local turn wrote seconds ago is fresher than a
+        # throttled reading from up to 180s back — per-window recency and
+        # announced-reset arbitration sort both cases out.
+        for window in self._app_server.read(cfg, now):
+            compete(window)
+        candidates = _rollout_files_newest_first(home)[:_MAX_CANDIDATE_FILES]
         for path in candidates:
             event = self._last_snapshot(path)
             if event is None:
                 continue
             for window in _windows_from_event(event, str(path)):
-                incumbent = best.get(window.kind)
-                if incumbent is None or _supersedes(window, incumbent):
-                    best[window.kind] = window
+                compete(window)
         kept = set(candidates)
         self._snapshot_cache = {
             path: entry for path, entry in self._snapshot_cache.items() if path in kept

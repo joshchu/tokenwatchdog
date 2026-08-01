@@ -5,16 +5,17 @@ from __future__ import annotations
 import pytest
 
 from tokenwatchdog.config import load_config
-from tokenwatchdog.providers import claude_cli
+from tokenwatchdog.providers import claude_cli, codex_app_server
 from tokenwatchdog.store import Store
 
 
 @pytest.fixture(autouse=True)
-def _no_real_claude_spawn(monkeypatch):
-    """No test may shell out to a real `claude` binary — it's slow and every
-    spawn hits Anthropic's rate-limited usage endpoint. Tests that exercise
-    the CLI source inject their own fake spawn callable instead."""
+def _no_real_cli_spawns(monkeypatch):
+    """No test may shell out to a real `claude` or `codex` binary — it's
+    slow and every spawn hits the vendor's rate-limited usage surface.
+    Tests that exercise these sources inject their own fake callables."""
     monkeypatch.setattr(claude_cli, "_spawn_claude_usage", lambda cfg: None)
+    monkeypatch.setattr(codex_app_server, "_spawn_and_query", lambda cfg: None)
 
 
 @pytest.fixture

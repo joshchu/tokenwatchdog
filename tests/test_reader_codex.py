@@ -17,6 +17,7 @@ from tokenwatchdog.config import load_config
 from tokenwatchdog.models import Provider, WindowKind
 from tokenwatchdog.providers import codex as codex_provider
 from tokenwatchdog.providers.codex import CodexProvider
+from tokenwatchdog.providers.codex_app_server import AppServerUsageSource
 from tokenwatchdog.timeutil import parse_iso_to_epoch
 
 
@@ -524,6 +525,74 @@ def test_within_reset_jitter_the_newest_line_wins(tmp_path, store):
     cfg = _cfg_for(tmp_path, codex_home)
     (window,) = CodexProvider().read(cfg, store)
     assert window.used_percent == 42.0
+
+
+def test_live_app_server_reading_beats_stale_rollouts_and_echoes(tmp_path, store):
+    """Regression for a live incident: rollouts lag the account whenever
+    usage happens on a surface that writes no local sessions — they said 5%
+    two hours after the account had moved to 7%. The app-server reading
+    (fresh, same cycle) must win over both the lagging same-cycle rollout
+    (recency tie-break) and an old-cycle echo (announced-reset rule)."""
+    codex_home = tmp_path / "codex_home"
+    old_cycle_reset = 1_785_935_826.0
+    new_cycle_reset = old_cycle_reset + 3 * 86400.0
+    lagging = _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-08-01T12:22:21.000Z",
+                {
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 10080,
+                        "resets_at": new_cycle_reset,
+                    },
+                    "secondary": None,
+                },
+            )
+        ],
+        day="01",
+    )
+    echo = _write_rollout(
+        codex_home,
+        [
+            _token_count_event(
+                "2026-08-01T13:15:34.000Z",
+                {
+                    "primary": {
+                        "used_percent": 99.0,
+                        "window_minutes": 10080,
+                        "resets_at": old_cycle_reset,
+                    },
+                    "secondary": None,
+                },
+            )
+        ],
+        day="31",
+    )
+    now = time_mod.time()
+    os.utime(lagging, (now - 3000, now - 3000))
+    os.utime(echo, (now, now))
+
+    live_result = {
+        "rateLimits": {
+            "primary": {
+                "usedPercent": 7,
+                "windowDurationMins": 10080,
+                "resetsAt": new_cycle_reset,
+            },
+            "secondary": None,
+        }
+    }
+    provider = CodexProvider(
+        app_server=AppServerUsageSource(query=lambda cfg: live_result)
+    )
+
+    cfg = _cfg_for(tmp_path, codex_home)
+    (window,) = provider.read(cfg, store)
+    assert window.used_percent == 7.0
+    assert window.resets_at == new_cycle_reset
+    assert window.source_file == "codex app-server"
 
 
 def test_unchanged_rollouts_are_not_reparsed_on_the_next_read(tmp_path, store):

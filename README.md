@@ -230,18 +230,23 @@ definition but not their inputs (replayed forecasts versus stored ones).
 ## How it works
 
 TokenWatchDog reads quota data **from your own machine and your own
-providers, nothing else**. For Claude, the freshest reading comes from
+providers, nothing else**, and never touches credentials — each vendor's
+own binary owns its auth. For Claude, the freshest reading comes from
 spawning Claude Code's own CLI — `claude -p "/usage"`, a free, LLM-less
-local slash command that reports the server's numbers — so this tool never
-touches credentials; the `claude` binary owns its own auth. Claude
-Desktop's usage snapshot and Claude Code's transcripts are the fallbacks,
-and Codex is read from its session logs. The only network traffic is what
-the `claude` binary itself sends to Anthropic to answer that query:
-TokenWatchDog holds no tokens, calls no API of its own, and never
-transmits anything anywhere. The session logs it parses do contain your
-conversation history, but only numeric usage fields (token counts,
-timestamps, model names) are ever extracted — the message content itself
-is never logged, stored, or transmitted anywhere.
+local slash command that reports the server's numbers — with Claude
+Desktop's usage snapshot and Claude Code's transcripts as fallbacks. For
+Codex it likewise asks the codex binary itself — a short-lived
+`codex app-server` query (`account/rateLimits/read`, the same read behind
+the Codex desktop app's usage display; no LLM call, no quota spent) — with
+its session rollout files as the fallback: rollouts only record a snapshot
+when a local turn completes, so usage burned on Codex web/cloud or another
+machine is invisible to them until then. The only network traffic is what
+the `claude` and `codex` binaries themselves send to their own vendors to
+answer those queries: TokenWatchDog holds no tokens, calls no API of its
+own, and never transmits anything anywhere. The session logs it parses do
+contain your conversation history, but only numeric usage fields (token
+counts, timestamps, model names) are ever extracted — the message content
+itself is never logged, stored, or transmitted anywhere.
 
 Burn rate is measured from token throughput wherever possible. Neither
 provider publishes its real token cap, so instead of guessing one, the tool
@@ -310,12 +315,13 @@ model and says so. That's the design working, not a gap — run
 
 ## Limitations
 
-- **Codex's usage *percentage* can't be backfilled.** Its session logs carry
-  only the current rate-limit snapshot, not a time series, so a stretch with
-  the tool off leaves a real gap in the percentage history — a property of
-  what Codex exposes, not a bug. Its per-request *token* counts are a time
-  series and are backfilled, which is why burn rate survives downtime better
-  than the percentage does.
+- **Codex's usage *percentage* can't be backfilled.** The live level comes
+  from the app-server query, and session logs carry only the current
+  rate-limit snapshot, not a time series — so a stretch with the tool off
+  leaves a real gap in the percentage history. A property of what Codex
+  exposes, not a bug. Its per-request *token* counts are a time series and
+  are backfilled, which is why burn rate survives downtime better than the
+  percentage does.
 - **Claude history can be backfilled.** The Desktop and token-compute
   sources keep their own history independent of whether TokenWatchDog is
   running — token-compute re-scans Claude Code's own transcripts (bounded

@@ -46,6 +46,9 @@ class ProvidersConfig:
 @dataclass(frozen=True)
 class CodexConfig:
     home: str = ""  # "" -> $CODEX_HOME or ~/.codex
+    # "" -> find `codex` on PATH. Set explicitly when running under
+    # launchd, whose minimal PATH won't include user-installed binaries.
+    cli_path: str = ""
     # 0.0 = not configured -> no $ estimate shown, tokens-past-quota shows
     # instead. Codex's own API never reports a price -- these only ever
     # reflect what you configure yourself, matching your actual plan's
@@ -362,6 +365,7 @@ claude = true
 
 [codex]
 home = ""                            # "" -> $CODEX_HOME or ~/.codex
+cli_path = ""                        # "" -> find `codex` on PATH (set under launchd)
 input_price_per_million_usd = 0.0    # set to your plan's real overage/credit rate
 output_price_per_million_usd = 0.0   # to show $ burned past quota instead of just tokens
 
